@@ -40,19 +40,11 @@
 #include "mongo/db/ops/log_builder.h"
 #include "mongo/unittest/unittest.h"
 
-namespace {
+namespace mongo {
 
-using mongo::BSONObj;
-using mongo::fromjson;
-using mongo::LogBuilder;
-using mongo::ModifierInterface;
-using mongo::NumberInt;
-using mongo::ModifierRename;
-using mongo::Status;
-using mongo::StringData;
-using mongo::mutablebson::ConstElement;
-using mongo::mutablebson::Document;
-using mongo::mutablebson::Element;
+using mutablebson::ConstElement;
+using mutablebson::Document;
+using mutablebson::Element;
 
 /** Helper to build and manipulate the mod. */
 class Mod {
@@ -106,6 +98,33 @@ TEST(InvalidInit, FromDbTests) {
         mod.init(fromjson("{'b':'.a'}").firstElement(), ModifierInterface::Options::normal()));
     ASSERT_NOT_OK(
         mod.init(fromjson("{'b':'a.'}").firstElement(), ModifierInterface::Options::normal()));
+}
+
+TEST(InvalidInit, ToFieldCannotContainEmbeddedNullByte) {
+    ModifierRename mod;
+    {
+        const auto embeddedNull = "a\0b"_sd;
+        ASSERT_NOT_OK(mod.init(BSON("a" << embeddedNull).firstElement(),
+                               ModifierInterface::Options::normal()));
+    }
+
+    {
+        const auto singleNullByte = "\0"_sd;
+        ASSERT_NOT_OK(mod.init(BSON("a" << singleNullByte).firstElement(),
+                               ModifierInterface::Options::normal()));
+    }
+
+    {
+        const auto leadingNullByte = "\0bbbb"_sd;
+        ASSERT_NOT_OK(mod.init(BSON("a" << leadingNullByte).firstElement(),
+                               ModifierInterface::Options::normal()));
+    }
+
+    {
+        const auto trailingNullByte = "bbbb\0"_sd;
+        ASSERT_NOT_OK(mod.init(BSON("a" << trailingNullByte).firstElement(),
+                               ModifierInterface::Options::normal()));
+    }
 }
 
 TEST(MissingFrom, InitPrepLog) {
@@ -441,4 +460,4 @@ TEST(LegacyData, CanRenameFromInvalidFieldName) {
     ASSERT_EQUALS(logDoc, logObj);
 }
 
-}  // namespace
+}  // namespace mongo

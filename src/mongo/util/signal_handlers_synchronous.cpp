@@ -36,8 +36,8 @@
 #include <boost/exception/exception.hpp>
 #include <csignal>
 #include <exception>
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <streambuf>
 #include <typeinfo>
@@ -75,8 +75,7 @@ const char* strsignal(int signalNum) {
 }
 
 void endProcessWithSignal(int signalNum) {
-    doMinidump();
-    quickExit(EXIT_ABRUPT);
+    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, NULL);
 }
 
 #else
@@ -345,5 +344,14 @@ void reportOutOfMemoryErrorAndExit() {
     printStackTrace(mallocFreeOStream << "out of memory.\n");
     writeMallocFreeStreamToLog();
     quickExit(EXIT_ABRUPT);
+}
+
+void clearSignalMask() {
+#ifndef _WIN32
+    // We need to make sure that all signals are unmasked so signals are handled correctly
+    sigset_t unblockSignalMask;
+    invariant(sigemptyset(&unblockSignalMask) == 0);
+    invariant(sigprocmask(SIG_SETMASK, &unblockSignalMask, nullptr) == 0);
+#endif
 }
 }  // namespace mongo

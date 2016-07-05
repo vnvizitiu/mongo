@@ -29,12 +29,12 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/basic.h"
+#include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
 
@@ -45,7 +45,7 @@ namespace mongo {
 class OpCounters {
 public:
     OpCounters();
-    void incInsertInWriteLock(int n);
+    void gotInserts(int n);
     void gotInsert();
     void gotQuery();
     void gotUpdate();

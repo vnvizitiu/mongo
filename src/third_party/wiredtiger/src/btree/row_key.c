@@ -52,6 +52,7 @@ __wt_row_leaf_keys(WT_SESSION_IMPL *session, WT_PAGE *page)
 	WT_RET(__wt_scr_alloc(session, 0, &key));
 	WT_RET(__wt_scr_alloc(session,
 	    (uint32_t)__bitstr_size(page->pg_row_entries), &tmp));
+	memset(tmp->mem, 0, tmp->memsize);
 
 	if ((gap = btree->key_gap) == 0)
 		gap = 1;
@@ -516,7 +517,7 @@ __wt_row_ikey(WT_SESSION_IMPL *session,
 	{
 	uintptr_t oldv;
 
-	oldv = (uintptr_t)ref->key.ikey;
+	oldv = (uintptr_t)ref->ref_ikey;
 	WT_DIAGNOSTIC_YIELD;
 
 	/*
@@ -526,10 +527,10 @@ __wt_row_ikey(WT_SESSION_IMPL *session,
 	WT_ASSERT(session, oldv == 0 || (oldv & WT_IK_FLAG) != 0);
 	WT_ASSERT(session, ref->state != WT_REF_SPLIT);
 	WT_ASSERT(session,
-	    __wt_atomic_cas_ptr(&ref->key.ikey, (WT_IKEY *)oldv, ikey));
+	    __wt_atomic_cas_ptr(&ref->ref_ikey, (WT_IKEY *)oldv, ikey));
 	}
 #else
-	ref->key.ikey = ikey;
+	ref->ref_ikey = ikey;
 #endif
 	return (0);
 }

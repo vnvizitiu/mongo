@@ -76,7 +76,8 @@ void DocumentSourceSort::serializeToArray(vector<Value>& array, bool explain) co
         array.push_back(
             Value(DOC(getSourceName()
                       << DOC("sortKey" << serializeSortKey(explain) << "mergePresorted"
-                                       << (_mergingPresorted ? Value(true) : Value()) << "limit"
+                                       << (_mergingPresorted ? Value(true) : Value())
+                                       << "limit"
                                        << (limitSrc ? Value(limitSrc->getLimit()) : Value())))));
     } else {  // one Value for $sort and maybe a Value for $limit
         MutableDocument inner(serializeSortKey(explain));
@@ -118,7 +119,7 @@ Document DocumentSourceSort::serializeSortKey(bool explain) const {
             const FieldPath& withVariable = efp->getFieldPath();
             verify(withVariable.getPathLength() > 1);
             verify(withVariable.getFieldName(0) == "ROOT");
-            const string fieldPath = withVariable.tail().getPath(false);
+            const string fieldPath = withVariable.tail().fullPath();
 
             // append a named integer based on the sort order
             keyObj.setField(fieldPath, Value(vAscending[i] ? 1 : -1));
@@ -169,6 +170,7 @@ intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
 intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx, BSONObj sortOrder, long long limit) {
     intrusive_ptr<DocumentSourceSort> pSort = new DocumentSourceSort(pExpCtx);
+    pSort->_sort = sortOrder.getOwned();
 
     /* check for then iterate over the sort object */
     BSONForEach(keyField, sortOrder) {
@@ -358,6 +360,7 @@ intrusive_ptr<DocumentSource> DocumentSourceSort::getMergeSource() {
     other->vSortKey = vSortKey;
     other->limitSrc = limitSrc;
     other->_mergingPresorted = true;
+    other->_sort = _sort;
     return other;
 }
 }

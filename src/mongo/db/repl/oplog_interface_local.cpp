@@ -72,7 +72,8 @@ StatusWith<OplogInterface::Iterator::Value> OplogIteratorLocal::next() {
 
     PlanExecutor::ExecState state;
     if (PlanExecutor::ADVANCED != (state = _exec->getNext(&obj, &recordId))) {
-        return StatusWith<Value>(ErrorCodes::NoSuchKey, "no more operations in local oplog");
+        return StatusWith<Value>(ErrorCodes::CollectionIsEmpty,
+                                 "no more operations in local oplog");
     }
 
     // Non-yielding collection scans from InternalPlanner will never error.
@@ -91,8 +92,8 @@ OplogInterfaceLocal::OplogInterfaceLocal(OperationContext* txn, const std::strin
 
 std::string OplogInterfaceLocal::toString() const {
     return str::stream() << "LocalOplogInterface: "
-                            "operation context: " << _txn->getNS() << "/" << _txn->getOpID()
-                         << "; collection: " << _collectionName;
+                            "operation context: "
+                         << _txn->getOpID() << "; collection: " << _collectionName;
 }
 
 std::unique_ptr<OplogInterface::Iterator> OplogInterfaceLocal::makeIterator() const {

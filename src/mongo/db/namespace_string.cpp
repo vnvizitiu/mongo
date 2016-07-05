@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <ostream>
+
 #include "mongo/db/namespace_string.h"
 
 namespace mongo {
@@ -68,7 +70,7 @@ const string escapeTable[256] = {
 
 const char kConfigCollection[] = "admin.system.version";
 
-const StringData listIndexesCursorNSPrefix("$cmd.listIndexes.", StringData::LiteralTag());
+constexpr auto listIndexesCursorNSPrefix = "$cmd.listIndexes."_sd;
 
 }  // namespace
 
@@ -97,7 +99,7 @@ bool legalClientSystemNS(StringData ns, bool write) {
 const NamespaceString NamespaceString::kConfigCollectionNamespace(kConfigCollection);
 
 bool NamespaceString::isListCollectionsCursorNS() const {
-    return coll() == StringData("$cmd.listCollections", StringData::LiteralTag());
+    return coll() == "$cmd.listCollections"_sd;
 }
 
 bool NamespaceString::isListIndexesCursorNS() const {
@@ -120,6 +122,11 @@ string NamespaceString::escapeDbName(const StringData dbname) {
         escapedDbName += escapeTable[c];
     }
     return escapedDbName;
+}
+
+
+std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {
+    return stream << nss.toString();
 }
 
 }  // namespace mongo

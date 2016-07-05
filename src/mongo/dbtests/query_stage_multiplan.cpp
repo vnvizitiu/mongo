@@ -26,8 +26,11 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -39,17 +42,20 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
+
+const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
 extern std::atomic<bool> internalQueryForceIntersectionPlans;  // NOLINT
@@ -101,8 +107,15 @@ public:
         _client.remove(nss.ns(), obj);
     }
 
+    OperationContext* txn() {
+        return &_txn;
+    }
+
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
+    ClockSource* const _clock = _txn.getServiceContext()->getFastClockSource();
+
     DBDirectClient _client;
 };
 
@@ -145,8 +158,9 @@ public:
 
         // Make the filter.
         BSONObj filterObj = BSON("foo" << 7);
-        StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filterObj, ExtensionsCallbackDisallowExtensions());
+        const CollatorInterface* collator = nullptr;
+        StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
+            filterObj, ExtensionsCallbackDisallowExtensions(), collator);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filter = std::move(statusWithMatcher.getValue());
         // Make the stage.
@@ -154,8 +168,10 @@ public:
             new CollectionScan(&_txn, csparams, sharedWs.get(), filter.get()));
 
         // Hand the plans off to the MPS.
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(BSON("foo" << 7));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            nss, BSON("foo" << 7), ExtensionsCallbackDisallowExtensions());
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         verify(NULL != cq.get());
@@ -166,7 +182,7 @@ public:
         mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
         // Plan 0 aka the first plan aka the index scan should be the best.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, _clock);
         mps->pickBestPlan(&yieldPolicy);
         ASSERT(mps->bestPlanChosen());
         ASSERT_EQUALS(0, mps->bestPlanIdx());
@@ -210,11 +226,11 @@ public:
         Collection* collection = ctx.getCollection();
 
         // Query for both 'a' and 'b' and sort on 'b'.
-        auto statusWithCQ = CanonicalQuery::canonicalize(nss,
-                                                         BSON("a" << 1 << "b" << 1),  // query
-                                                         BSON("b" << 1),              // sort
-                                                         BSONObj(),                   // proj
-                                                         ExtensionsCallbackDisallowExtensions());
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(BSON("a" << 1 << "b" << 1));
+        qr->setSort(BSON("b" << 1));
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
@@ -250,7 +266,7 @@ public:
         }
 
         // This sets a backup plan.
-        PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, _clock);
         mps->pickBestPlan(&yieldPolicy);
         ASSERT(mps->bestPlanChosen());
         ASSERT(mps->hasBackupPlan());
@@ -316,8 +332,10 @@ public:
 
         AutoGetCollectionForRead ctx(&_txn, nss.ns());
 
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(BSON("x" << 1));
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
-            nss, BSON("x" << 1), ExtensionsCallbackDisallowExtensions()));
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
         unique_ptr<MultiPlanStage> mps =
             make_unique<MultiPlanStage>(&_txn, ctx.getCollection(), cq.get());
 
@@ -337,7 +355,8 @@ public:
         ASSERT_EQ(root->bestPlanIdx(), 0);
 
         BSONObjBuilder bob;
-        Explain::explainStages(exec.get(), ExplainCommon::EXEC_ALL_PLANS, &bob);
+        Explain::explainStages(
+            exec.get(), ctx.getCollection(), ExplainCommon::EXEC_ALL_PLANS, &bob);
         BSONObj explained = bob.done();
 
         ASSERT_EQ(explained["executionStats"]["nReturned"].Int(), nDocs);
@@ -390,9 +409,10 @@ public:
         Collection* coll = ctx.getCollection();
 
         // Create the executor (Matching all documents).
-        auto queryObj = BSON("foo" << BSON("$gte" << 0));
-        auto cq = uassertStatusOK(
-            CanonicalQuery::canonicalize(nss, queryObj, ExtensionsCallbackDisallowExtensions()));
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(BSON("foo" << BSON("$gte" << 0)));
+        auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
+            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
         auto exec =
             uassertStatusOK(getExecutor(&_txn, coll, std::move(cq), PlanExecutor::YIELD_MANUAL));
 

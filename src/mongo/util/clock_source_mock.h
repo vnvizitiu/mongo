@@ -43,12 +43,13 @@ public:
      */
     ClockSourceMock() = default;
 
+    Milliseconds getPrecision() override;
     Date_t now() final;
 
     /**
      * Advances the current time by the given value.
      */
-    void advance(stdx::chrono::milliseconds ms);
+    void advance(Milliseconds ms);
 
     /**
      * Resets the current time to the given value.

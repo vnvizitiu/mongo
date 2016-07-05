@@ -32,8 +32,8 @@
 
 #include "mongo/platform/basic.h"
 
-#include <ostream>
 #include <DbgHelp.h>
+#include <ostream>
 
 #include "mongo/config.h"
 #include "mongo/util/assert_util.h"
@@ -172,10 +172,6 @@ LONG WINAPI exceptionFilter(struct _EXCEPTION_POINTERS* excPointers) {
     // We won't reach here
     return EXCEPTION_EXECUTE_HANDLER;
 }
-}
-
-void doMinidump() {
-    doMinidumpWithException(NULL);
 }
 
 LPTOP_LEVEL_EXCEPTION_FILTER filtLast = 0;

@@ -32,6 +32,7 @@
 
 #include "mongo/scripting/mozjs/implscope.h"
 
+#include <js/CharacterEncoding.h>
 #include <jscustomallocator.h>
 #include <jsfriendapi.h>
 
@@ -242,10 +243,11 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
         if (engine->isJITEnabled()) {
             JS::RuntimeOptionsRef(_runtime)
                 .setAsmJS(true)
+                .setThrowOnAsmJSValidationFailure(true)
                 .setBaseline(true)
                 .setIon(true)
-                .setNativeRegExp(true)
-                .setUnboxedObjects(true);
+                .setAsyncStack(false)
+                .setNativeRegExp(true);
         }
 
         const StackLocator locator;
@@ -262,7 +264,19 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
             //
             // TODO: What if we are running on a platform with very
             // large pages, like 4MB?
-            JS_SetNativeStackQuota(_runtime, available.get() - (64 * 1024));
+            const int available_stack_space = available.get();
+
+#if defined(__powerpc64__) && defined(MONGO_CONFIG_DEBUG_BUILD)
+            // From experimentation, we need a larger reservation of 96k since debug ppc64le code
+            // needs more stack space to process stack overflow. In debug builds, more variables are
+            // stored on the stack which increases the stack pressure. It does not affects non-debug
+            // builds.
+            const int reserve_stack_space = 96 * 1024;
+#else
+            const int reserve_stack_space = 64 * 1024;
+#endif
+
+            JS_SetNativeStackQuota(_runtime, available_stack_space - reserve_stack_space);
         }
 
         // The memory limit is in megabytes
@@ -353,13 +367,13 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
     execSetup(JSFiles::assert);
     execSetup(JSFiles::types);
 
-    // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
-    if (_engine->getScopeInitCallback())
-        _engine->getScopeInitCallback()(*this);
-
     // install global utility functions
     installGlobalUtils(*this);
     _mongoHelpersProto.install(_global);
+
+    // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
+    if (_engine->getScopeInitCallback())
+        _engine->getScopeInitCallback()(*this);
 }
 
 MozJSImplScope::~MozJSImplScope() {
@@ -470,14 +484,20 @@ void MozJSImplScope::newFunction(StringData raw, JS::MutableHandleValue out) {
 
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
-    _checkErrorState(JS::Evaluate(_context, _global, co, code.c_str(), code.length(), out));
+    _checkErrorState(JS::Evaluate(_context, co, code.c_str(), code.length(), out));
 }
 
 BSONObj MozJSImplScope::callThreadArgs(const BSONObj& args) {
     MozJSEntry entry(this);
 
     JS::RootedValue function(_context);
-    ValueReader(_context, &function).fromBSONElement(args.firstElement(), args, true);
+    auto firstElem = args.firstElement();
+
+    // The first argument must be the thread start function
+    if (firstElem.type() != mongo::Code)
+        uasserted(ErrorCodes::BadValue, "first thread argument must be a function");
+
+    getScope(_context)->newFunction(firstElem.valueStringData(), &function);
 
     int argc = args.nFields() - 1;
 
@@ -520,7 +540,7 @@ void MozJSImplScope::_MozJSCreateFunction(const char* raw,
     JS::CompileOptions co(_context);
     setCompileOptions(&co);
 
-    _checkErrorState(JS::Evaluate(_context, _global, co, code.c_str(), code.length(), fun));
+    _checkErrorState(JS::Evaluate(_context, co, code.c_str(), code.length(), fun));
     uassert(10232,
             "not a function",
             fun.isObject() && JS_ObjectIsFunction(_context, fun.toObjectOrNull()));
@@ -629,7 +649,7 @@ bool MozJSImplScope::exec(StringData code,
     co.setFile(name.c_str());
     JS::RootedScript script(_context);
 
-    bool success = JS::Compile(_context, _global, co, code.rawData(), code.size(), &script);
+    bool success = JS::Compile(_context, co, code.rawData(), code.size(), &script);
 
     if (_checkErrorState(success, reportError, assertOnError))
         return false;
@@ -639,7 +659,7 @@ bool MozJSImplScope::exec(StringData code,
 
     JS::RootedValue out(_context);
 
-    success = JS_ExecuteScript(_context, _global, script, &out);
+    success = JS_ExecuteScript(_context, script, &out);
 
     if (timeoutMs)
         _engine->getDeadlineMonitor().stopDeadline(this);
@@ -752,9 +772,7 @@ void MozJSImplScope::installBSONTypes() {
     _nativeFunctionProto.install(_global);
     _numberIntProto.install(_global);
     _numberLongProto.install(_global);
-    if (Decimal128::enabled) {
-        _numberDecimalProto.install(_global);
-    }
+    _numberDecimalProto.install(_global);
     _objectProto.install(_global);
     _oidProto.install(_global);
     _regExpProto.install(_global);

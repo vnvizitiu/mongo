@@ -34,7 +34,6 @@
 
 #include "mongo/db/catalog/index_create.h"
 
-
 #include "mongo/base/error_codes.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/audit.h"
@@ -45,19 +44,25 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 
 using std::unique_ptr;
 using std::string;
 using std::endl;
+
+MONGO_FP_DECLARE(crashAfterStartingIndexBuild);
+MONGO_FP_DECLARE(hangAfterStartingIndexBuild);
 
 /**
  * On rollback sets MultiIndexBlock::_needToCleanup to true.
@@ -138,6 +143,11 @@ void MultiIndexBlock::removeExistingIndexes(std::vector<BSONObj>* specs) const {
     }
 }
 
+Status MultiIndexBlock::init(const BSONObj& spec) {
+    const auto indexes = std::vector<BSONObj>(1, spec);
+    return init(indexes);
+}
+
 Status MultiIndexBlock::init(const std::vector<BSONObj>& indexSpecs) {
     WriteUnitOfWork wunit(_txn);
 
@@ -146,7 +156,10 @@ Status MultiIndexBlock::init(const std::vector<BSONObj>& indexSpecs) {
 
     const string& ns = _collection->ns().ns();
 
-    Status status = _collection->getIndexCatalog()->checkUnfinished();
+    const auto idxCat = _collection->getIndexCatalog();
+    invariant(idxCat);
+    invariant(idxCat->ok());
+    Status status = idxCat->checkUnfinished();
     if (!status.isOK())
         return status;
 
@@ -213,6 +226,17 @@ Status MultiIndexBlock::init(const std::vector<BSONObj>& indexSpecs) {
         _backgroundOperation.reset(new BackgroundOperation(ns));
 
     wunit.commit();
+
+    if (MONGO_FAIL_POINT(crashAfterStartingIndexBuild)) {
+        log() << "Index build interrupted due to 'crashAfterStartingIndexBuild' failpoint. Exiting "
+                 "after waiting for changes to become durable.";
+        Locker::LockSnapshot lockInfo;
+        _txn->lockState()->saveLockStateAndUnlock(&lockInfo);
+        if (_txn->recoveryUnit()->waitUntilDurable()) {
+            quickExit(EXIT_TEST);
+        }
+    }
+
     return Status::OK();
 }
 
@@ -231,9 +255,9 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
         _txn, _collection->ns().ns(), _collection, PlanExecutor::YIELD_MANUAL));
     if (_buildInBackground) {
         invariant(_allowInterruption);
-        exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
+        exec->setYieldPolicy(PlanExecutor::YIELD_AUTO, _collection);
     } else {
-        exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY);
+        exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY, _collection);
     }
 
     Snapshotted<BSONObj> objToIndex;
@@ -259,6 +283,8 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
 
             WriteUnitOfWork wunit(_txn);
             Status ret = insert(objToIndex.value(), loc);
+            if (_buildInBackground)
+                exec->saveState();
             if (ret.isOK()) {
                 wunit.commit();
             } else if (dupsOut && ret.code() == ErrorCodes::DuplicateKey) {
@@ -269,6 +295,8 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
                 // Fail the index build hard.
                 return ret;
             }
+            if (_buildInBackground)
+                exec->restoreState();  // Handles any WCEs internally.
 
             // Go to the next document
             progress->hit();
@@ -291,6 +319,13 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
             "Unable to complete index build due to collection scan failure: " +
                 WorkingSetCommon::toStatusString(objToIndex.value()),
             state == PlanExecutor::IS_EOF);
+
+    // Need the index build to hang before the progress meter is marked as finished so we can
+    // reliably check that the index build has actually started in js tests.
+    while (MONGO_FAIL_POINT(hangAfterStartingIndexBuild)) {
+        log() << "Hanging index build due to 'hangAfterStartingIndexBuild' failpoint";
+        sleepmillis(1000);
+    }
 
     progress->finished();
 

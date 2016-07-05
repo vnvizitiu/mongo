@@ -13,9 +13,7 @@ load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');
 
 var $config = (function() {
     // TODO: This workload may fail if an iteration multiplier is specified.
-    var data = {
-        prefix: 'convert_to_capped_collection'
-    };
+    var data = {prefix: 'convert_to_capped_collection'};
 
     var states = (function() {
 
@@ -32,7 +30,7 @@ var $config = (function() {
 
             var bulk = db[this.threadCollName].initializeUnorderedBulkOp();
             for (var i = 0; i < (this.tid + 1) * 200; i++) {
-                bulk.insert({ i: i, rand: Random.rand() });
+                bulk.insert({i: i, rand: Random.rand()});
             }
 
             var res = bulk.execute();
@@ -58,20 +56,14 @@ var $config = (function() {
             var indexKeys = db[this.threadCollName].getIndexKeys();
             assertWhenOwnDB.eq(1, indexKeys.length);
             assertWhenOwnDB(function() {
-                assertWhenOwnDB.docEq({ _id: 1 }, indexKeys[0]);
+                assertWhenOwnDB.docEq({_id: 1}, indexKeys[0]);
             });
         }
 
-        return {
-            init: init,
-            convertToCapped: convertToCapped
-        };
+        return {init: init, convertToCapped: convertToCapped};
     })();
 
-    var transitions = {
-        init: { convertToCapped: 1 },
-        convertToCapped: { convertToCapped: 1 }
-    };
+    var transitions = {init: {convertToCapped: 1}, convertToCapped: {convertToCapped: 1}};
 
     function setup(db, collName, cluster) {
         // Initial size should not be a power of 256.

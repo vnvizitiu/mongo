@@ -17,26 +17,26 @@ var $config = (function() {
     var states = {
         update: function update(db, collName) {
             var from = choose(fieldNames);
-            var to   = choose(fieldNames.filter(function(n) { return n !== from; }));
-            var updater = { $rename: {} };
+            var to = choose(fieldNames.filter(function(n) {
+                return n !== from;
+            }));
+            var updater = {$rename: {}};
             updater.$rename[from] = to;
 
             var query = {};
-            query[from] = { $exists: 1 };
+            query[from] = {$exists: 1};
 
             var res = db[collName].update(query, updater);
 
             assertAlways.eq(0, res.nUpserted, tojson(res));
-            assertWhenOwnColl.contains(res.nMatched, [0, 1],  tojson(res));
+            assertWhenOwnColl.contains(res.nMatched, [0, 1], tojson(res));
             if (db.getMongo().writeMode() === 'commands') {
                 assertWhenOwnColl.eq(res.nMatched, res.nModified, tojson(res));
             }
         }
     };
 
-    var transitions = {
-        update: { update: 1 }
-    };
+    var transitions = {update: {update: 1}};
 
     function setup(db, collName, cluster) {
         // Create an index on all but one fieldName key to make it possible to test renames

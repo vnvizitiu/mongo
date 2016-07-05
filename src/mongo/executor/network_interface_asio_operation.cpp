@@ -34,7 +34,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/executor/async_stream_interface.h"
 #include "mongo/executor/connection_pool_asio.h"
 #include "mongo/executor/downconvert_find_and_getmore_commands.h"
@@ -99,6 +99,9 @@ StatusWith<Message> messageFromRequest(const RemoteCommandRequest& request,
 }
 
 }  // namespace
+
+const NetworkInterfaceASIO::TableRow NetworkInterfaceASIO::AsyncOp::kFieldLabels = {
+    "", "id", "states", "start_time", "request"};
 
 NetworkInterfaceASIO::AsyncOp::AsyncOp(NetworkInterfaceASIO* const owner,
                                        const TaskExecutor::CallbackHandle& cbHandle,
@@ -197,7 +200,7 @@ Status NetworkInterfaceASIO::AsyncOp::beginCommand(const RemoteCommandRequest& r
                                                    rpc::EgressMetadataHook* metadataHook) {
     // Check if we need to downconvert find or getMore commands.
     StringData commandName = request.cmdObj.firstElement().fieldNameStringData();
-    const auto isFindCmd = commandName == LiteParsedQuery::kFindCommandName;
+    const auto isFindCmd = commandName == QueryRequest::kFindCommandName;
     const auto isGetMoreCmd = commandName == GetMoreRequest::kGetMoreCommandName;
     const auto isFindOrGetMoreCmd = isFindCmd || isGetMoreCmd;
 
@@ -238,6 +241,10 @@ NetworkInterfaceASIO::AsyncCommand* NetworkInterfaceASIO::AsyncOp::command() {
 void NetworkInterfaceASIO::AsyncOp::finish(const ResponseStatus& status) {
     // We never hold the access lock when we call finish from NetworkInterfaceASIO.
     _transitionToState(AsyncOp::State::kFinished);
+
+    LOG(2) << "Request " << _request.id << " finished with response: "
+           << (status.getStatus().isOK() ? status.getValue().data.toString()
+                                         : status.getStatus().toString());
 
     // Calling the completion handler may invalidate state in this op, so do it last.
     _onFinish(status);
@@ -296,7 +303,7 @@ void NetworkInterfaceASIO::AsyncOp::setOnFinish(RemoteCommandCompletionFn&& onFi
 std::string NetworkInterfaceASIO::AsyncOp::_stateToString(AsyncOp::State state) const {
     switch (state) {
         case State::kUninitialized:
-            return "UNITIALIZED";
+            return "UNINITIALIZED";
         case State::kInProgress:
             return "IN_PROGRESS";
         case State::kTimedOut:
@@ -340,10 +347,21 @@ NetworkInterfaceASIO::TableRow NetworkInterfaceASIO::AsyncOp::getStringFields() 
 
 std::string NetworkInterfaceASIO::AsyncOp::toString() const {
     str::stream s;
+    int fieldIdx = 1;
+    bool first = true;
+
     for (auto field : getStringFields()) {
-        s << field << "\t\t";
+        if (field != "") {
+            if (first) {
+                first = false;
+            } else {
+                s << ", ";
+            }
+
+            s << kFieldLabels[fieldIdx] << ": " << field;
+            fieldIdx++;
+        }
     }
-    s << "\n";
     return s;
 }
 
@@ -352,9 +370,9 @@ bool NetworkInterfaceASIO::AsyncOp::operator==(const AsyncOp& other) const {
 }
 
 bool NetworkInterfaceASIO::AsyncOp::_hasSeenState(AsyncOp::State state) const {
-    return std::any_of(std::begin(_states),
-                       std::end(_states),
-                       [state](AsyncOp::State _state) { return _state == state; });
+    return std::any_of(std::begin(_states), std::end(_states), [state](AsyncOp::State _state) {
+        return _state == state;
+    });
 }
 
 void NetworkInterfaceASIO::AsyncOp::_transitionToState(AsyncOp::State newState) {
@@ -375,9 +393,9 @@ void NetworkInterfaceASIO::AsyncOp::_transitionToState_inlock(AsyncOp::State new
     // multiple times.  Ignore that transition if we're already cancelled.
     if (newState == State::kCanceled) {
         // Find the current state
-        auto iter = std::find_if_not(_states.rbegin(),
-                                     _states.rend(),
-                                     [](const State& state) { return state == State::kNoState; });
+        auto iter = std::find_if_not(_states.rbegin(), _states.rend(), [](const State& state) {
+            return state == State::kNoState;
+        });
 
         // If its cancelled, just return
         if (iter != _states.rend() && *iter == State::kCanceled) {
@@ -399,6 +417,9 @@ void NetworkInterfaceASIO::AsyncOp::_transitionToState_inlock(AsyncOp::State new
                                              "kInProgress must come directly after kUninitialized");
                     break;
                 case State::kTimedOut:
+                    // During connection setup, it is possible to timeout before the stream is
+                    // initialized, so we have to allow this transition.
+                    break;
                 case State::kCanceled:
                     MONGO_ASYNC_OP_INVARIANT(
                         i > 1, _stateToString(newState) + " must come after kInProgress");
@@ -427,8 +448,8 @@ void NetworkInterfaceASIO::AsyncOp::_failWithInfo(const char* file,
                                                   int line,
                                                   std::string error) const {
     std::stringstream ss;
-    ss << "Invariant failure at " << file << ":" << line << ": " << error;
-    ss << "\n\t Operation: " << toString();
+    ss << "Invariant failure at " << file << ":" << line << ": " << error
+       << ", Operation: " << toString();
     Status status{ErrorCodes::InternalError, ss.str()};
     fassertFailedWithStatus(34430, status);
 }

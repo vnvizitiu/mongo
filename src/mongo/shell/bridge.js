@@ -191,8 +191,9 @@ function MongoBridge(options) {
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'acceptConnectionsFrom', {host: bridge.dest});
-            assert.commandWorked(res, 'failed to configure the mongobridge listening on port ' +
-                                 this.port + ' to accept new connections from ' + bridge.dest);
+            assert.commandWorked(res,
+                                 'failed to configure the mongobridge listening on port ' +
+                                     this.port + ' to accept new connections from ' + bridge.dest);
         });
     };
 
@@ -210,8 +211,9 @@ function MongoBridge(options) {
 
         bridges.forEach(bridge => {
             var res = runBridgeCommand(controlConn, 'rejectConnectionsFrom', {host: bridge.dest});
-            assert.commandWorked(res, 'failed to configure the mongobridge listening on port ' +
-                                 this.port + ' to hang up connections from ' + bridge.dest);
+            assert.commandWorked(res,
+                                 'failed to configure the mongobridge listening on port ' +
+                                     this.port + ' to hang up connections from ' + bridge.dest);
         });
     };
 
@@ -233,9 +235,10 @@ function MongoBridge(options) {
                 host: bridge.dest,
                 delay: delay,
             });
-            assert.commandWorked(res, 'failed to configure the mongobridge listening on port ' +
-                                 this.port + ' to delay messages from ' + bridge.dest + ' by ' +
-                                 delay + ' milliseconds');
+            assert.commandWorked(res,
+                                 'failed to configure the mongobridge listening on port ' +
+                                     this.port + ' to delay messages from ' + bridge.dest + ' by ' +
+                                     delay + ' milliseconds');
         });
     };
 
@@ -257,9 +260,10 @@ function MongoBridge(options) {
                 host: bridge.dest,
                 loss: lossProbability,
             });
-            assert.commandWorked(res, 'failed to configure the mongobridge listening on port ' +
-                                 this.port + ' to discard messages from ' + bridge.dest +
-                                 ' with probability ' + lossProbability);
+            assert.commandWorked(res,
+                                 'failed to configure the mongobridge listening on port ' +
+                                     this.port + ' to discard messages from ' + bridge.dest +
+                                     ' with probability ' + lossProbability);
         });
     };
 
@@ -268,7 +272,8 @@ function MongoBridge(options) {
     // prototypical inheritance isn't possible.
     return new Proxy(this, {
         get: function get(target, property, receiver) {
-            // If the property is defined on the MongoBridge instance itself, then return it.
+            // If the property is defined on the MongoBridge instance itself, then
+            // return it.
             // Otherwise, get the value of the property from the Mongo instance.
             if (target.hasOwnProperty(property)) {
                 return target[property];
@@ -281,9 +286,12 @@ function MongoBridge(options) {
         },
 
         set: function set(target, property, value, receiver) {
-            // Delegate setting the value of any property to the Mongo instance so that it can be
-            // accessed in functions acting on the Mongo instance directly instead of this Proxy.
-            // For example, the "slaveOk" property needs to be set on the Mongo instance in order
+            // Delegate setting the value of any property to the Mongo instance so
+            // that it can be
+            // accessed in functions acting on the Mongo instance directly instead of
+            // this Proxy.
+            // For example, the "slaveOk" property needs to be set on the Mongo
+            // instance in order
             // for the query options bit to be set correctly.
             userConn[property] = value;
             return true;

@@ -31,7 +31,7 @@
 
 #pragma once
 
-#include <set>
+#include <queue>
 #include <string>
 
 #include <wiredtiger.h>
@@ -44,6 +44,7 @@
 
 namespace mongo {
 
+class ClockSource;
 class JournalListener;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
@@ -52,11 +53,14 @@ class WiredTigerKVEngine final : public KVEngine {
 public:
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
+                       ClockSource* cs,
                        const std::string& extraOpenOptions,
                        size_t cacheSizeGB,
                        bool durable,
                        bool ephemeral,
-                       bool repair);
+                       bool repair,
+                       bool readOnly);
+
     virtual ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -132,7 +136,7 @@ public:
     WT_CONNECTION* getConnection() {
         return _conn;
     }
-    void dropAllQueued();
+    void dropSomeQueuedIdents();
     bool haveDropsQueued() const;
 
     void syncSizeInfo(bool sync) const;
@@ -170,13 +174,15 @@ private:
 
     bool _durable;
     bool _ephemeral;
+    bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
 
     std::string _rsOptions;
     std::string _indexOptions;
 
+    mutable stdx::mutex _dropAllQueuesMutex;
     mutable stdx::mutex _identToDropMutex;
-    std::set<std::string> _identToDrop;
+    std::queue<std::string> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 

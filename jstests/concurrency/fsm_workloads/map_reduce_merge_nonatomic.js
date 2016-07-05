@@ -13,9 +13,9 @@
  *
  * Specifies nonAtomic=true.
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/map_reduce_inline.js'); // for $config
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropDatabases
+load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
+load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
+load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropDatabases
 
 var $config = extendWorkload($config, function($config, $super) {
 
@@ -43,11 +43,7 @@ var $config = extendWorkload($config, function($config, $super) {
 
         var options = {
             finalize: this.finalizer,
-            out: {
-                merge: collName,
-                db: this.outDBName,
-                nonAtomic: true
-            }
+            out: {merge: collName, db: this.outDBName, nonAtomic: true}
         };
 
         var res = db[collName].mapReduce(this.mapper, this.reducer, options);

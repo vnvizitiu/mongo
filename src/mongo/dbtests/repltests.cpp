@@ -36,11 +36,11 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
@@ -66,7 +66,8 @@ BSONObj f(const char* s) {
 
 class Base {
 protected:
-    mutable OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     mutable DBDirectClient _client;
 
 public:
@@ -75,6 +76,8 @@ public:
         replSettings.setOplogSizeBytes(10 * 1024 * 1024);
         replSettings.setMaster(true);
         setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
+
+        getGlobalServiceContext()->setOpObserver(stdx::make_unique<OpObserver>());
 
         setOplogCollectionName();
         createOplog(&_txn);
@@ -246,9 +249,10 @@ protected:
             coll = db->createCollection(&_txn, ns());
         }
 
+        OpDebug* const nullOpDebug = nullptr;
         if (o.hasField("_id")) {
             _txn.setReplicatedWrites(false);
-            coll->insertDocument(&_txn, o, true);
+            coll->insertDocument(&_txn, o, nullOpDebug, true);
             _txn.setReplicatedWrites(true);
             wunit.commit();
             return;
@@ -260,7 +264,7 @@ protected:
         b.appendOID("_id", &id);
         b.appendElements(o);
         _txn.setReplicatedWrites(false);
-        coll->insertDocument(&_txn, b.obj(), true);
+        coll->insertDocument(&_txn, b.obj(), nullOpDebug, true);
         _txn.setReplicatedWrites(true);
         wunit.commit();
     }
@@ -912,7 +916,8 @@ public:
         _client.insert("unittests.system.indexes",
                        BSON("ns" << ns() << "key" << BSON("a" << 1) << "name"
                                  << "foo"
-                                 << "sparse" << true));
+                                 << "sparse"
+                                 << true));
     }
     ~EmptyPushSparseIndex() {
         _client.dropIndexes(ns());
@@ -1406,10 +1411,12 @@ public:
     void run() {
         bool threw = false;
         BSONObj o = BSON("ns" << ns() << "o" << BSON("foo"
-                                                     << "bar") << "o2" << BSON("_id"
-                                                                               << "in oplog"
-                                                                               << "foo"
-                                                                               << "bar"));
+                                                     << "bar")
+                              << "o2"
+                              << BSON("_id"
+                                      << "in oplog"
+                                      << "foo"
+                                      << "bar"));
 
         ScopedTransaction transaction(&_txn, MODE_X);
         Lock::GlobalWrite lk(_txn.lockState());
@@ -1429,9 +1436,11 @@ public:
         // now this should succeed
         SyncTest t;
         verify(t.shouldRetry(&_txn, o));
-        verify(!_client.findOne(ns(),
-                                BSON("_id"
-                                     << "on remote")).isEmpty());
+        verify(!_client
+                    .findOne(ns(),
+                             BSON("_id"
+                                  << "on remote"))
+                    .isEmpty());
 
         // force it not to find an obj
         t.returnEmpty = true;

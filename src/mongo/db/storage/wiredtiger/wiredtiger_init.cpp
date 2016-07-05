@@ -33,20 +33,20 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_parameters.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -61,28 +61,18 @@ public:
             warning() << "Recovering data from the last clean checkpoint.";
         }
 
-        size_t cacheSizeGB = wiredTigerGlobalOptions.cacheSizeGB;
-        if (cacheSizeGB == 0) {
-            // Since the user didn't provide a cache size, choose a reasonable default value.
-            // We want to reserve 1GB for the system and binaries, but it's not bad to
-            // leave a fair amount left over for pagecache since that's compressed storage.
-            ProcessInfo pi;
-            double memSizeMB = pi.getMemSizeMB();
-            if (memSizeMB > 0) {
-                double cacheMB = (memSizeMB - 1024) * 0.6;
-                cacheSizeGB = static_cast<size_t>(cacheMB / 1024);
-                if (cacheSizeGB < 1)
-                    cacheSizeGB = 1;
-            }
-        }
+        size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
         const bool ephemeral = false;
-        WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
-                                                        params.dbpath,
-                                                        wiredTigerGlobalOptions.engineConfig,
-                                                        cacheSizeGB,
-                                                        params.dur,
-                                                        ephemeral,
-                                                        params.repair);
+        WiredTigerKVEngine* kv =
+            new WiredTigerKVEngine(getCanonicalName().toString(),
+                                   params.dbpath,
+                                   getGlobalServiceContext()->getFastClockSource(),
+                                   wiredTigerGlobalOptions.engineConfig,
+                                   cacheMB,
+                                   params.dur,
+                                   ephemeral,
+                                   params.repair,
+                                   params.readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
         // Intentionally leaked.
@@ -130,6 +120,10 @@ public:
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
         return builder.obj();
+    }
+
+    bool supportsReadOnly() const final {
+        return true;
     }
 };
 }  // namespace

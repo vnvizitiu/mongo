@@ -39,7 +39,9 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharding_raii.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -78,7 +80,7 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
     LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
 
     if (_implicitCreateDb) {
-        uassertStatusOK(grid.implicitCreateDb(txn, dbName));
+        uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, dbName));
     }
 
     std::vector<ShardId> shardIds;
@@ -102,6 +104,11 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
 
     std::list<std::shared_ptr<Future::CommandResult>>::iterator futuresit;
     std::vector<ShardId>::const_iterator shardIdsIt;
+
+    BSONElement wcErrorElem;
+    ShardId wcErrorShardId;
+    bool hasWCError = false;
+
     // We iterate over the set of shard ids and their corresponding futures in parallel.
     // TODO: replace with zip iterator if we ever decide to use one from Boost or elsewhere
     for (futuresit = futures.begin(), shardIdsIt = shardIds.cbegin();
@@ -112,12 +119,26 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
         if (res->join(txn)) {
             // success :)
             BSONObj result = res->result();
-            results.emplace_back(*shardIdsIt, result);
+            results.emplace_back(shardIdsIt->toString(), result);
             subobj.append(res->getServer(), result);
+
+            if (!hasWCError) {
+                if ((wcErrorElem = result["writeConcernError"])) {
+                    wcErrorShardId = *shardIdsIt;
+                    hasWCError = true;
+                }
+            }
             continue;
         }
 
         BSONObj result = res->result();
+
+        if (!hasWCError) {
+            if ((wcErrorElem = result["writeConcernError"])) {
+                wcErrorShardId = *shardIdsIt;
+                hasWCError = true;
+            }
+        }
 
         if (result["errmsg"].type() || result["code"].numberInt() != 0) {
             result = specialErrorHandler(res->getServer(), dbName, cmdObj, result);
@@ -125,7 +146,7 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
             BSONElement errmsgObj = result["errmsg"];
             if (errmsgObj.eoo() || errmsgObj.String().empty()) {
                 // it was fixed!
-                results.emplace_back(*shardIdsIt, result);
+                results.emplace_back(shardIdsIt->toString(), result);
                 subobj.append(res->getServer(), result);
                 continue;
             }
@@ -147,13 +168,18 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
         } else if (commonErrCode != errCode) {
             commonErrCode = 0;
         }
-        results.emplace_back(*shardIdsIt, result);
+        results.emplace_back(shardIdsIt->toString(), result);
         subobj.append(res->getServer(), result);
     }
 
     subobj.done();
 
+    if (hasWCError) {
+        appendWriteConcernErrorToCmdResponse(wcErrorShardId, wcErrorElem, output);
+    }
+
     BSONObj errobj = errors.done();
+
     if (!errobj.isEmpty()) {
         errmsg = errobj.toString(false, true);
 

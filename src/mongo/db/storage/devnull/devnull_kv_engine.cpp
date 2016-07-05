@@ -104,20 +104,26 @@ public:
         return StatusWith<RecordId>(RecordId(6, 4));
     }
 
-    virtual StatusWith<RecordId> insertRecord(OperationContext* txn,
-                                              const DocWriter* doc,
-                                              bool enforceQuota) {
-        _numInserts++;
-        return StatusWith<RecordId>(RecordId(6, 4));
+    virtual Status insertRecordsWithDocWriter(OperationContext* txn,
+                                              const DocWriter* const* docs,
+                                              size_t nDocs,
+                                              RecordId* idsOut) {
+        _numInserts += nDocs;
+        if (idsOut) {
+            for (size_t i = 0; i < nDocs; i++) {
+                idsOut[i] = RecordId(6, 4);
+            }
+        }
+        return Status::OK();
     }
 
-    virtual StatusWith<RecordId> updateRecord(OperationContext* txn,
-                                              const RecordId& oldLocation,
-                                              const char* data,
-                                              int len,
-                                              bool enforceQuota,
-                                              UpdateNotifier* notifier) {
-        return StatusWith<RecordId>(oldLocation);
+    virtual Status updateRecord(OperationContext* txn,
+                                const RecordId& oldLocation,
+                                const char* data,
+                                int len,
+                                bool enforceQuota,
+                                UpdateNotifier* notifier) {
+        return Status::OK();
     }
 
     virtual bool updateWithDamagesSupported() const {
@@ -145,8 +151,7 @@ public:
     virtual void temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive) {}
 
     virtual Status validate(OperationContext* txn,
-                            bool full,
-                            bool scanData,
+                            ValidateCmdLevel level,
                             ValidateAdaptor* adaptor,
                             ValidateResults* results,
                             BSONObjBuilder* output) {
@@ -209,9 +214,8 @@ public:
     }
 
     virtual void fullValidate(OperationContext* txn,
-                              bool full,
                               long long* numKeysOut,
-                              BSONObjBuilder* output) const {}
+                              ValidateResults* fullResults) const {}
 
     virtual bool appendCustomStats(OperationContext* txn,
                                    BSONObjBuilder* output,

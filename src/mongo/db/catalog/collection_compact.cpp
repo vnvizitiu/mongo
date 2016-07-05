@@ -34,13 +34,13 @@
 
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/document_validation.h"
-#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
@@ -111,12 +111,24 @@ StatusWith<CompactStats> Collection::compact(OperationContext* txn,
                                             << _recordStore->name());
 
     if (_recordStore->compactsInPlace()) {
-        // Since we are compacting in-place, we don't need to touch the indexes.
-        // TODO SERVER-16856 compact indexes
         CompactStats stats;
         Status status = _recordStore->compact(txn, NULL, compactOptions, &stats);
         if (!status.isOK())
             return StatusWith<CompactStats>(status);
+
+        // Compact all indexes (not including unfinished indexes)
+        IndexCatalog::IndexIterator ii(_indexCatalog.getIndexIterator(txn, false));
+        while (ii.more()) {
+            IndexDescriptor* descriptor = ii.next();
+            IndexAccessMethod* index = _indexCatalog.getIndex(descriptor);
+
+            LOG(1) << "compacting index: " << descriptor->toString();
+            Status status = index->compact(txn);
+            if (!status.isOK()) {
+                error() << "failed to compact index: " << descriptor->toString();
+                return status;
+            }
+        }
 
         return StatusWith<CompactStats>(stats);
     }
@@ -138,7 +150,9 @@ StatusWith<CompactStats> Collection::compact(OperationContext* txn,
                 return StatusWith<CompactStats>(
                     ErrorCodes::CannotCreateIndex,
                     str::stream() << "Cannot compact collection due to invalid index " << spec
-                                  << ": " << keyStatus.reason() << " For more info see"
+                                  << ": "
+                                  << keyStatus.reason()
+                                  << " For more info see"
                                   << " http://dochub.mongodb.org/core/index-validation");
             }
             indexSpecs.push_back(spec);

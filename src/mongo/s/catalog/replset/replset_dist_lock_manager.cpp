@@ -34,18 +34,20 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/catalog/dist_lock_catalog.h"
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -54,8 +56,6 @@ MONGO_FP_DECLARE(setDistLockTimeout);
 
 using std::string;
 using std::unique_ptr;
-using stdx::chrono::milliseconds;
-using stdx::chrono::duration_cast;
 
 namespace {
 
@@ -70,8 +70,8 @@ const Minutes ReplSetDistLockManager::kDistLockExpirationTime{15};
 ReplSetDistLockManager::ReplSetDistLockManager(ServiceContext* globalContext,
                                                StringData processID,
                                                unique_ptr<DistLockCatalog> catalog,
-                                               milliseconds pingInterval,
-                                               milliseconds lockExpiration)
+                                               Milliseconds pingInterval,
+                                               Milliseconds lockExpiration)
     : _serviceContext(globalContext),
       _processID(processID.toString()),
       _catalog(std::move(catalog)),
@@ -86,8 +86,7 @@ void ReplSetDistLockManager::startUp() {
     }
 }
 
-void ReplSetDistLockManager::shutDown(OperationContext* txn, bool allowNetworking) {
-    invariant(allowNetworking);
+void ReplSetDistLockManager::shutDown(OperationContext* txn) {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _isShutDown = true;
@@ -133,7 +132,7 @@ void ReplSetDistLockManager::doTask() {
                 warning() << "pinging failed for distributed lock pinger" << causedBy(pingStatus);
             }
 
-            const milliseconds elapsed(elapsedSincelastPing.millis());
+            const Milliseconds elapsed(elapsedSincelastPing.millis());
             if (elapsed > 10 * _pingInterval) {
                 warning() << "Lock pinger for proc: " << _processID << " was inactive for "
                           << elapsed << " ms";
@@ -165,13 +164,13 @@ void ReplSetDistLockManager::doTask() {
         }
 
         stdx::unique_lock<stdx::mutex> lk(_mutex);
-        _shutDownCV.wait_for(lk, _pingInterval);
+        _shutDownCV.wait_for(lk, _pingInterval.toSystemDuration());
     }
 }
 
-StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(OperationContext* txn,
-                                                         LocksType lockDoc,
-                                                         const milliseconds& lockExpiration) {
+StatusWith<bool> ReplSetDistLockManager::isLockExpired(OperationContext* txn,
+                                                       LocksType lockDoc,
+                                                       const Milliseconds& lockExpiration) {
     const auto& processID = lockDoc.getProcess();
     auto pingStatus = _catalog->getPing(txn, processID);
 
@@ -199,7 +198,7 @@ StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(OperationContext* txn,
     // Be conservative when determining that lock expiration has elapsed by
     // taking into account the roundtrip delay of trying to get the local
     // time from the config server.
-    milliseconds delay(timer.millis() / 2);  // Assuming symmetrical delay.
+    Milliseconds delay(timer.millis() / 2);  // Assuming symmetrical delay.
 
     const auto& serverInfo = serverInfoStatus.getValue();
 
@@ -249,7 +248,7 @@ StatusWith<bool> ReplSetDistLockManager::canOvertakeLock(OperationContext* txn,
         return false;
     }
 
-    milliseconds elapsedSinceLastPing(configServerLocalTime - pingInfo->configLocalTime);
+    Milliseconds elapsedSinceLastPing(configServerLocalTime - pingInfo->configLocalTime);
     if (elapsedSinceLastPing >= lockExpiration) {
         LOG(0) << "forcing lock '" << lockDoc.getName() << "' because elapsed time "
                << elapsedSinceLastPing << " >= takeover time " << lockExpiration;
@@ -266,8 +265,18 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
     OperationContext* txn,
     StringData name,
     StringData whyMessage,
-    milliseconds waitFor,
-    milliseconds lockTryInterval) {
+    Milliseconds waitFor,
+    Milliseconds lockTryInterval) {
+    return lockWithSessionID(txn, name, whyMessage, OID::gen(), waitFor, lockTryInterval);
+}
+
+StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lockWithSessionID(
+    OperationContext* txn,
+    StringData name,
+    StringData whyMessage,
+    const OID lockSessionID,
+    Milliseconds waitFor,
+    Milliseconds lockTryInterval) {
     Timer timer(_serviceContext->getTickSource());
     Timer msgTimer(_serviceContext->getTickSource());
 
@@ -276,18 +285,18 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
     // independent write operations.
     int networkErrorRetries = 0;
 
+    auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
     // Distributed lock acquisition works by tring to update the state of the lock to 'taken'. If
     // the lock is currently taken, we will back off and try the acquisition again, repeating this
     // until the lockTryInterval has been reached. If a network error occurs at each lock
     // acquisition attempt, the lock acquisition will be retried immediately.
-    while (waitFor <= milliseconds::zero() || milliseconds(timer.millis()) < waitFor) {
-        const OID lockSessionID = OID::gen();
+    while (waitFor <= Milliseconds::zero() || Milliseconds(timer.millis()) < waitFor) {
         const string who = str::stream() << _processID << ":" << getThreadName();
 
         auto lockExpiration = _lockExpiration;
         MONGO_FAIL_POINT_BLOCK(setDistLockTimeout, customTimeout) {
             const BSONObj& data = customTimeout.getData();
-            lockExpiration = stdx::chrono::milliseconds(data["timeoutMs"].numberInt());
+            lockExpiration = Milliseconds(data["timeoutMs"].numberInt());
         }
 
         LOG(1) << "trying to acquire new distributed lock for " << name
@@ -310,7 +319,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         }
 
         // If a network error occurred, unlock the lock synchronously and try again
-        if (ShardRegistry::kAllRetriableErrors.count(status.code()) &&
+        if (configShard->isRetriableError(status.code(), Shard::RetryPolicy::kIdempotent) &&
             networkErrorRetries < kMaxNumLockAcquireRetries) {
             LOG(1) << "Failed to acquire distributed lock because of retriable error. Retrying "
                       "acquisition by first unlocking the stale entry, which possibly exists now"
@@ -351,13 +360,13 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         // found, use the normal grab lock path to acquire it.
         if (getLockStatusResult.isOK()) {
             auto currentLock = getLockStatusResult.getValue();
-            auto canOvertakeResult = canOvertakeLock(txn, currentLock, lockExpiration);
+            auto isLockExpiredResult = isLockExpired(txn, currentLock, lockExpiration);
 
-            if (!canOvertakeResult.isOK()) {
-                return canOvertakeResult.getStatus();
+            if (!isLockExpiredResult.isOK()) {
+                return isLockExpiredResult.getStatus();
             }
 
-            if (canOvertakeResult.getValue()) {
+            if (isLockExpiredResult.getValue() || (lockSessionID == currentLock.getLockID())) {
                 auto overtakeResult = _catalog->overtakeLock(txn,
                                                              name,
                                                              lockSessionID,
@@ -389,7 +398,7 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
 
         LOG(1) << "distributed lock '" << name << "' was not acquired.";
 
-        if (waitFor == milliseconds::zero()) {
+        if (waitFor == Milliseconds::zero()) {
             break;
         }
 
@@ -405,8 +414,8 @@ StatusWith<DistLockManager::ScopedDistLock> ReplSetDistLockManager::lock(
         // busy, so reset the retries counter)
         networkErrorRetries = 0;
 
-        const milliseconds timeRemaining =
-            std::max(milliseconds::zero(), waitFor - milliseconds(timer.millis()));
+        const Milliseconds timeRemaining =
+            std::max(Milliseconds::zero(), waitFor - Milliseconds(timer.millis()));
         sleepFor(std::min(lockTryInterval, timeRemaining));
     }
 

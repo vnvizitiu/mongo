@@ -119,7 +119,7 @@ class StageDebugCmd : public Command {
 public:
     StageDebugCmd() : Command("stageDebug") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     bool slaveOk() const {
@@ -154,20 +154,24 @@ public:
         if (collElt.eoo() || (String != collElt.type())) {
             return false;
         }
-        string collName = collElt.String();
+
+        const NamespaceString nss(dbname, collElt.String());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.toString() << " is not a valid namespace",
+                nss.isValid());
 
         // Need a context to get the actual Collection*
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
         ScopedTransaction transaction(txn, MODE_IX);
-        Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-        OldClientContext ctx(txn, dbname);
+        AutoGetCollection autoColl(txn, nss, MODE_IX);
 
         // Make sure the collection is valid.
-        Database* db = ctx.db();
-        Collection* collection = db->getCollection(db->name() + '.' + collName);
-        uassert(17446, "Couldn't find the collection " + collName, NULL != collection);
+        Collection* collection = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Couldn't find collection " << nss.ns(),
+                collection);
 
         // Pull out the plan
         BSONElement planElt = argObj["plan"];
@@ -208,12 +212,12 @@ public:
                     << PlanExecutor::statestr(state)
                     << ", stats: " << Explain::getWinningPlanStats(exec.get());
 
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream()
-                           << "Executor error during "
-                           << "StageDebug command: " << WorkingSetCommon::toStatusString(obj)));
+            return appendCommandStatus(result,
+                                       Status(ErrorCodes::OperationFailed,
+                                              str::stream()
+                                                  << "Executor error during "
+                                                  << "StageDebug command: "
+                                                  << WorkingSetCommon::toStatusString(obj)));
         }
 
         return true;
@@ -245,8 +249,9 @@ public:
             }
             BSONObj argObj = e.Obj();
             if (filterTag == e.fieldName()) {
+                const CollatorInterface* collator = nullptr;
                 StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                    argObj, ExtensionsCallbackReal(txn, &collection->ns()));
+                    argObj, ExtensionsCallbackReal(txn, &collection->ns()), collator);
                 if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }

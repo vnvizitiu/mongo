@@ -1,5 +1,3 @@
-//@file chunktests.cpp : s/chunk.{h,cpp} tests
-
 /**
  *    Copyright (C) 2012 10gen Inc.
  *
@@ -56,12 +54,16 @@ public:
             const string shardId = str::stream() << (i - 1);
             _shardIds.insert(shardId);
 
-            std::shared_ptr<Chunk> chunk(
-                new Chunk(this, mySplitPoints[i - 1], mySplitPoints[i], shardId));
+            std::shared_ptr<Chunk> chunk(new Chunk(this,
+                                                   mySplitPoints[i - 1],
+                                                   mySplitPoints[i],
+                                                   shardId,
+                                                   ChunkVersion(0, 0, OID()),
+                                                   0));
             _chunkMap[mySplitPoints[i]] = chunk;
         }
 
-        _chunkRanges.reloadAll(_chunkMap);
+        _chunkRangeMap = _constructRanges(_chunkMap);
     }
 };
 
@@ -125,8 +127,9 @@ class MultiShardBase : public Base {
         return BSON_ARRAY(BSON("a"
                                << "x")
                           << BSON("a"
-                                  << "y") << BSON("a"
-                                                  << "z"));
+                                  << "y")
+                          << BSON("a"
+                                  << "z"));
     }
 };
 

@@ -37,6 +37,7 @@
 
 #include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
 
@@ -61,8 +62,7 @@ void logCommonStartupWarnings(const ServerGlobalParams& serverParams) {
         }
     }
 
-    if ((serverParams.isAuthEnabled ||
-         serverParams.clusterAuthMode.load() != ServerGlobalParams::ClusterAuthMode_undefined) &&
+    if (serverParams.authState == ServerGlobalParams::AuthState::kEnabled &&
         (serverParams.rest || serverParams.isHttpInterfaceEnabled || serverParams.jsonp)) {
         log() << startupWarningsLog;
         log()
@@ -75,11 +75,34 @@ void logCommonStartupWarnings(const ServerGlobalParams& serverParams) {
         warned = true;
     }
 
+    if (serverParams.authState == ServerGlobalParams::AuthState::kUndefined) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: Access control is not enabled for the database."
+              << startupWarningsLog;
+        log() << "**          Read and write access to data and configuration is "
+                 "unrestricted."
+              << startupWarningsLog;
+        warned = true;
+    }
+
     const bool is32bit = sizeof(int*) == 4;
     if (is32bit) {
         log() << startupWarningsLog;
         log() << "** WARNING: This 32-bit MongoDB binary is deprecated" << startupWarningsLog;
         warned = true;
+    }
+
+    /*
+    * We did not add the message to startupWarningsLog as the user can not
+    * specify a sslCAFile parameter from the shell
+    */
+    if (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled &&
+        sslGlobalParams.sslCAFile.empty()) {
+        log() << "";
+        log() << "** WARNING: No SSL certificate validation can be performed since"
+                 " no CA file has been provided";
+
+        log() << "**          Please specify an sslCAFile parameter.";
     }
 
 #if defined(_WIN32) && !defined(_WIN64)

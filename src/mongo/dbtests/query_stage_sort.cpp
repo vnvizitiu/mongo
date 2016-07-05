@@ -26,9 +26,13 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
@@ -36,7 +40,6 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
@@ -50,6 +53,8 @@ namespace QueryStageSortTests {
 using std::set;
 using std::unique_ptr;
 using stdx::make_unique;
+
+namespace dps = ::mongo::dotted_path_support;
 
 class QueryStageSortTestBase {
 public:
@@ -114,7 +119,7 @@ public:
         params.limit = limit();
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj());
+            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
 
         auto ss = make_unique<SortStage>(&_txn, params, ws.get(), keyGenStage.release());
 
@@ -153,7 +158,7 @@ public:
         params.limit = limit();
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj());
+            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
 
         auto sortStage = make_unique<SortStage>(&_txn, params, ws.get(), keyGenStage.release());
 
@@ -178,7 +183,7 @@ public:
         BSONObj current;
         PlanExecutor::ExecState state;
         while (PlanExecutor::ADVANCED == (state = exec->getNext(&current, NULL))) {
-            int cmp = sgn(current.woSortOrder(last, params.pattern));
+            int cmp = sgn(dps::compareObjectsAccordingToSort(current, last, params.pattern));
             // The next object should be equal to the previous or oriented according to the sort
             // pattern.
             ASSERT(cmp == 0 || cmp == 1);
@@ -216,7 +221,8 @@ public:
     }
 
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     DBDirectClient _client;
 };
 
@@ -316,11 +322,7 @@ public:
             wuow.commit();
         }
 
-        {
-            WriteUnitOfWork wuow(&_txn);
-            fillData();
-            wuow.commit();
-        }
+        fillData();
 
         // The data we're going to later invalidate.
         set<RecordId> recordIds;
@@ -429,11 +431,7 @@ public:
             wuow.commit();
         }
 
-        {
-            WriteUnitOfWork wuow(&_txn);
-            fillData();
-            wuow.commit();
-        }
+        fillData();
 
         // The data we're going to later invalidate.
         set<RecordId> recordIds;
@@ -456,10 +454,11 @@ public:
 
         // We should have read in the first 'firstRead' recordIds.  Invalidate the first.
         exec->saveState();
+        OpDebug* const nullOpDebug = nullptr;
         set<RecordId>::iterator it = recordIds.begin();
         {
             WriteUnitOfWork wuow(&_txn);
-            coll->deleteDocument(&_txn, *it++);
+            coll->deleteDocument(&_txn, *it++, nullOpDebug);
             wuow.commit();
         }
         exec->restoreState();
@@ -475,7 +474,7 @@ public:
         while (it != recordIds.end()) {
             {
                 WriteUnitOfWork wuow(&_txn);
-                coll->deleteDocument(&_txn, *it++);
+                coll->deleteDocument(&_txn, *it++, nullOpDebug);
                 wuow.commit();
             }
         }
@@ -558,7 +557,7 @@ public:
         params.limit = 0;
 
         auto keyGenStage = make_unique<SortKeyGeneratorStage>(
-            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj());
+            &_txn, queuedDataStage.release(), ws.get(), params.pattern, BSONObj(), nullptr);
 
         auto sortStage = make_unique<SortStage>(&_txn, params, ws.get(), keyGenStage.release());
 

@@ -32,12 +32,12 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 
 namespace mongo {
 
-class BSONObj;
 class BSONObjBuilder;
 template <typename T>
 class StatusWith;
@@ -66,13 +66,13 @@ public:
                                 const NamespaceString& nss,
                                 const ChunkVersion& shardVersion,
                                 const ConnectionString& configServerConnectionString,
-                                const std::string& fromShardId,
-                                const std::string& toShardId,
-                                const BSONObj& chunkMinKey,
-                                const BSONObj& chunkMaxKey,
+                                const ShardId& fromShardId,
+                                const ShardId& toShardId,
+                                const ChunkRange& range,
                                 int64_t maxChunkSizeBytes,
                                 const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                bool waitForDelete);
+                                bool waitForDelete,
+                                bool takeDistLock);
 
     const NamespaceString& getNss() const {
         return _nss;
@@ -82,20 +82,20 @@ public:
         return _configServerCS;
     }
 
-    const std::string& getFromShardId() const {
+    const ShardId& getFromShardId() const {
         return _fromShardId;
     }
 
-    const std::string& getToShardId() const {
+    const ShardId& getToShardId() const {
         return _toShardId;
     }
 
     const BSONObj& getMinKey() const {
-        return _minKey;
+        return _range.getMin();
     }
 
     const BSONObj& getMaxKey() const {
-        return _maxKey;
+        return _range.getMax();
     }
 
     int64_t getMaxChunkSizeBytes() const {
@@ -110,8 +110,21 @@ public:
         return _waitForDelete;
     }
 
+    bool getTakeDistLock() const {
+        return _takeDistLock;
+    }
+
+    /**
+     * Returns true if the requests match exactly in terms of the field values and the order of
+     * elements within the BSON-typed fields.
+     */
+    bool operator==(const MoveChunkRequest& other) const;
+    bool operator!=(const MoveChunkRequest& other) const;
+
 private:
-    MoveChunkRequest(NamespaceString nss, MigrationSecondaryThrottleOptions secondaryThrottle);
+    MoveChunkRequest(NamespaceString nss,
+                     ChunkRange range,
+                     MigrationSecondaryThrottleOptions secondaryThrottle);
 
     // The collection for which this request applies
     NamespaceString _nss;
@@ -122,14 +135,13 @@ private:
     ConnectionString _configServerCS;
 
     // The source shard id
-    std::string _fromShardId;
+    ShardId _fromShardId;
 
     // The recipient shard id
-    std::string _toShardId;
+    ShardId _toShardId;
 
-    // Exact min and max key of the chunk being moved
-    BSONObj _minKey;
-    BSONObj _maxKey;
+    // Range of chunk chunk being moved
+    ChunkRange _range;
 
     // This value is used by the migration source to determine the data size threshold above which a
     // chunk would be considered jumbo and migrations will not proceed.
@@ -141,6 +153,9 @@ private:
     // Whether to block and wait for the range deleter to cleanup the orphaned documents at the end
     // of move.
     bool _waitForDelete;
+
+    // Whether to take the distributed lock for the collection or not.
+    bool _takeDistLock;
 };
 
 }  // namespace mongo

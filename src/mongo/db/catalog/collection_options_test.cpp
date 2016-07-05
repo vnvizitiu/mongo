@@ -131,9 +131,9 @@ TEST(CollectionOptions, InvalidStorageEngineField) {
 
 TEST(CollectionOptions, ParseEngineField) {
     CollectionOptions opts;
-    ASSERT_OK(opts.parse(fromjson(
-        "{unknownField: 1, "
-        "storageEngine: {storageEngine1: {x: 1, y: 2}, storageEngine2: {a: 1, b:2}}}")));
+    ASSERT_OK(opts.parse(
+        fromjson("{unknownField: 1, "
+                 "storageEngine: {storageEngine1: {x: 1, y: 2}, storageEngine2: {a: 1, b:2}}}")));
     checkRoundTrip(opts);
 
     // Unrecognized field should not be present in BSON representation.
@@ -186,5 +186,52 @@ TEST(CollectionOptions, ModifyStorageEngineField) {
     ASSERT_TRUE(storageEngine.getField("storageEngine1").isABSONObj());
     BSONObj storageEngine1 = storageEngine.getObjectField("storageEngine1");
     ASSERT_EQUALS(1, storageEngine1.getIntField("x"));
+}
+
+TEST(CollectionOptions, FailToParseCollationThatIsNotAnObject) {
+    CollectionOptions options;
+    ASSERT_NOT_OK(options.parse(fromjson("{collation: 'notAnObject'}")));
+}
+
+TEST(CollectionOptions, FailToParseCollationThatIsAnEmptyObject) {
+    CollectionOptions options;
+    ASSERT_NOT_OK(options.parse(fromjson("{collation: {}}")));
+}
+
+TEST(CollectionOptions, CollationFieldParsesCorrectly) {
+    CollectionOptions options;
+    ASSERT_OK(options.parse(fromjson("{collation: {locale: 'en'}}")));
+    ASSERT_EQ(options.collation, fromjson("{locale: 'en'}"));
+    ASSERT_TRUE(options.isValid());
+    ASSERT_OK(options.validate());
+}
+
+TEST(CollectionOptions, ParsedCollationObjShouldBeOwned) {
+    CollectionOptions options;
+    ASSERT_OK(options.parse(fromjson("{collation: {locale: 'en'}}")));
+    ASSERT_EQ(options.collation, fromjson("{locale: 'en'}"));
+    ASSERT_TRUE(options.collation.isOwned());
+}
+
+TEST(CollectionOptions, ResetClearsCollationField) {
+    CollectionOptions options;
+    ASSERT_OK(options.parse(fromjson("{collation: {locale: 'en'}}")));
+    ASSERT_FALSE(options.collation.isEmpty());
+    options.reset();
+    ASSERT_TRUE(options.collation.isEmpty());
+}
+
+TEST(CollectionOptions, CollationFieldLeftEmptyWhenOmitted) {
+    CollectionOptions options;
+    ASSERT_OK(options.parse(fromjson("{validator: {a: 1}}")));
+    ASSERT_TRUE(options.collation.isEmpty());
+}
+
+TEST(CollectionOptions, CollationFieldNotDumpedToBSONWhenOmitted) {
+    CollectionOptions options;
+    ASSERT_OK(options.parse(fromjson("{validator: {a: 1}}")));
+    ASSERT_TRUE(options.collation.isEmpty());
+    BSONObj asBSON = options.toBSON();
+    ASSERT_FALSE(asBSON["collation"]);
 }
 }

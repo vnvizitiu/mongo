@@ -37,14 +37,15 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/dbclient_multi_command.h"
 #include "mongo/s/config.h"
-#include "mongo/s/dbclient_shard_resolver.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/mongos_options.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -110,7 +111,7 @@ void toBatchError(const Status& status, BatchedCommandResponse* response) {
  * Splits the chunks touched based from the targeter stats if needed.
  */
 void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const TargeterStats& stats) {
-    if (!Chunk::ShouldAutoSplit) {
+    if (!mongosGlobalParams.shouldAutoSplit) {
         return;
     }
 
@@ -123,7 +124,7 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
 
     shared_ptr<DBConfig> config = status.getValue();
 
-    ChunkManagerPtr chunkManager;
+    shared_ptr<ChunkManager> chunkManager;
     shared_ptr<Shard> dummyShard;
     config->getChunkManagerOrPrimary(txn, nss.ns(), chunkManager, dummyShard);
 
@@ -134,7 +135,7 @@ void splitIfNeeded(OperationContext* txn, const NamespaceString& nss, const Targ
     for (map<BSONObj, int>::const_iterator it = stats.chunkSizeDelta.begin();
          it != stats.chunkSizeDelta.end();
          ++it) {
-        ChunkPtr chunk;
+        shared_ptr<Chunk> chunk;
         try {
             chunk = chunkManager->findIntersectingChunk(txn, it->first);
         } catch (const AssertionException& ex) {
@@ -252,7 +253,7 @@ void ClusterWriter::write(OperationContext* txn,
             request = requestWithWriteConcern.get();
         }
 
-        grid.catalogManager(txn)->writeConfigServerDirect(txn, *request, response);
+        grid.catalogClient(txn)->writeConfigServerDirect(txn, *request, response);
     } else {
         TargeterStats targeterStats;
 
@@ -265,15 +266,15 @@ void ClusterWriter::write(OperationContext* txn,
                                     str::stream()
                                         << "unable to target"
                                         << (request->isInsertIndexRequest() ? " index" : "")
-                                        << " write op for collection " << request->getTargetingNS()
+                                        << " write op for collection "
+                                        << request->getTargetingNS()
                                         << causedBy(targetInitStatus)),
                              response);
                 return;
             }
 
-            DBClientShardResolver resolver;
             DBClientMultiCommand dispatcher;
-            BatchWriteExec exec(&targeter, &resolver, &dispatcher);
+            BatchWriteExec exec(&targeter, &dispatcher);
             exec.executeBatch(txn, *request, response, &_stats);
         }
 

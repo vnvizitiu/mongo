@@ -36,7 +36,6 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -55,18 +54,7 @@ const char kOpQueryOnly[] = "opQueryOnly";
 const char kOpCommandOnly[] = "opCommandOnly";
 const char kAll[] = "all";
 
-const OperationContext::Decoration<Protocol> operationProtocolDecoration =
-    OperationContext::declareDecoration<Protocol>();
-
 }  // namespace
-
-Protocol getOperationProtocol(OperationContext* txn) {
-    return operationProtocolDecoration(txn);
-}
-
-void setOperationProtocol(OperationContext* txn, Protocol protocol) {
-    operationProtocolDecoration(txn) = protocol;
-}
 
 StatusWith<Protocol> negotiate(ProtocolSet fst, ProtocolSet snd) {
     using std::begin;
@@ -74,9 +62,9 @@ StatusWith<Protocol> negotiate(ProtocolSet fst, ProtocolSet snd) {
 
     ProtocolSet common = fst & snd;
 
-    auto it = std::find_if(begin(kPreferredProtos),
-                           end(kPreferredProtos),
-                           [common](Protocol p) { return common & static_cast<ProtocolSet>(p); });
+    auto it = std::find_if(begin(kPreferredProtos), end(kPreferredProtos), [common](Protocol p) {
+        return common & static_cast<ProtocolSet>(p);
+    });
 
     if (it == end(kPreferredProtos)) {
         return Status(ErrorCodes::RPCProtocolNegotiationFailed, "No common protocol found.");

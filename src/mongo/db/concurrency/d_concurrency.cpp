@@ -32,9 +32,9 @@
 
 #include <string>
 
-#include "mongo/db/service_context.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
@@ -52,6 +52,12 @@ Lock::TempRelease::~TempRelease() {
         _lockState->restoreLockState(_lockSnapshot);
     }
 }
+
+namespace {
+AtomicWord<uint64_t> lastResourceMutexHash{0};
+}  // namespace
+
+Lock::ResourceMutex::ResourceMutex() : _rid(RESOURCE_MUTEX, lastResourceMutexHash.fetchAndAdd(1)) {}
 
 Lock::GlobalLock::GlobalLock(Locker* locker)
     : _locker(locker), _result(LOCK_INVALID), _pbwm(locker, resourceIdParallelBatchWriterMode) {}
@@ -86,7 +92,7 @@ void Lock::GlobalLock::waitForLock(unsigned timeoutMs) {
 
 void Lock::GlobalLock::_unlock() {
     if (isLocked()) {
-        _locker->unlockAll();
+        _locker->unlockGlobal();
         _result = LOCK_INVALID;
     }
 }

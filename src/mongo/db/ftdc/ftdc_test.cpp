@@ -43,6 +43,8 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
@@ -107,17 +109,13 @@ void createDirectoryClean(const boost::filesystem::path& dir) {
     boost::filesystem::create_directory(dir);
 }
 
-class FTDCClockSourceMock : public ClockSource {
-    Date_t now() final {
-        return Date_t::fromMillisSinceEpoch(37);
-    }
-};
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(FTDCTestInit,
-                                     ("ThreadNameInitializer"))(InitializerContext* context) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(FTDCTestInit, ("ThreadNameInitializer"))
+(InitializerContext* context) {
     setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
 
-    getGlobalServiceContext()->setClockSource(stdx::make_unique<FTDCClockSourceMock>());
+    getGlobalServiceContext()->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    getGlobalServiceContext()->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
+    getGlobalServiceContext()->setTickSource(stdx::make_unique<TickSourceMock>());
 
     Client::initThreadIfNotAlready("UnitTest");
 

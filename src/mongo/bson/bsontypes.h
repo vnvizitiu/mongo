@@ -29,24 +29,35 @@
 
 #pragma once
 
+#include "mongo/config.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/config.h"
 
 namespace mongo {
 
 class BSONArrayBuilder;
 class BSONElement;
+class BSONElementCmpWithoutField;
 class BSONObj;
 class BSONObjBuilder;
 class BSONObjBuilderValueStream;
 class BSONObjIterator;
 class Ordering;
 struct BSONArray;  // empty subclass of BSONObj useful for overloading
-struct BSONElementCmpWithoutField;
 
 extern const BSONObj kMaxBSONKey;
 extern const BSONObj kMinBSONKey;
+
+/**
+    determines BSON types considered valid by validate
+*/
+enum class BSONVersion { kV1_0, kV1_1, kLatest = kV1_1 };
+
+/**
+    Flag that determines whether we should accept decimal types in object validation, and default
+    to KeyString V1 indexes on non-MMAP storage engines. Set by enableBSON1_1 server parameter.
+*/
+extern bool enableBSON1_1;
 
 /**
     the complete list of valid BSON types
@@ -96,7 +107,7 @@ enum BSONType {
     /** 128 bit decimal */
     NumberDecimal = 19,
     /** max type that is not MaxKey */
-    JSTypeMax = Decimal128::enabled ? 19 : 18,
+    JSTypeMax = 19,
     /** larger than all other types */
     MaxKey = 127
 };

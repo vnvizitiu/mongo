@@ -63,7 +63,8 @@ public:
            << th(a("", "Connections to the database, both internal and external.", "Client"))
            << th(a("http://dochub.mongodb.org/core/viewingandterminatingcurrentoperation",
                    "",
-                   "OpId")) << "<th>Locking</th>"
+                   "OpId"))
+           << "<th>Locking</th>"
            << "<th>Waiting</th>"
            << "<th>SecsRunning</th>"
            << "<th>Op</th>"
@@ -140,7 +141,8 @@ class CurrentOpContexts : public Command {
 public:
     CurrentOpContexts() : Command("currentOpCtx") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -167,8 +169,9 @@ public:
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> filter;
         if (cmdObj["filter"].isABSONObj()) {
+            const CollatorInterface* collator = nullptr;
             StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                cmdObj["filter"].Obj(), ExtensionsCallbackDisallowExtensions());
+                cmdObj["filter"].Obj(), ExtensionsCallbackDisallowExtensions(), collator);
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }

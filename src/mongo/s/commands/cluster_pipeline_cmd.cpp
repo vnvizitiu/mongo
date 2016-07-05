@@ -39,9 +39,11 @@
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/catalog_cache.h"
@@ -49,6 +51,7 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/sharded_command_processing.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
@@ -70,7 +73,7 @@ namespace {
  */
 class PipelineCommand : public Command {
 public:
-    PipelineCommand() : Command(Pipeline::commandName, false) {}
+    PipelineCommand() : Command(AggregationRequest::kCommandName, false) {}
 
     virtual bool slaveOk() const {
         return true;
@@ -80,8 +83,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
     virtual void help(std::stringstream& help) const {
@@ -114,19 +118,23 @@ public:
             return aggPassthrough(txn, conf, cmdObj, result, options);
         }
 
-        intrusive_ptr<ExpressionContext> mergeCtx =
-            new ExpressionContext(txn, NamespaceString(fullns));
+        auto request = AggregationRequest::parseFromBSON(NamespaceString(fullns), cmdObj);
+        if (!request.isOK()) {
+            return appendCommandStatus(result, request.getStatus());
+        }
+
+        intrusive_ptr<ExpressionContext> mergeCtx = new ExpressionContext(txn, request.getValue());
         mergeCtx->inRouter = true;
         // explicitly *not* setting mergeCtx->tempDir
 
-        // Parse the pipeline specification
-        intrusive_ptr<Pipeline> pipeline(Pipeline::parseCommand(errmsg, cmdObj, mergeCtx));
-        if (!pipeline.get()) {
-            // There was some parsing error
-            return false;
+        // Parse and optimize the pipeline specification.
+        auto pipeline = Pipeline::parse(request.getValue().getPipeline(), mergeCtx);
+        if (!pipeline.isOK()) {
+            return appendCommandStatus(result, pipeline.getStatus());
         }
+        pipeline.getValue()->optimizePipeline();
 
-        for (auto&& ns : pipeline->getInvolvedCollections()) {
+        for (auto&& ns : pipeline.getValue()->getInvolvedCollections()) {
             uassert(
                 28769, str::stream() << ns.ns() << " cannot be sharded", !conf->isSharded(ns.ns()));
         }
@@ -137,32 +145,36 @@ public:
 
         // If the first $match stage is an exact match on the shard key, we only have to send it
         // to one shard, so send the command to that shard.
-        BSONObj firstMatchQuery = pipeline->getInitialQuery();
+        BSONObj firstMatchQuery = pipeline.getValue()->getInitialQuery();
         ChunkManagerPtr chunkMgr = conf->getChunkManager(txn, fullns);
         BSONObj shardKeyMatches = uassertStatusOK(
-            chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(firstMatchQuery));
+            chunkMgr->getShardKeyPattern().extractShardKeyFromQuery(txn, firstMatchQuery));
 
         // Don't need to split pipeline if the first $match is an exact match on shard key, unless
         // there is a stage that needs to be run on the primary shard.
-        const bool needPrimaryShardMerger = pipeline->needsPrimaryShardMerger();
+        const bool needPrimaryShardMerger = pipeline.getValue()->needsPrimaryShardMerger();
         const bool needSplit = shardKeyMatches.isEmpty() || needPrimaryShardMerger;
 
         // Split the pipeline into pieces for mongod(s) and this mongos. If needSplit is true,
         // 'pipeline' will become the merger side.
-        intrusive_ptr<Pipeline> shardPipeline(needSplit ? pipeline->splitForSharded() : pipeline);
+        intrusive_ptr<Pipeline> shardPipeline(needSplit ? pipeline.getValue()->splitForSharded()
+                                                        : pipeline.getValue());
 
-        // Create the command for the shards. The 'fromRouter' field means produce output to
-        // be merged.
-        MutableDocument commandBuilder(shardPipeline->serialize());
+        // Create the command for the shards. The 'fromRouter' field means produce output to be
+        // merged.
+        MutableDocument commandBuilder(request.getValue().serializeToCommandObj());
+        commandBuilder[AggregationRequest::kPipelineName] = Value(shardPipeline->serialize());
         if (needSplit) {
-            commandBuilder.setField("fromRouter", Value(true));
-            commandBuilder.setField("cursor", Value(DOC("batchSize" << 0)));
+            commandBuilder[AggregationRequest::kFromRouterName] = Value(true);
+            commandBuilder["cursor"] = Value(DOC("batchSize" << 0));
         } else {
-            commandBuilder.setField("cursor", Value(cmdObj["cursor"]));
+            commandBuilder["cursor"] = Value(cmdObj["cursor"]);
         }
 
+        // These fields are not part of the AggregationRequest since they are not handled by the
+        // aggregation subsystem, so we serialize them separately.
         const std::initializer_list<StringData> fieldsToPropagateToShards = {
-            "$queryOptions", "readConcern", LiteParsedQuery::cmdOptionMaxTimeMS,
+            "$queryOptions", "readConcern", QueryRequest::cmdOptionMaxTimeMS,
         };
         for (auto&& field : fieldsToPropagateToShards) {
             commandBuilder[field] = Value(cmdObj[field]);
@@ -177,14 +189,14 @@ public:
         Strategy::commandOp(
             txn, dbname, shardedCommand, options, fullns, shardQuery, &shardResults);
 
-        if (pipeline->isExplain()) {
+        if (mergeCtx->isExplain) {
             // This must be checked before we start modifying result.
             uassertAllShardsSupportExplain(shardResults);
 
             if (needSplit) {
                 result << "needsPrimaryShardMerger" << needPrimaryShardMerger << "splitPipeline"
                        << DOC("shardsPart" << shardPipeline->writeExplainOps() << "mergerPart"
-                                           << pipeline->writeExplainOps());
+                                           << pipeline.getValue()->writeExplainOps());
             } else {
                 result << "splitPipeline" << BSONNULL;
             }
@@ -202,7 +214,7 @@ public:
         if (!needSplit) {
             invariant(shardResults.size() == 1);
             invariant(shardResults[0].target.getServers().size() == 1);
-            auto executorPool = grid.shardRegistry()->getExecutorPool();
+            auto executorPool = grid.getExecutorPool();
             const BSONObj reply =
                 uassertStatusOK(storePossibleCursor(shardResults[0].target.getServers()[0],
                                                     shardResults[0].result,
@@ -212,25 +224,29 @@ public:
             return reply["ok"].trueValue();
         }
 
-        DocumentSourceMergeCursors::CursorIds cursorIds = parseCursors(shardResults, fullns);
-        pipeline->addInitialSource(DocumentSourceMergeCursors::create(cursorIds, mergeCtx));
+        pipeline.getValue()->addInitialSource(
+            DocumentSourceMergeCursors::create(parseCursors(shardResults), mergeCtx));
 
-        MutableDocument mergeCmd(pipeline->serialize());
+        MutableDocument mergeCmd(request.getValue().serializeToCommandObj());
+        mergeCmd["pipeline"] = Value(pipeline.getValue()->serialize());
         mergeCmd["cursor"] = Value(cmdObj["cursor"]);
 
         if (cmdObj.hasField("$queryOptions")) {
             mergeCmd["$queryOptions"] = Value(cmdObj["$queryOptions"]);
         }
 
-        if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
-            mergeCmd[LiteParsedQuery::cmdOptionMaxTimeMS] =
-                Value(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
+        if (cmdObj.hasField(QueryRequest::cmdOptionMaxTimeMS)) {
+            mergeCmd[QueryRequest::cmdOptionMaxTimeMS] =
+                Value(cmdObj[QueryRequest::cmdOptionMaxTimeMS]);
         }
+
+        mergeCmd.setField("writeConcern", Value(cmdObj["writeConcern"]));
 
         // Not propagating readConcern to merger since it doesn't do local reads.
 
         string outputNsOrEmpty;
-        if (DocumentSourceOut* out = dynamic_cast<DocumentSourceOut*>(pipeline->output())) {
+        if (DocumentSourceOut* out =
+                dynamic_cast<DocumentSourceOut*>(pipeline.getValue()->output())) {
             outputNsOrEmpty = out->getOutputNs().ns();
         }
 
@@ -246,16 +262,20 @@ public:
             aggRunCommand(conn.get(), dbname, mergeCmd.freeze().toBson(), options);
         conn.done();
 
+        if (auto wcErrorElem = mergedResults["writeConcernError"]) {
+            appendWriteConcernErrorToCmdResponse(mergingShardId, wcErrorElem, result);
+        }
+
         // Copy output from merging (primary) shard to the output object from our command.
         // Also, propagates errmsg and code if ok == false.
-        result.appendElements(mergedResults);
+        result.appendElementsUnique(mergedResults);
 
         return mergedResults["ok"].trueValue();
     }
 
 private:
-    DocumentSourceMergeCursors::CursorIds parseCursors(
-        const vector<Strategy::CommandResult>& shardResults, const string& fullns);
+    std::vector<DocumentSourceMergeCursors::CursorDescriptor> parseCursors(
+        const vector<Strategy::CommandResult>& shardResults);
 
     void killAllCursors(const vector<Strategy::CommandResult>& shardResults);
     void uassertAllShardsSupportExplain(const vector<Strategy::CommandResult>& shardResults);
@@ -274,10 +294,10 @@ private:
                         int queryOptions);
 } clusterPipelineCmd;
 
-DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
-    const vector<Strategy::CommandResult>& shardResults, const string& fullns) {
+std::vector<DocumentSourceMergeCursors::CursorDescriptor> PipelineCommand::parseCursors(
+    const vector<Strategy::CommandResult>& shardResults) {
     try {
-        DocumentSourceMergeCursors::CursorIds cursors;
+        std::vector<DocumentSourceMergeCursors::CursorDescriptor> cursors;
 
         for (size_t i = 0; i < shardResults.size(); i++) {
             BSONObj result = shardResults[i].result;
@@ -294,7 +314,8 @@ DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
                 invariant(errCode == result["code"].numberInt() || errCode == 17022);
                 uasserted(errCode,
                           str::stream() << "sharded pipeline failed on shard "
-                                        << shardResults[i].shardTargetId << ": "
+                                        << shardResults[i].shardTargetId
+                                        << ": "
                                         << result.toString());
             }
 
@@ -312,10 +333,12 @@ DocumentSourceMergeCursors::CursorIds PipelineCommand::parseCursors(
 
             massert(17025,
                     str::stream() << "shard " << shardResults[i].shardTargetId
-                                  << " returned different ns: " << cursor["ns"],
-                    cursor["ns"].String() == fullns);
+                                  << " returned invalid ns: "
+                                  << cursor["ns"],
+                    NamespaceString(cursor["ns"].String()).isValid());
 
-            cursors.push_back(std::make_pair(shardResults[i].target, cursor["id"].Long()));
+            cursors.emplace_back(
+                shardResults[i].target, cursor["ns"].String(), cursor["id"].Long());
         }
 
         return cursors;
@@ -330,8 +353,8 @@ void PipelineCommand::uassertAllShardsSupportExplain(
     const vector<Strategy::CommandResult>& shardResults) {
     for (size_t i = 0; i < shardResults.size(); i++) {
         uassert(17403,
-                str::stream() << "Shard " << shardResults[i].target.toString()
-                              << " failed: " << shardResults[i].result,
+                str::stream() << "Shard " << shardResults[i].target.toString() << " failed: "
+                              << shardResults[i].result,
                 shardResults[i].result["ok"].trueValue());
 
         uassert(17404,
@@ -390,10 +413,10 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
                               0,     // nToSkip
                               NULL,  // fieldsToReturn
                               queryOptions);
-    massert(
-        17014,
-        str::stream() << "aggregate command didn't return results on host: " << conn->toString(),
-        cursor && cursor->more());
+    massert(17014,
+            str::stream() << "aggregate command didn't return results on host: "
+                          << conn->toString(),
+            cursor && cursor->more());
 
     BSONObj result = cursor->nextSafe().getOwned();
 
@@ -401,7 +424,7 @@ BSONObj PipelineCommand::aggRunCommand(DBClientBase* conn,
         throw RecvStaleConfigException("command failed because of stale config", result);
     }
 
-    auto executorPool = grid.shardRegistry()->getExecutorPool();
+    auto executorPool = grid.getExecutorPool();
     result = uassertStatusOK(storePossibleCursor(HostAndPort(cursor->originalHost()),
                                                  result,
                                                  executorPool->getArbitraryExecutor(),
@@ -419,7 +442,14 @@ bool PipelineCommand::aggPassthrough(OperationContext* txn,
     ShardConnection conn(shard->getConnString(), "");
     BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
     conn.done();
-    out.appendElements(result);
+
+    // First append the properly constructed writeConcernError. It will then be skipped
+    // in appendElementsUnique.
+    if (auto wcErrorElem = result["writeConcernError"]) {
+        appendWriteConcernErrorToCmdResponse(shard->getId(), wcErrorElem, out);
+    }
+
+    out.appendElementsUnique(result);
     return result["ok"].trueValue();
 }
 

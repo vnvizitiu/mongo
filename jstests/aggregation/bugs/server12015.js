@@ -8,7 +8,7 @@
 
 load("jstests/aggregation/extras/utils.js");  // For orderedArrayEq.
 
-(function (){
+(function() {
     "use strict";
     var coll = db.server12015;
     coll.drop();
@@ -52,8 +52,8 @@ load("jstests/aggregation/extras/utils.js");  // For orderedArrayEq.
     // Non-blocking $sort, uncovered $project.
     assertResultsMatch([{$sort: {a: -1, b: -1}}, {$project: {_id: 1, a: 1, b: 1}}]);
     assertResultsMatch([{$sort: {a: 1, b: 1}}, {$project: {_id: 1, a: 1, b: 1}}]);
-    assertResultsMatch([{$sort: {a: 1, b: 1}},
-                        {$group: {_id: "$_id", arr: {$push: "$a"}, sum: {$sum: "$b"}}}]);
+    assertResultsMatch(
+        [{$sort: {a: 1, b: 1}}, {$group: {_id: "$_id", arr: {$push: "$a"}, sum: {$sum: "$b"}}}]);
 
     // Non-blocking $sort, covered $project.
     assertResultsMatch([{$sort: {a: -1, b: -1}}, {$project: {_id: 0, a: 1, b: 1}}]);
@@ -62,8 +62,8 @@ load("jstests/aggregation/extras/utils.js");  // For orderedArrayEq.
 
     // Blocking $sort, uncovered $project.
     assertResultsMatch([{$sort: {b: 1, a: -1}}, {$project: {_id: 1, a: 1, b: 1}}]);
-    assertResultsMatch([{$sort: {b: 1, a: -1}},
-                        {$group: {_id: "$_id", arr: {$push: "$a"}, sum: {$sum: "$b"}}}]);
+    assertResultsMatch(
+        [{$sort: {b: 1, a: -1}}, {$group: {_id: "$_id", arr: {$push: "$a"}, sum: {$sum: "$b"}}}]);
 
     // Blocking $sort, covered $project.
     assertResultsMatch([{$sort: {b: 1, a: -1}}, {$project: {_id: 0, a: 1, b: 1}}]);

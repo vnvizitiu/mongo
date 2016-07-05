@@ -30,14 +30,14 @@
 
 #include "mongo/db/exec/collection_scan.h"
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
@@ -74,7 +74,8 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
             ErrorCodes::CappedPositionLost,
             str::stream()
                 << "CollectionScan died due to position in capped collection being deleted. "
-                << "Last seen record id: " << _lastSeenId);
+                << "Last seen record id: "
+                << _lastSeenId);
         *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
         return PlanStage::DEAD;
     }
@@ -107,7 +108,8 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                     Status status(ErrorCodes::CappedPositionLost,
                                   str::stream() << "CollectionScan died due to failure to restore "
                                                 << "tailable cursor position. "
-                                                << "Last seen record id: " << _lastSeenId);
+                                                << "Last seen record id: "
+                                                << _lastSeenId);
                     *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
                     return PlanStage::DEAD;
                 }
@@ -169,6 +171,9 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
     ++_specificStats.docsTested;
 
     if (Filter::passes(member, _filter)) {
+        if (_params.stopApplyingFilterAfterFirstMatch) {
+            _filter = nullptr;
+        }
         *out = memberID;
         return PlanStage::ADVANCED;
     } else {
@@ -213,8 +218,6 @@ void CollectionScan::doSaveState() {
 void CollectionScan::doRestoreState() {
     if (_cursor) {
         if (!_cursor->restore()) {
-            warning() << "Could not restore RecordCursor for CollectionScan: "
-                      << getOpCtx()->getNS();
             _isDead = true;
         }
     }
@@ -234,7 +237,7 @@ unique_ptr<PlanStageStats> CollectionScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (NULL != _filter) {
         BSONObjBuilder bob;
-        _filter->toBSON(&bob);
+        _filter->serialize(&bob);
         _commonStats.filter = bob.obj();
     }
 

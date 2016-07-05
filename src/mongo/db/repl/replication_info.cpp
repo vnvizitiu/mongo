@@ -32,13 +32,13 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
@@ -47,6 +47,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/executor/network_interface.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 
 namespace mongo {
@@ -210,7 +211,7 @@ public:
                 "--slave in simple master/slave setups.\n";
         help << "{ isMaster : 1 }";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -226,15 +227,22 @@ public:
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
         */
-        if (cmdObj["forShell"].trueValue())
+        if (cmdObj["forShell"].trueValue()) {
             LastError::get(txn->getClient()).disable();
+        }
 
+        // Tag connections to avoid closing them on stepdown.
+        auto hangUpElement = cmdObj["hangUpOnStepDown"];
+        if (!hangUpElement.eoo() && !hangUpElement.trueValue()) {
+            AbstractMessagingPort* mp = txn->getClient()->port();
+            if (mp) {
+                mp->setTag(mp->getTag() | executor::NetworkInterface::kMessagingPortKeepOpen);
+            }
+        }
         appendReplicationInfo(txn, result, 0);
 
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::CSRS) {
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             result.append("configsvr", 1);
-        } else if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::SCCC) {
-            result.append("configsvr", 0);
         }
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);

@@ -28,8 +28,8 @@
 
 #pragma once
 
-#include <string>
 #include <iosfwd>
+#include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
@@ -165,8 +165,7 @@ public:
      */
     virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
                                         const OpTime& myLastOpTime,
-                                        const OpTime& syncSourceLastOpTime,
-                                        bool syncSourceHasSyncSource,
+                                        const rpc::ReplSetMetadata& metadata,
                                         Date_t now) const = 0;
 
     /**
@@ -208,8 +207,7 @@ public:
     ////////////////////////////////////////////////////////////
 
     // produces a reply to a replSetSyncFrom command
-    virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackArgs& data,
-                                         const HostAndPort& target,
+    virtual void prepareSyncFromResponse(const HostAndPort& target,
                                          const OpTime& lastOpApplied,
                                          BSONObjBuilder* response,
                                          Status* result) = 0;
@@ -248,13 +246,13 @@ public:
         Date_t now;
         unsigned selfUptime;
         const OpTime& lastOpApplied;
+        const OpTime& lastOpDurable;
         const OpTime& lastCommittedOpTime;
         const OpTime& readConcernMajorityOpTime;
     };
 
     // produce a reply to a status request
-    virtual void prepareStatusResponse(const ReplicationExecutor::CallbackArgs& data,
-                                       const ReplSetStatusArgs& rsStatusArgs,
+    virtual void prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                        BSONObjBuilder* response,
                                        Status* result) = 0;
 
@@ -406,7 +404,7 @@ public:
      * Considers whether or not this node should stand for election, and returns true
      * if the node has transitioned to candidate role as a result of the call.
      */
-    virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const = 0;
+    virtual Status checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied) const = 0;
 
     /**
      * Set the outgoing heartbeat message from self
@@ -416,9 +414,9 @@ public:
     /**
      * Prepares a BSONObj describing the current term, primary, and lastOp information.
      */
-    virtual void prepareReplResponseMetadata(rpc::ReplSetMetadata* metadata,
-                                             const OpTime& lastVisibleOpTime,
-                                             const OpTime& lastCommittedOpTime) const = 0;
+    virtual void prepareReplMetadata(rpc::ReplSetMetadata* metadata,
+                                     const OpTime& lastVisibleOpTime,
+                                     const OpTime& lastCommittedOpTime) const = 0;
 
     /**
      * Writes into 'output' all the information needed to generate a summary of the current
@@ -432,15 +430,6 @@ public:
     virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                             ReplSetRequestVotesResponse* response,
                                             const OpTime& lastAppliedOpTime) = 0;
-
-    /**
-     * Determines whether or not the newly elected primary is valid from our perspective.
-     * If it is, sets the _currentPrimaryIndex and term to the received values.
-     * If it is not, return ErrorCode::BadValue and the current term from our perspective.
-     * Populate responseTerm with the current term from our perspective.
-     */
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) = 0;
 
     /**
      * Loads an initial LastVote document, which was read from local storage.
@@ -462,7 +451,7 @@ public:
     /**
      * Transitions to the candidate role if the node is electable.
      */
-    virtual bool becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
+    virtual Status becomeCandidateIfElectable(const Date_t now, const OpTime& lastOpApplied) = 0;
 
     /**
      * Updates the storage engine read committed support in the TopologyCoordinator options after

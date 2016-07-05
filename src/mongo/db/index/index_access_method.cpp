@@ -32,6 +32,7 @@
 
 #include "mongo/db/index/btree_access_method.h"
 
+#include <utility>
 #include <vector>
 
 #include "mongo/base/error_codes.h"
@@ -42,6 +43,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
@@ -50,8 +52,23 @@
 namespace mongo {
 
 using std::endl;
+using std::pair;
 using std::set;
 using std::vector;
+
+namespace {
+
+/**
+ * Returns true if at least one prefix of any of the indexed fields causes the index to be multikey,
+ * and returns false otherwise. This function returns false if the 'multikeyPaths' vector is empty.
+ */
+bool isMultikeyFromPaths(const MultikeyPaths& multikeyPaths) {
+    return std::any_of(multikeyPaths.cbegin(),
+                       multikeyPaths.cend(),
+                       [](const std::set<std::size_t>& components) { return !components.empty(); });
+}
+
+}  // namespace
 
 MONGO_EXPORT_SERVER_PARAMETER(failIndexKeyTooLong, bool, true);
 
@@ -93,7 +110,9 @@ IndexAccessMethod::IndexAccessMethod(IndexCatalogEntry* btreeState, SortedDataIn
 
 bool IndexAccessMethod::ignoreKeyTooLong(OperationContext* txn) {
     // Ignore this error if we're on a secondary or if the user requested it
-    return !txn->isPrimaryFor(_btreeState->ns()) || !failIndexKeyTooLong;
+    const auto canAcceptWritesForNs = repl::ReplicationCoordinator::get(txn)->canAcceptWritesFor(
+        NamespaceString(_btreeState->ns()));
+    return !canAcceptWritesForNs || !failIndexKeyTooLong;
 }
 
 // Find the keys for obj, put them in the tree pointing to loc
@@ -102,11 +121,12 @@ Status IndexAccessMethod::insert(OperationContext* txn,
                                  const RecordId& loc,
                                  const InsertDeleteOptions& options,
                                  int64_t* numInserted) {
+    invariant(numInserted);
     *numInserted = 0;
-
     BSONObjSet keys;
+    MultikeyPaths multikeyPaths;
     // Delegate to the subclass.
-    getKeys(obj, &keys);
+    getKeys(obj, &keys, &multikeyPaths);
 
     Status ret = Status::OK();
     for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
@@ -142,8 +162,8 @@ Status IndexAccessMethod::insert(OperationContext* txn,
         return status;
     }
 
-    if (*numInserted > 1) {
-        _btreeState->setMultikey(txn);
+    if (*numInserted > 1 || isMultikeyFromPaths(multikeyPaths)) {
+        _btreeState->setMultikey(txn, multikeyPaths);
     }
 
     return ret;
@@ -179,9 +199,14 @@ Status IndexAccessMethod::remove(OperationContext* txn,
                                  const RecordId& loc,
                                  const InsertDeleteOptions& options,
                                  int64_t* numDeleted) {
-    BSONObjSet keys;
-    getKeys(obj, &keys);
+    invariant(numDeleted);
     *numDeleted = 0;
+    BSONObjSet keys;
+    // There's no need to compute the prefixes of the indexed fields that cause the index to be
+    // multikey when removing a document since the index metadata isn't updated when keys are
+    // deleted.
+    MultikeyPaths* multikeyPaths = nullptr;
+    getKeys(obj, &keys, multikeyPaths);
 
     for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
         removeOneKey(txn, *i, loc, options.dupsAllowed);
@@ -191,33 +216,16 @@ Status IndexAccessMethod::remove(OperationContext* txn,
     return Status::OK();
 }
 
-// Return keys in l that are not in r.
-// Lifted basically verbatim from elsewhere.
-static void setDifference(const BSONObjSet& l, const BSONObjSet& r, vector<BSONObj*>* diff) {
-    // l and r must use the same ordering spec.
-    verify(l.key_comp().order() == r.key_comp().order());
-    BSONObjSet::const_iterator i = l.begin();
-    BSONObjSet::const_iterator j = r.begin();
-    while (1) {
-        if (i == l.end())
-            break;
-        while (j != r.end() && j->woCompare(*i) < 0)
-            j++;
-        if (j == r.end() || i->woCompare(*j) != 0) {
-            const BSONObj* jo = &*i;
-            diff->push_back((BSONObj*)jo);
-        }
-        i++;
-    }
-}
-
 Status IndexAccessMethod::initializeAsEmpty(OperationContext* txn) {
     return _newInterface->initAsEmpty(txn);
 }
 
 Status IndexAccessMethod::touch(OperationContext* txn, const BSONObj& obj) {
     BSONObjSet keys;
-    getKeys(obj, &keys);
+    // There's no need to compute the prefixes of the indexed fields that cause the index to be
+    // multikey when paging a document's index entries into memory.
+    MultikeyPaths* multikeyPaths = nullptr;
+    getKeys(obj, &keys, multikeyPaths);
 
     std::unique_ptr<SortedDataInterface::Cursor> cursor(_newInterface->newCursor(txn));
     for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
@@ -248,12 +256,10 @@ RecordId IndexAccessMethod::findSingle(OperationContext* txn, const BSONObj& key
 }
 
 Status IndexAccessMethod::validate(OperationContext* txn,
-                                   bool full,
                                    int64_t* numKeys,
-                                   BSONObjBuilder* output) {
-    // XXX: long long vs int64_t
+                                   ValidateResults* fullResults) {
     long long keys = 0;
-    _newInterface->fullValidate(txn, full, &keys, output);
+    _newInterface->fullValidate(txn, &keys, fullResults);
     *numKeys = keys;
     return Status::OK();
 }
@@ -268,6 +274,42 @@ long long IndexAccessMethod::getSpaceUsedBytes(OperationContext* txn) const {
     return _newInterface->getSpaceUsedBytes(txn);
 }
 
+pair<vector<BSONObj>, vector<BSONObj>> IndexAccessMethod::setDifference(const BSONObjSet& left,
+                                                                        const BSONObjSet& right) {
+    // Two iterators to traverse the two sets in sorted order.
+    auto leftIt = left.begin();
+    auto rightIt = right.begin();
+    vector<BSONObj> onlyLeft;
+    vector<BSONObj> onlyRight;
+
+    while (leftIt != left.end() && rightIt != right.end()) {
+        const int cmp = leftIt->woCompare(*rightIt);
+        if (cmp == 0) {
+            // 'leftIt' and 'rightIt' compare equal using woCompare(), but may not be identical,
+            // which should result in an index change.
+            if (!leftIt->binaryEqual(*rightIt)) {
+                onlyLeft.push_back(*leftIt);
+                onlyRight.push_back(*rightIt);
+            }
+            ++leftIt;
+            ++rightIt;
+            continue;
+        } else if (cmp > 0) {
+            onlyRight.push_back(*rightIt);
+            ++rightIt;
+        } else {
+            onlyLeft.push_back(*leftIt);
+            ++leftIt;
+        }
+    }
+
+    // Add the rest of 'left' to 'onlyLeft', and the rest of 'right' to 'onlyRight', if any.
+    onlyLeft.insert(onlyLeft.end(), leftIt, left.end());
+    onlyRight.insert(onlyRight.end(), rightIt, right.end());
+
+    return {std::move(onlyLeft), std::move(onlyRight)};
+}
+
 Status IndexAccessMethod::validateUpdate(OperationContext* txn,
                                          const BSONObj& from,
                                          const BSONObj& to,
@@ -275,15 +317,22 @@ Status IndexAccessMethod::validateUpdate(OperationContext* txn,
                                          const InsertDeleteOptions& options,
                                          UpdateTicket* ticket,
                                          const MatchExpression* indexFilter) {
-    if (indexFilter == NULL || indexFilter->matchesBSON(from))
-        getKeys(from, &ticket->oldKeys);
-    if (indexFilter == NULL || indexFilter->matchesBSON(to))
-        getKeys(to, &ticket->newKeys);
+    if (!indexFilter || indexFilter->matchesBSON(from)) {
+        // There's no need to compute the prefixes of the indexed fields that possibly caused the
+        // index to be multikey when the old version of the document was written since the index
+        // metadata isn't updated when keys are deleted.
+        MultikeyPaths* multikeyPaths = nullptr;
+        getKeys(from, &ticket->oldKeys, multikeyPaths);
+    }
+
+    if (!indexFilter || indexFilter->matchesBSON(to)) {
+        getKeys(to, &ticket->newKeys, &ticket->newMultikeyPaths);
+    }
+
     ticket->loc = record;
     ticket->dupsAllowed = options.dupsAllowed;
 
-    setDifference(ticket->oldKeys, ticket->newKeys, &ticket->removed);
-    setDifference(ticket->newKeys, ticket->oldKeys, &ticket->added);
+    std::tie(ticket->removed, ticket->added) = setDifference(ticket->oldKeys, ticket->newKeys);
 
     ticket->_isValid = true;
 
@@ -292,22 +341,29 @@ Status IndexAccessMethod::validateUpdate(OperationContext* txn,
 
 Status IndexAccessMethod::update(OperationContext* txn,
                                  const UpdateTicket& ticket,
-                                 int64_t* numUpdated) {
+                                 int64_t* numInserted,
+                                 int64_t* numDeleted) {
+    invariant(numInserted);
+    invariant(numDeleted);
+
+    *numInserted = 0;
+    *numDeleted = 0;
+
     if (!ticket._isValid) {
         return Status(ErrorCodes::InternalError, "Invalid UpdateTicket in update");
     }
 
-    if (ticket.oldKeys.size() + ticket.added.size() - ticket.removed.size() > 1) {
-        _btreeState->setMultikey(txn);
+    if (ticket.oldKeys.size() + ticket.added.size() - ticket.removed.size() > 1 ||
+        isMultikeyFromPaths(ticket.newMultikeyPaths)) {
+        _btreeState->setMultikey(txn, ticket.newMultikeyPaths);
     }
 
     for (size_t i = 0; i < ticket.removed.size(); ++i) {
-        _newInterface->unindex(txn, *ticket.removed[i], ticket.loc, ticket.dupsAllowed);
+        _newInterface->unindex(txn, ticket.removed[i], ticket.loc, ticket.dupsAllowed);
     }
 
     for (size_t i = 0; i < ticket.added.size(); ++i) {
-        Status status =
-            _newInterface->insert(txn, *ticket.added[i], ticket.loc, ticket.dupsAllowed);
+        Status status = _newInterface->insert(txn, ticket.added[i], ticket.loc, ticket.dupsAllowed);
         if (!status.isOK()) {
             if (status.code() == ErrorCodes::KeyTooLong && ignoreKeyTooLong(txn)) {
                 // Ignore.
@@ -318,9 +374,14 @@ Status IndexAccessMethod::update(OperationContext* txn,
         }
     }
 
-    *numUpdated = ticket.added.size();
+    *numInserted = ticket.added.size();
+    *numDeleted = ticket.removed.size();
 
     return Status::OK();
+}
+
+Status IndexAccessMethod::compact(OperationContext* txn) {
+    return this->_newInterface->compact(txn);
 }
 
 std::unique_ptr<IndexAccessMethod::BulkBuilder> IndexAccessMethod::initiateBulk() {
@@ -343,9 +404,21 @@ Status IndexAccessMethod::BulkBuilder::insert(OperationContext* txn,
                                               const InsertDeleteOptions& options,
                                               int64_t* numInserted) {
     BSONObjSet keys;
-    _real->getKeys(obj, &keys);
+    MultikeyPaths multikeyPaths;
+    _real->getKeys(obj, &keys, &multikeyPaths);
 
-    _isMultiKey = _isMultiKey || (keys.size() > 1);
+    _everGeneratedMultipleKeys = _everGeneratedMultipleKeys || (keys.size() > 1);
+
+    if (!multikeyPaths.empty()) {
+        if (_indexMultikeyPaths.empty()) {
+            _indexMultikeyPaths = multikeyPaths;
+        } else {
+            invariant(_indexMultikeyPaths.size() == multikeyPaths.size());
+            for (size_t i = 0; i < multikeyPaths.size(); ++i) {
+                _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
+            }
+        }
+    }
 
     for (BSONObjSet::iterator it = keys.begin(); it != keys.end(); ++it) {
         _sorter->add(*it, loc);
@@ -381,8 +454,8 @@ Status IndexAccessMethod::commitBulk(OperationContext* txn,
     MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
         WriteUnitOfWork wunit(txn);
 
-        if (bulk->_isMultiKey) {
-            _btreeState->setMultikey(txn);
+        if (bulk->_everGeneratedMultipleKeys || isMultikeyFromPaths(bulk->_indexMultikeyPaths)) {
+            _btreeState->setMultikey(txn, bulk->_indexMultikeyPaths);
         }
 
         builder.reset(_newInterface->getBulkBuilder(txn, dupsAllowed));

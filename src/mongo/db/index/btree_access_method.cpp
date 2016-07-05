@@ -55,14 +55,17 @@ BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataIn
     if (0 == _descriptor->version()) {
         _keyGenerator.reset(new BtreeKeyGeneratorV0(fieldNames, fixed, _descriptor->isSparse()));
     } else if (1 == _descriptor->version()) {
-        _keyGenerator.reset(new BtreeKeyGeneratorV1(fieldNames, fixed, _descriptor->isSparse()));
+        _keyGenerator.reset(new BtreeKeyGeneratorV1(
+            fieldNames, fixed, _descriptor->isSparse(), btreeState->getCollator()));
     } else {
         massert(16745, "Invalid index version for key generation.", false);
     }
 }
 
-void BtreeAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
-    _keyGenerator->getKeys(obj, keys);
+void BtreeAccessMethod::getKeys(const BSONObj& obj,
+                                BSONObjSet* keys,
+                                MultikeyPaths* multikeyPaths) const {
+    _keyGenerator->getKeys(obj, keys, multikeyPaths);
 }
 
 }  // namespace mongo

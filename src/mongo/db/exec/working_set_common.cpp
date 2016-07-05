@@ -31,11 +31,11 @@
 #include "mongo/db/exec/working_set_common.h"
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
 
@@ -114,7 +114,10 @@ bool WorkingSetCommon::fetch(OperationContext* txn,
         invariant(!member->keyData.empty());
         for (size_t i = 0; i < member->keyData.size(); i++) {
             BSONObjSet keys;
-            member->keyData[i].index->getKeys(member->obj.value(), &keys);
+            // There's no need to compute the prefixes of the indexed fields that cause the index to
+            // be multikey when ensuring the keyData is still valid.
+            MultikeyPaths* multikeyPaths = nullptr;
+            member->keyData[i].index->getKeys(member->obj.value(), &keys, multikeyPaths);
             if (!keys.count(member->keyData[i].keyData)) {
                 // document would no longer be at this position in the index.
                 return false;

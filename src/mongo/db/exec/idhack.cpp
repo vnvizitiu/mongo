@@ -38,7 +38,6 @@
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/storage/record_fetcher.h"
-#include "mongo/s/d_state.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -228,10 +227,10 @@ void IDHackStage::doInvalidate(OperationContext* txn, const RecordId& dl, Invali
 
 // static
 bool IDHackStage::supportsQuery(const CanonicalQuery& query) {
-    return !query.getParsed().showRecordId() && query.getParsed().getHint().isEmpty() &&
-        !query.getParsed().getSkip() &&
-        CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter()) &&
-        !query.getParsed().isTailable();
+    return !query.getQueryRequest().showRecordId() && query.getQueryRequest().getHint().isEmpty() &&
+        query.getQueryRequest().getCollation().isEmpty() && !query.getQueryRequest().getSkip() &&
+        CanonicalQuery::isSimpleIdQuery(query.getQueryRequest().getFilter()) &&
+        !query.getQueryRequest().isTailable();
 }
 
 unique_ptr<PlanStageStats> IDHackStage::getStats() {

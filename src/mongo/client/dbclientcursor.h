@@ -97,6 +97,11 @@ public:
 
     /** throws AssertionException if get back { $err : ... } */
     BSONObj nextSafe();
+    BSONObj nextSafeOwned() {
+        BSONObj out = nextSafe();
+        out.shareOwnershipWith(batch.m.sharedBuffer());
+        return out;
+    }
 
     /** peek ahead at items buffered for future next() calls.
         never requests new data from the server.  so peek only effective
@@ -193,16 +198,6 @@ public:
     Message* getMessage() {
         return &batch.m;
     }
-
-    /**
-     * Used mainly to run commands on connections that doesn't support lazy initialization and
-     * does not support commands through the call interface.
-     *
-     * @param cmd The BSON representation of the command to send.
-     *
-     * @return true if command was sent successfully
-     */
-    bool initCommand();
 
     /**
      * actually does the query

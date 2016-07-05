@@ -113,9 +113,7 @@ public:
      * Requires holding an exclusive database lock.
      */
     Status init(const std::vector<BSONObj>& specs);
-    Status init(const BSONObj& spec) {
-        return init(std::vector<BSONObj>(1, spec));
-    }
+    Status init(const BSONObj& spec);
 
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
@@ -192,25 +190,6 @@ private:
     class CleanupIndexesVectorOnRollback;
 
     struct IndexToBuild {
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MVSC++ <= 2013 can't generate default move operations
-        IndexToBuild() = default;
-        IndexToBuild(IndexToBuild&& other)
-            : block(std::move(other.block)),
-              real(std::move(other.real)),
-              bulk(std::move(other.bulk)),
-              options(std::move(other.options)),
-              filterExpression(std::move(other.filterExpression)) {}
-
-        IndexToBuild& operator=(IndexToBuild&& other) {
-            block = std::move(other.block);
-            real = std::move(other.real);
-            filterExpression = std::move(other.filterExpression);
-            bulk = std::move(other.bulk);
-            options = std::move(other.options);
-            return *this;
-        }
-#endif
-
         std::unique_ptr<IndexCatalog::IndexBuildBlock> block;
 
         IndexAccessMethod* real = NULL;           // owned elsewhere

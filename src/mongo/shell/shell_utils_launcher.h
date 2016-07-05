@@ -33,11 +33,12 @@
 #include <map>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <utility>
+#include <vector>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/platform/unordered_map.h"
 #include "mongo/stdx/mutex.h"
 
 namespace mongo {
@@ -54,7 +55,6 @@ struct MongoProgramScope {
 };
 void KillMongoProgramInstances();
 
-void goingAwaySoon();
 void installShellUtilsLauncher(Scope& scope);
 
 /** Record log lines from concurrent programs.  All public members are thread safe. */
@@ -112,8 +112,10 @@ public:
 /** Helper class for launching a program and logging its output. */
 class ProgramRunner {
 public:
-    /** @param args The program's arguments, including the program name. */
-    ProgramRunner(const BSONObj& args);
+    /** @param args The program's arguments, including the program name.
+     *  @param env Environment to run the program with, which will override any set by the local
+     *             environment */
+    ProgramRunner(const BSONObj& args, const BSONObj& env);
     /** Launch the program. */
     void start();
     /** Continuously read the program's output, generally from a special purpose thread. */
@@ -130,6 +132,7 @@ private:
     void launchProcess(int child_stdout);
 
     std::vector<std::string> _argv;
+    std::map<std::string, std::string> _envp;
     int _port;
     int _pipe;
     ProcessId _pid;

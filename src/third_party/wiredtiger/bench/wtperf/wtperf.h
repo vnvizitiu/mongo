@@ -30,33 +30,8 @@
 #define	HAVE_WTPERF_H
 
 #include <wt_internal.h>
-
-#ifndef _WIN32
-#include <sys/time.h>
-#endif
-#include <sys/types.h>
-#include <sys/stat.h>
-
 #include <assert.h>
-#include <ctype.h>
-#ifndef _WIN32
-#include <dirent.h>
-#endif
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <limits.h>
 #include <math.h>
-#ifndef _WIN32
-#include <pthread.h>
-#endif
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 #ifdef _WIN32
 #include "windows_shim.h"
@@ -94,6 +69,7 @@ typedef struct {
 	int64_t truncate;		/* Truncate ratio */
 	uint64_t truncate_pct;		/* Truncate Percent */
 	uint64_t truncate_count;	/* Truncate Count */
+	int64_t update_delta;		/* Value size change on update */
 
 #define	WORKER_INSERT		1	/* Insert */
 #define	WORKER_INSERT_RMW	2	/* Insert with read-modify-write */
@@ -190,7 +166,10 @@ struct __config {			/* Configuration structure */
 
 	volatile uint32_t totalsec;	/* total seconds running */
 
-	u_int		 has_truncate;  /* if there is a truncate workload */
+#define	CFG_GROW	0x0001		/* There is a grow workload */
+#define	CFG_SHRINK	0x0002		/* There is a shrink workload */
+#define	CFG_TRUNCATE	0x0004		/* There is a truncate workload */
+	uint32_t	flags;		/* flags */
 
 	/* Queue head for use with the Truncate Logic */
 	TAILQ_HEAD(__truncate_qh, __truncate_queue_entry) stone_head;
@@ -333,13 +312,16 @@ generate_key(CONFIG *cfg, char *key_buf, uint64_t keyno)
 static inline void
 extract_key(char *key_buf, uint64_t *keynop)
 {
-	sscanf(key_buf, "%" SCNu64, keynop);
+	(void)sscanf(key_buf, "%" SCNu64, keynop);
 }
 
 /*
  * die --
  *      Print message and exit on failure.
  */
+static inline void
+die(int, const char *)
+    WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static inline void
 die(int e, const char *str)
 {
@@ -366,11 +348,11 @@ dmalloc(size_t len)
  *      Call calloc, dying on failure.
  */
 static inline void *
-dcalloc(size_t num, size_t len)
+dcalloc(size_t num, size_t size)
 {
 	void *p;
 
-	if ((p = calloc(len, num)) == NULL)
+	if ((p = calloc(num, size)) == NULL)
 		die(errno, "calloc");
 	return (p);
 }
@@ -412,11 +394,9 @@ static inline char *
 dstrndup(const char *str, const size_t len)
 {
 	char *p;
-	p = dcalloc(len + 1, 1);
 
-	strncpy(p, str, len);
-	if (p == NULL)
-		die(errno, "dstrndup");
+	p = dcalloc(len + 1, sizeof(char));
+	memcpy(p, str, len);
 	return (p);
 }
 #endif

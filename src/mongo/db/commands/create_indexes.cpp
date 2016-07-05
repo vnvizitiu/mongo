@@ -1,38 +1,37 @@
-// create_indexes.cpp
-
 /**
-*    Copyright (C) 2013 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2013-2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
 #include <string>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -42,14 +41,13 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/scopeguard.h"
 
@@ -64,8 +62,8 @@ class CmdCreateIndex : public Command {
 public:
     CmdCreateIndex() : Command("createIndexes") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
     virtual bool slaveOk() const {
         return false;
@@ -96,9 +94,8 @@ public:
                      int options,
                      string& errmsg,
                      BSONObjBuilder& result) {
-        // ---  parse
+        const NamespaceString ns(parseNs(dbname, cmdObj));
 
-        NamespaceString ns(dbname, cmdObj[name].String());
         Status status = userAllowedWriteNS(ns);
         if (!status.isOK())
             return appendCommandStatus(result, status);
@@ -118,6 +115,26 @@ public:
                     errmsg = "everything in indexes has to be an Object";
                     result.append("cmdObj", cmdObj);
                     return false;
+                }
+
+                // Verify that there are no duplicate keys
+                BSONElement indexKey = e.Obj()["key"];
+                if (indexKey.type() != Object) {
+                    errmsg = "missing 'key' property in index spec";
+                    result.append("cmdObj", cmdObj);
+                    return false;
+                }
+                BSONObjIterator it(indexKey.Obj());
+                std::vector<StringData> keys;
+                while (it.more()) {
+                    BSONElement e = it.next();
+                    StringData fieldName(e.fieldName(), e.fieldNameSize());
+                    if (std::find(keys.begin(), keys.end(), fieldName) != keys.end()) {
+                        errmsg = str::stream() << "duplicate keys detected in index spec: "
+                                               << indexKey;
+                        return false;
+                    }
+                    keys.push_back(fieldName);
                 }
                 specs.push_back(e.Obj());
             }
@@ -269,7 +286,8 @@ public:
                             Status(ErrorCodes::NotMaster,
                                    str::stream()
                                        << "Not primary while creating background indexes in "
-                                       << ns.ns() << ": cleaning up index build failure due to "
+                                       << ns.ns()
+                                       << ": cleaning up index build failure due to "
                                        << e.toString()));
                     }
                 } catch (...) {
@@ -298,8 +316,9 @@ public:
 
             for (size_t i = 0; i < specs.size(); i++) {
                 std::string systemIndexes = ns.getSystemIndexesCollection();
-                getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                    txn, systemIndexes, specs[i]);
+                auto opObserver = getGlobalServiceContext()->getOpObserver();
+                if (opObserver)
+                    opObserver->onCreateIndex(txn, systemIndexes, specs[i]);
             }
 
             wunit.commit();
@@ -319,21 +338,17 @@ private:
                                               const BSONObj& newIdxKey) {
         invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
 
-        ShardingState* const shardingState = ShardingState::get(txn);
-
-        if (shardingState->enabled()) {
-            std::shared_ptr<CollectionMetadata> metadata(
-                shardingState->getCollectionMetadata(ns.toString()));
-            if (metadata) {
-                ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
-                if (!shardKeyPattern.isUniqueIndexCompatible(newIdxKey)) {
-                    return Status(ErrorCodes::CannotCreateIndex,
-                                  str::stream() << "cannot create unique index over " << newIdxKey
-                                                << " with shard key pattern "
-                                                << shardKeyPattern.toBSON());
-                }
+        auto metadata(CollectionShardingState::get(txn, ns.toString())->getMetadata());
+        if (metadata) {
+            ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
+            if (!shardKeyPattern.isUniqueIndexCompatible(newIdxKey)) {
+                return Status(ErrorCodes::CannotCreateIndex,
+                              str::stream() << "cannot create unique index over " << newIdxKey
+                                            << " with shard key pattern "
+                                            << shardKeyPattern.toBSON());
             }
         }
+
 
         return Status::OK();
     }

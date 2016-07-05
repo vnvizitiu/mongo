@@ -33,9 +33,10 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 
-#include <sstream>
 #include "mongo/unittest/unittest.h"
+#include <sstream>
 
+namespace mongo {
 namespace {
 
 using mongo::BSONElement;
@@ -71,6 +72,14 @@ void assertBSONTypeEquals(BSONType actual, BSONType expected, T value, int i) {
         const string msg = ss.str();
         FAIL(msg);
     }
+}
+
+TEST(BSONObjBuilder, AppendInt64T) {
+    auto obj = BSON("a" << int64_t{5} << "b" << int64_t{1ll << 40});
+    ASSERT_EQ(obj["a"].type(), NumberLong);
+    ASSERT_EQ(obj["b"].type(), NumberLong);
+    ASSERT_EQ(obj["a"].Long(), 5);
+    ASSERT_EQ(obj["b"].Long(), 1ll << 40);
 }
 
 /**
@@ -300,7 +309,9 @@ TEST(BSONObjBuilderTest, ResumeBuildingWithNesting) {
     auto obj = BSONObj(b.buf());
     ASSERT_EQ(obj,
               BSON("ll" << BSON("f" << BSON("cc"
-                                            << "dd")) << "a" << BSON("c" << 3)));
+                                            << "dd"))
+                        << "a"
+                        << BSON("c" << 3)));
 }
 
 TEST(BSONObjBuilderTest, ResetToEmptyResultsInEmptyObj) {
@@ -321,3 +332,4 @@ TEST(BSONObjBuilderTest, ResetToEmptyForNestedBuilderOnlyResetsInnerObj) {
 }
 
 }  // unnamed namespace
+}  // namespace mongo

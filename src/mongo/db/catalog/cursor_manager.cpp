@@ -40,9 +40,9 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/startup_test.h"
@@ -332,7 +332,6 @@ void CursorManager::invalidateAll(bool collectionGoingAway, const std::string& r
         // we kill the executor, but it deletes itself
         PlanExecutor* exec = *it;
         exec->kill(reason);
-        invariant(exec->collection() == NULL);
     }
     _nonCachedExecutors.clear();
 
@@ -342,8 +341,6 @@ void CursorManager::invalidateAll(bool collectionGoingAway, const std::string& r
             ClientCursor* cc = i->second;
 
             cc->kill();
-
-            invariant(cc->getExecutor() == NULL || cc->getExecutor()->collection() == NULL);
 
             // If the CC is pinned, somebody is actively using it and we do not delete it.
             // Instead we notify the holder that we killed it.  The holder will then delete the

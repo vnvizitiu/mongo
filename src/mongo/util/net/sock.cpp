@@ -34,14 +34,14 @@
 #include "mongo/util/net/sock.h"
 
 #if !defined(_WIN32)
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
 #if defined(__OpenBSD__)
 #include <sys/uio.h>
 #endif
@@ -54,11 +54,12 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
-#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_poll.h"
+#include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -168,209 +169,6 @@ string getAddrInfoStrError(int code) {
 }
 
 // --- SockAddr
-SockAddr::SockAddr() {
-    addressSize = sizeof(sa);
-    memset(&sa, 0, sizeof(sa));
-    sa.ss_family = AF_UNSPEC;
-    _isValid = true;
-}
-
-SockAddr::SockAddr(int sourcePort) {
-    memset(as<sockaddr_in>().sin_zero, 0, sizeof(as<sockaddr_in>().sin_zero));
-    as<sockaddr_in>().sin_family = AF_INET;
-    as<sockaddr_in>().sin_port = htons(sourcePort);
-    as<sockaddr_in>().sin_addr.s_addr = htonl(INADDR_ANY);
-    addressSize = sizeof(sockaddr_in);
-    _isValid = true;
-}
-
-SockAddr::SockAddr(const char* _iporhost, int port) {
-    string target = _iporhost;
-    if (target == "localhost") {
-        target = "127.0.0.1";
-    }
-
-    if (mongoutils::str::contains(target, '/')) {
-#ifdef _WIN32
-        uassert(13080, "no unix socket support on windows", false);
-#endif
-        uassert(13079,
-                "path to unix socket too long",
-                target.size() < sizeof(as<sockaddr_un>().sun_path));
-        as<sockaddr_un>().sun_family = AF_UNIX;
-        strcpy(as<sockaddr_un>().sun_path, target.c_str());
-        addressSize = sizeof(sockaddr_un);
-        _isValid = true;
-        return;
-    }
-
-    addrinfo* addrs = NULL;
-    addrinfo hints;
-    memset(&hints, 0, sizeof(addrinfo));
-    hints.ai_socktype = SOCK_STREAM;
-    // hints.ai_flags = AI_ADDRCONFIG; // This is often recommended but don't do it.
-    // SERVER-1579
-    hints.ai_flags |= AI_NUMERICHOST;  // first pass tries w/o DNS lookup
-    hints.ai_family = (IPv6Enabled() ? AF_UNSPEC : AF_INET);
-
-    StringBuilder ss;
-    ss << port;
-    int ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
-
-// old C compilers on IPv6-capable hosts return EAI_NODATA error
-#ifdef EAI_NODATA
-    int nodata = (ret == EAI_NODATA);
-#else
-    int nodata = false;
-#endif
-    if ((ret == EAI_NONAME || nodata)) {
-        // iporhost isn't an IP address, allow DNS lookup
-        hints.ai_flags &= ~AI_NUMERICHOST;
-        ret = getaddrinfo(target.c_str(), ss.str().c_str(), &hints, &addrs);
-    }
-
-    if (ret) {
-        // we were unsuccessful
-        if (target != "0.0.0.0") {  // don't log if this as it is a
-                                    // CRT construction and log() may not work yet.
-            log() << "getaddrinfo(\"" << target << "\") failed: " << getAddrInfoStrError(ret)
-                  << endl;
-            _isValid = false;
-            return;
-        }
-        *this = SockAddr(port);
-        return;
-    }
-
-    // TODO: handle other addresses in linked list;
-    fassert(16501, addrs->ai_addrlen <= sizeof(sa));
-    memcpy(&sa, addrs->ai_addr, addrs->ai_addrlen);
-    addressSize = addrs->ai_addrlen;
-    freeaddrinfo(addrs);
-    _isValid = true;
-}
-
-bool SockAddr::isLocalHost() const {
-    switch (getType()) {
-        case AF_INET:
-            return getAddr() == "127.0.0.1";
-        case AF_INET6:
-            return getAddr() == "::1";
-        case AF_UNIX:
-            return true;
-        default:
-            return false;
-    }
-    fassert(16502, false);
-    return false;
-}
-
-string SockAddr::toString(bool includePort) const {
-    string out = getAddr();
-    if (includePort && getType() != AF_UNIX && getType() != AF_UNSPEC)
-        out += mongoutils::str::stream() << ':' << getPort();
-    return out;
-}
-
-sa_family_t SockAddr::getType() const {
-    return sa.ss_family;
-}
-
-unsigned SockAddr::getPort() const {
-    switch (getType()) {
-        case AF_INET:
-            return ntohs(as<sockaddr_in>().sin_port);
-        case AF_INET6:
-            return ntohs(as<sockaddr_in6>().sin6_port);
-        case AF_UNIX:
-            return 0;
-        case AF_UNSPEC:
-            return 0;
-        default:
-            massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
-            return 0;
-    }
-}
-
-std::string SockAddr::getAddr() const {
-    switch (getType()) {
-        case AF_INET:
-        case AF_INET6: {
-            const int buflen = 128;
-            char buffer[buflen];
-            int ret = getnameinfo(raw(), addressSize, buffer, buflen, NULL, 0, NI_NUMERICHOST);
-            massert(13082,
-                    mongoutils::str::stream() << "getnameinfo error " << getAddrInfoStrError(ret),
-                    ret == 0);
-            return buffer;
-        }
-
-        case AF_UNIX:
-            return (as<sockaddr_un>().sun_path[0] != '\0' ? as<sockaddr_un>().sun_path
-                                                          : "anonymous unix socket");
-        case AF_UNSPEC:
-            return "(NONE)";
-        default:
-            massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
-            return "";
-    }
-}
-
-bool SockAddr::operator==(const SockAddr& r) const {
-    if (getType() != r.getType())
-        return false;
-
-    if (getPort() != r.getPort())
-        return false;
-
-    switch (getType()) {
-        case AF_INET:
-            return as<sockaddr_in>().sin_addr.s_addr == r.as<sockaddr_in>().sin_addr.s_addr;
-        case AF_INET6:
-            return memcmp(as<sockaddr_in6>().sin6_addr.s6_addr,
-                          r.as<sockaddr_in6>().sin6_addr.s6_addr,
-                          sizeof(in6_addr)) == 0;
-        case AF_UNIX:
-            return strcmp(as<sockaddr_un>().sun_path, r.as<sockaddr_un>().sun_path) == 0;
-        case AF_UNSPEC:
-            return true;  // assume all unspecified addresses are the same
-        default:
-            massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
-    }
-    return false;
-}
-
-bool SockAddr::operator!=(const SockAddr& r) const {
-    return !(*this == r);
-}
-
-bool SockAddr::operator<(const SockAddr& r) const {
-    if (getType() < r.getType())
-        return true;
-    else if (getType() > r.getType())
-        return false;
-
-    if (getPort() < r.getPort())
-        return true;
-    else if (getPort() > r.getPort())
-        return false;
-
-    switch (getType()) {
-        case AF_INET:
-            return as<sockaddr_in>().sin_addr.s_addr < r.as<sockaddr_in>().sin_addr.s_addr;
-        case AF_INET6:
-            return memcmp(as<sockaddr_in6>().sin6_addr.s6_addr,
-                          r.as<sockaddr_in6>().sin6_addr.s6_addr,
-                          sizeof(in6_addr)) < 0;
-        case AF_UNIX:
-            return strcmp(as<sockaddr_un>().sun_path, r.as<sockaddr_un>().sun_path) < 0;
-        case AF_UNSPEC:
-            return false;
-        default:
-            massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
-    }
-    return false;
-}
 
 string makeUnixSockPath(int port) {
     return mongoutils::str::stream() << serverGlobalParams.socket << "/mongodb-" << port << ".sock";
@@ -419,8 +217,6 @@ string prettyHostName() {
     return s.str();
 }
 
-// --------- SocketException ----------
-
 #ifdef MSG_NOSIGNAL
 const int portSendFlags = MSG_NOSIGNAL;
 const int portRecvFlags = MSG_NOSIGNAL;
@@ -428,19 +224,6 @@ const int portRecvFlags = MSG_NOSIGNAL;
 const int portSendFlags = 0;
 const int portRecvFlags = 0;
 #endif
-
-string SocketException::toString() const {
-    stringstream ss;
-    ss << _ei.code << " socket exception [" << _getStringType(_type) << "] ";
-
-    if (_server.size())
-        ss << "server [" << _server << "] ";
-
-    if (_extra.size())
-        ss << _extra;
-
-    return ss.str();
-}
 
 // ------------ Socket -----------------
 
@@ -476,7 +259,7 @@ Socket::Socket(int fd, const SockAddr& remote)
 }
 
 Socket::Socket(double timeout, logger::LogSeverity ll) : _logLevel(ll) {
-    _fd = -1;
+    _fd = INVALID_SOCKET;
     _timeout = timeout;
     _lastValidityCheckAtSecs = time(0);
     _init();
@@ -496,7 +279,7 @@ void Socket::_init() {
 }
 
 void Socket::close() {
-    if (_fd >= 0) {
+    if (_fd != INVALID_SOCKET) {
 // Stop any blocking reads/writes, and prevent new reads/writes
 #if defined(_WIN32)
         shutdown(_fd, SD_BOTH);
@@ -504,14 +287,14 @@ void Socket::close() {
         shutdown(_fd, SHUT_RDWR);
 #endif
         closesocket(_fd);
-        _fd = -1;
+        _fd = INVALID_SOCKET;
     }
 }
 
 #ifdef MONGO_CONFIG_SSL
 bool Socket::secure(SSLManagerInterface* mgr, const std::string& remoteHost) {
     fassert(16503, mgr);
-    if (_fd < 0) {
+    if (_fd == INVALID_SOCKET) {
         return false;
     }
     _sslManager = mgr;
@@ -527,7 +310,7 @@ void Socket::secureAccepted(SSLManagerInterface* ssl) {
 std::string Socket::doSSLHandshake(const char* firstBytes, int len) {
     if (!_sslManager)
         return "";
-    fassert(16506, _fd);
+    fassert(16506, _fd != INVALID_SOCKET);
     if (_sslConnection.get()) {
         throw SocketException(SocketException::RECV_ERROR,
                               "Attempt to call SSL_accept on already secure Socket from " +
@@ -857,7 +640,7 @@ const int Socket::errorPollIntervalSecs(5);
 // isStillConnected() polls the socket at max every Socket::errorPollIntervalSecs to determine
 // if any disconnection-type events have happened on the socket.
 bool Socket::isStillConnected() {
-    if (_fd == -1) {
+    if (_fd == INVALID_SOCKET) {
         // According to the man page, poll will respond with POLLVNAL for invalid or
         // unopened descriptors, but it doesn't seem to be properly implemented in
         // some platforms - it can return 0 events and 0 for revent. Hence this workaround.

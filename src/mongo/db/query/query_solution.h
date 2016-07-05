@@ -30,9 +30,9 @@
 
 #include <memory>
 
+#include "mongo/db/fts/fts_query.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/fts/fts_query.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/stage_types.h"
@@ -457,6 +457,14 @@ struct IndexScanNode : public QuerySolutionNode {
 
     bool operator==(const IndexScanNode& other) const;
 
+    /**
+     * This function extracts a list of field names from 'indexKeyPattern' whose corresponding index
+     * bounds in 'bounds' can contain strings.  This is the case if there are intervals containing
+     * String, Object, or Array values.
+     */
+    static std::set<StringData> getFieldsWithStringBounds(const IndexBounds& bounds,
+                                                          const BSONObj& indexKeyPattern);
+
     BSONObjSet _sorts;
 
     BSONObj indexKeyPattern;
@@ -470,11 +478,10 @@ struct IndexScanNode : public QuerySolutionNode {
     // If there's a 'returnKey' projection we add key metadata.
     bool addKeyMetadata;
 
-    // BIG NOTE:
-    // If you use simple bounds, we'll use whatever index access method the keypattern implies.
-    // If you use the complex bounds, we force Btree access.
-    // The complex bounds require Btree access.
     IndexBounds bounds;
+
+    const CollatorInterface* indexCollator;
+    const CollatorInterface* queryCollator;
 };
 
 struct ProjectionNode : public QuerySolutionNode {
@@ -496,13 +503,15 @@ struct ProjectionNode : public QuerySolutionNode {
         SIMPLE_DOC,
     };
 
-    ProjectionNode() : fullExpression(NULL), projType(DEFAULT) {}
+    ProjectionNode(ParsedProjection proj) : fullExpression(NULL), projType(DEFAULT), parsed(proj) {}
 
     virtual ~ProjectionNode() {}
 
     virtual StageType getType() const {
         return STAGE_PROJECTION;
     }
+
+    virtual void computeProperties();
 
     virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
 
@@ -532,8 +541,6 @@ struct ProjectionNode : public QuerySolutionNode {
     }
 
     const BSONObjSet& getSort() const {
-        // TODO: If we're applying a projection that maintains sort order, the prefix of the
-        // sort order we project is the sort order.
         return _sorts;
     }
 
@@ -551,6 +558,8 @@ struct ProjectionNode : public QuerySolutionNode {
 
     // What implementation of the projection algorithm should we use?
     ProjectionType projType;
+
+    ParsedProjection parsed;
 
     // Only meaningful if projType == COVERED_ONE_INDEX.  This is the key pattern of the index
     // supplying our covered data.  We can pre-compute which fields to include and cache that

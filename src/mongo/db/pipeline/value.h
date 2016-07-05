@@ -80,6 +80,7 @@ public:
     explicit Value(const Document& doc) : _storage(Object, doc) {}
     explicit Value(const BSONObj& obj);
     explicit Value(const BSONArray& arr);
+    explicit Value(const std::vector<BSONObj>& arr);
     explicit Value(std::vector<Value> vec) : _storage(Array, new RCVector(std::move(vec))) {}
     explicit Value(const BSONBinData& bd) : _storage(BinData, bd) {}
     explicit Value(const BSONRegEx& re) : _storage(RegEx, re) {}
@@ -96,16 +97,6 @@ public:
     // TODO: add an unsafe version that can share storage with the BSONElement
     /// Deep-convert from BSONElement to Value
     explicit Value(const BSONElement& elem);
-
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MVSC++ <= 2013 can't generate default move operations
-    Value(const Value& other) = default;
-    Value& operator=(const Value& other) = default;
-    Value(Value&& other) : _storage(std::move(other._storage)) {}
-    Value& operator=(Value&& other) {
-        _storage = std::move(other._storage);
-        return *this;
-    }
-#endif
 
     /** Construct a long or integer-valued Value.
      *
@@ -129,11 +120,16 @@ public:
     }
 
     /// true if type represents a number
-    // TODO: Add _storage.type == NumberDecimal
-    // SERVER-19735
     bool numeric() const {
         return _storage.type == NumberDouble || _storage.type == NumberLong ||
-            _storage.type == NumberInt;
+            _storage.type == NumberInt || _storage.type == NumberDecimal;
+    }
+
+    /**
+     * Return true if the Value is an array.
+     */
+    bool isArray() const {
+        return _storage.type == Array;
     }
 
     /**
@@ -298,6 +294,16 @@ typedef unordered_set<Value, Value::Hash> ValueSet;
 inline void swap(mongo::Value& lhs, mongo::Value& rhs) {
     lhs.swap(rhs);
 }
+
+/**
+ * This class is identical to Value, but supports implicit creation from any of the types explicitly
+ * supported by Value.
+ */
+class ImplicitValue : public Value {
+public:
+    template <typename T>
+    ImplicitValue(T arg) : Value(std::move(arg)) {}
+};
 }
 
 /* ======================= INLINED IMPLEMENTATIONS ========================== */

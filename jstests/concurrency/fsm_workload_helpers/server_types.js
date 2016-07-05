@@ -28,10 +28,9 @@ function getStorageEngineName(db) {
     var status = db.serverStatus();
     assert.commandWorked(status);
 
-    assert(isMongod(db),
-           'no storage engine is reported when connected to mongos');
-    assert.neq('undefined', typeof status.storageEngine,
-               'missing storage engine info in server status');
+    assert(isMongod(db), 'no storage engine is reported when connected to mongos');
+    assert.neq(
+        'undefined', typeof status.storageEngine, 'missing storage engine info in server status');
 
     return status.storageEngine.name;
 }
@@ -41,6 +40,15 @@ function getStorageEngineName(db) {
  */
 function isMMAPv1(db) {
     return getStorageEngineName(db) === 'mmapv1';
+}
+
+/**
+ * Returns true if an update can cause the RecordId of a document to change.
+ */
+function recordIdCanChangeOnUpdate(db) {
+    // A RecordId on MMAPv1 is just its location on disk, which can change if the document grows and
+    // needs to be moved.
+    return isMMAPv1(db);
 }
 
 /**
@@ -56,4 +64,13 @@ function isWiredTiger(db) {
 function isEphemeral(db) {
     var engine = getStorageEngineName(db);
     return (engine === 'inMemory') || (engine === 'ephemeralForTest');
+}
+
+/**
+ * Returns true if the current storage engine supports document-level concurrency, and false
+ * otherwise.
+ */
+function supportsDocumentLevelConcurrency(db) {
+    var engine = getStorageEngineName(db);
+    return ['wiredTiger', 'rocksdb', 'inMemory'].indexOf(engine) !== -1;
 }

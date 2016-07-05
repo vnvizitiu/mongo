@@ -77,8 +77,8 @@ logger::LogstreamBuilder log() {
     return LogstreamBuilder(unittestOutput, getThreadName(), logger::LogSeverity::Log());
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(UnitTestOutput,
-                                     ("GlobalLogManager", "default"))(InitializerContext*) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(UnitTestOutput, ("GlobalLogManager", "default"))
+(InitializerContext*) {
     unittestOutput->attachAppender(logger::MessageLogDomain::AppenderAutoPtr(
         new logger::ConsoleAppender<logger::MessageLogDomain::Event>(
             new logger::MessageEventDetailsEncoder)));
@@ -213,6 +213,13 @@ void Test::stopCapturingLogMessages() {
     _captureAppender = logger::globalLogDomain()->detachAppender(_captureAppenderHandle);
     checked_cast<StringVectorAppender*>(_captureAppender.get())->disable();
     _isCapturingLogMessages = false;
+}
+void Test::printCapturedLogLines() const {
+    log() << "****************************** Captured Lines (start) *****************************";
+    std::for_each(getCapturedLogMessages().begin(),
+                  getCapturedLogMessages().end(),
+                  [](std::string line) { log() << line; });
+    log() << "****************************** Captured Lines (end) ******************************";
 }
 
 int64_t Test::countLogLinesContaining(const std::string& needle) {

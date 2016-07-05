@@ -71,7 +71,7 @@ public:
 
     /**
      * Internally generate the keys {k1, ..., kn} for 'obj'.  For each key k, insert (k ->
-     * 'loc') into the index.  'obj' is the object at the location 'loc'.  If not NULL,
+     * 'loc') into the index.  'obj' is the object at the location 'loc'.
      * 'numInserted' will be set to the number of keys added to the index for the document.  If
      * there is more than one key for 'obj', either all keys will be inserted or none will.
      *
@@ -84,8 +84,8 @@ public:
                   int64_t* numInserted);
 
     /**
-     * Analogous to above, but remove the records instead of inserting them.  If not NULL,
-     * numDeleted will be set to the number of keys removed from the index for the document.
+     * Analogous to above, but remove the records instead of inserting them.
+     * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
     Status remove(OperationContext* txn,
                   const BSONObj& obj,
@@ -118,8 +118,14 @@ public:
      * 'from' will remain.  Assumes that the index has not changed since validateUpdate was
      * called.  If the index was changed, we may return an error, as our ticket may have been
      * invalidated.
+     *
+     * 'numInserted' will be set to the number of keys inserted into the index for the document.
+     * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
-    Status update(OperationContext* txn, const UpdateTicket& ticket, int64_t* numUpdated);
+    Status update(OperationContext* txn,
+                  const UpdateTicket& ticket,
+                  int64_t* numInserted,
+                  int64_t* numDeleted);
 
     /**
      * Returns an unpositioned cursor over 'this' index.
@@ -157,16 +163,10 @@ public:
     /**
      * Walk the entire index, checking the internal structure for consistency.
      * Set numKeys to the number of keys in the index.
-     *
-     * 'output' is used to store results of validate when 'full' is true.
-     * If 'full' is false, 'output' may be NULL.
-     *
+
      * Return OK if the index is valid.
-     *
-     * Currently wasserts that the index is invalid.  This could/should be changed in
-     * the future to return a Status.
      */
-    Status validate(OperationContext* txn, bool full, int64_t* numKeys, BSONObjBuilder* output);
+    Status validate(OperationContext* txn, int64_t* numKeys, ValidateResults* fullResults);
 
     /**
      * Add custom statistics about this index to BSON object builder, for display.
@@ -184,6 +184,12 @@ public:
     long long getSpaceUsedBytes(OperationContext* txn) const;
 
     RecordId findSingle(OperationContext* txn, const BSONObj& key) const;
+
+    /**
+     * Attempt compaction to regain disk space if the indexed record store supports
+     * compaction-in-place.
+     */
+    Status compact(OperationContext* txn);
 
     //
     // Bulk operations support
@@ -210,7 +216,14 @@ public:
         std::unique_ptr<Sorter> _sorter;
         const IndexAccessMethod* _real;
         int64_t _keysInserted = 0;
-        bool _isMultiKey = false;
+
+        // Set to true if at least one document causes IndexAccessMethod::getKeys() to return a
+        // BSONObjSet with size strictly greater than one.
+        bool _everGeneratedMultipleKeys = false;
+
+        // Holds the path components that cause this index to be multikey. The '_indexMultikeyPaths'
+        // vector remains empty if this index doesn't support path-level multikey tracking.
+        MultikeyPaths _indexMultikeyPaths;
     };
 
     /**
@@ -239,8 +252,27 @@ public:
 
     /**
      * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. If this
+     * index type supports tracking path-level multikey information, then this function resizes
+     * 'multikeyPaths' to have the same number of elements as the index key pattern and fills each
+     * element with the prefixes of the indexed field that would cause this index to be multikey as
+     * a result of inserting 'keys'.
      */
-    virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const = 0;
+    virtual void getKeys(const BSONObj& obj,
+                         BSONObjSet* keys,
+                         MultikeyPaths* multikeyPaths) const = 0;
+
+    /**
+     * Splits the sets 'left' and 'right' into two vectors, the first containing the elements that
+     * only appeared in 'left', and the second containing only elements that appeared in 'right'.
+     *
+     * Note this considers objects which are not identical as distinct objects. For example,
+     * setDifference({BSON("a" << 0.0)}, {BSON("a" << 0LL)}) would result in the pair
+     * ( {BSON("a" << 0.0)}, {BSON("a" << 0LL)} ).
+     */
+    static std::pair<std::vector<BSONObj>, std::vector<BSONObj>> setDifference(
+        const BSONObjSet& left, const BSONObjSet& right);
 
 protected:
     // Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext
@@ -272,12 +304,16 @@ private:
     BSONObjSet oldKeys;
     BSONObjSet newKeys;
 
-    // These point into the sets oldKeys and newKeys.
-    std::vector<BSONObj*> removed;
-    std::vector<BSONObj*> added;
+    std::vector<BSONObj> removed;
+    std::vector<BSONObj> added;
 
     RecordId loc;
     bool dupsAllowed;
+
+    // Holds the path components that would cause this index to be multikey as a result of inserting
+    // 'newKeys'. The 'newMultikeyPaths' vector remains empty if this index doesn't support
+    // path-level multikey tracking.
+    MultikeyPaths newMultikeyPaths;
 };
 
 /**

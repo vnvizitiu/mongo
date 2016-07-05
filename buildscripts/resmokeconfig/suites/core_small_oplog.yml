@@ -16,7 +16,10 @@ executor:
         readMode: commands
     hooks:
     - class: ValidateCollections
+    - class: CheckReplDBHashDeprecated
     - class: CheckReplDBHash
+    - class: CleanEveryN
+      n: 20
     fixture:
       class: MasterSlaveFixture
       mongod_options:

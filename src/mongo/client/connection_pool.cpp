@@ -185,12 +185,9 @@ ConnectionPool::ConnectionList::iterator ConnectionPool::acquireConnection(
     conn->setSoTimeout(durationCount<Milliseconds>(timeout) / 1000.0);
 
     uassertStatusOK(conn->connect(target));
-    conn->port().tag |= _messagingPortTags;
+    conn->port().setTag(conn->port().getTag() | _messagingPortTags);
 
-    if (getGlobalAuthorizationManager()->isAuthEnabled()) {
-        uassert(ErrorCodes::AuthenticationFailed,
-                "Missing credentials for authenticating as internal user",
-                isInternalAuthSet());
+    if (isInternalAuthSet()) {
         conn->auth(getInternalUserAuthParamsWithFallback());
     }
 
@@ -266,11 +263,6 @@ ConnectionPool::ConnectionPtr::ConnectionPtr(ConnectionPtr&& other)
 }
 
 ConnectionPool::ConnectionPtr& ConnectionPool::ConnectionPtr::operator=(ConnectionPtr&& other) {
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
-    if (&other == this)
-        return *this;
-#endif
-
     _pool = std::move(other._pool);
     _connInfo = std::move(other._connInfo);
     other._pool = nullptr;

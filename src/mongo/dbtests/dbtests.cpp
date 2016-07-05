@@ -39,11 +39,11 @@
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/wire_version.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/quick_exit.h"
@@ -54,17 +54,15 @@
 
 namespace mongo {
 namespace dbtests {
-// This specifies default dbpath for our testing framework
-const std::string default_test_dbpath = "/tmp/unittest";
 
 void initWireSpec() {
     WireSpec& spec = WireSpec::instance();
     // accept from any version
     spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = FIND_COMMAND;
+    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to any version
     spec.minWireVersionOutgoing = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionOutgoing = FIND_COMMAND;
+    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
 }
 
 Status createIndex(OperationContext* txn, StringData ns, const BSONObj& keys, bool unique) {

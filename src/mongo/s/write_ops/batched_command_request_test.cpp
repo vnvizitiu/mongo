@@ -41,8 +41,12 @@ TEST(BatchedCommandRequest, BasicInsert) {
 
     BSONObj origInsertRequestObj = BSON("insert"
                                         << "test"
-                                        << "documents" << insertArray << "writeConcern"
-                                        << BSON("w" << 1) << "ordered" << true);
+                                        << "documents"
+                                        << insertArray
+                                        << "writeConcern"
+                                        << BSON("w" << 1)
+                                        << "ordered"
+                                        << true);
 
     std::string errMsg;
     BatchedCommandRequest insertRequest(BatchedCommandRequest::BatchType_Insert);
@@ -59,34 +63,14 @@ TEST(BatchedCommandRequest, InsertWithShardVersion) {
 
     BSONObj origInsertRequestObj = BSON("insert"
                                         << "test"
-                                        << "documents" << insertArray << "writeConcern"
-                                        << BSON("w" << 1) << "ordered" << true << "shardVersion"
-                                        << BSON_ARRAY(Timestamp(1, 2) << epoch) << "configsvrOpTime"
-                                        << BSON("ts" << Timestamp(3, 4) << "t" << 5));
-
-    std::string errMsg;
-    BatchedCommandRequest insertRequest(BatchedCommandRequest::BatchType_Insert);
-    ASSERT_TRUE(insertRequest.parseBSON("TestDB", origInsertRequestObj, &errMsg));
-
-    ASSERT_EQ("TestDB.test", insertRequest.getInsertRequest()->getNS().toString());
-    ASSERT(insertRequest.hasShardVersion());
-    ASSERT_EQ(ChunkVersion(1, 2, epoch).toString(), insertRequest.getShardVersion().toString());
-}
-
-TEST(BatchedCommandRequest, InsertWithShardVersionInLegacyMetadata) {
-    BSONArray insertArray = BSON_ARRAY(BSON("a" << 1) << BSON("b" << 1));
-
-    const OID epoch = OID::gen();
-
-    BSONObj origInsertRequestObj = BSON("insert"
-                                        << "test"
-                                        << "documents" << insertArray << "writeConcern"
-                                        << BSON("w" << 1) << "ordered" << true << "metadata"
-                                        << BSON("shardVersion"
-                                                << BSON_ARRAY(Timestamp(1, 2) << epoch)
-                                                << "configsvrOpTime"
-                                                << BSON("ts" << Timestamp(3, 4) << "t" << 5)
-                                                << "session" << 0LL));
+                                        << "documents"
+                                        << insertArray
+                                        << "writeConcern"
+                                        << BSON("w" << 1)
+                                        << "ordered"
+                                        << true
+                                        << "shardVersion"
+                                        << BSON_ARRAY(Timestamp(1, 2) << epoch));
 
     std::string errMsg;
     BatchedCommandRequest insertRequest(BatchedCommandRequest::BatchType_Insert);
@@ -123,7 +107,9 @@ TEST(BatchedCommandRequest, InsertClone) {
 TEST(BatchedCommandRequest, InsertIndexClone) {
     BSONObj indexSpec(BSON("ns"
                            << "xyz.user"
-                           << "key" << BSON("x" << 1) << "name"
+                           << "key"
+                           << BSON("x" << 1)
+                           << "name"
                            << "y"));
 
     auto insertRequest = stdx::make_unique<BatchedInsertRequest>();

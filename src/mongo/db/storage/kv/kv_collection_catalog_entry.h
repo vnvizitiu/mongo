@@ -52,7 +52,7 @@ public:
 
     bool setIndexIsMultikey(OperationContext* txn,
                             StringData indexName,
-                            bool multikey = true) final;
+                            const MultikeyPaths& multikeyPaths) final;
 
     void setIndexHead(OperationContext* txn, StringData indexName, const RecordId& newHead) final;
 
@@ -67,6 +67,8 @@ public:
                           long long newExpireSeconds) final;
 
     void updateFlags(OperationContext* txn, int newValue) final;
+
+    void clearTempFlag(OperationContext* txn) final;
 
     void updateValidator(OperationContext* txn,
                          const BSONObj& validator,

@@ -50,7 +50,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -91,14 +92,16 @@ public:
                 continue;
             }
 
-            BSONObj x = uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
-                txn,
-                s,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                BSON("fsync" << 1)));
+            auto response =
+                uassertStatusOK(s->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              "admin",
+                                              BSON("fsync" << 1),
+                                              Shard::RetryPolicy::kIdempotent));
+            uassertStatusOK(response.commandStatus);
+            BSONObj x = std::move(response.response);
 
-            sub.append(s->getId(), x);
+            sub.append(s->getId().toString(), x);
 
             if (!x["ok"].trueValue()) {
                 ok = false;

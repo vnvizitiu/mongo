@@ -41,6 +41,7 @@
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace executor {
@@ -118,6 +119,59 @@ TEST(ConnectionPoolASIO, TestPing) {
     }
 
     ASSERT_LTE(MyNetworkConnectionHook::count(), 10);
+}
+
+/**
+ * This test verifies a fix for SERVER-22391, where we raced if a new request
+ * came in at the same time a host timeout was triggering.
+ */
+TEST(ConnectionPoolASIO, TestHostTimeoutRace) {
+    auto fixture = unittest::getFixtureConnectionString();
+
+    NetworkInterfaceASIO::Options options;
+    options.streamFactory = stdx::make_unique<AsyncStreamFactory>();
+    options.connectionPoolOptions.hostTimeout = Milliseconds(1);
+    options.timerFactory = stdx::make_unique<AsyncTimerFactoryASIO>();
+    NetworkInterfaceASIO net{std::move(options)};
+
+    net.startup();
+    auto guard = MakeGuard([&] { net.shutdown(); });
+
+    for (int i = 0; i < 1000; i++) {
+        Deferred<StatusWith<RemoteCommandResponse>> deferred;
+        net.startCommand(
+            makeCallbackHandle(),
+            RemoteCommandRequest{fixture.getServers()[0], "admin", BSON("ping" << 1), BSONObj()},
+            [&](StatusWith<RemoteCommandResponse> resp) { deferred.emplace(std::move(resp)); });
+
+        ASSERT_OK(deferred.get().getStatus());
+        sleepmillis(1);
+    }
+}
+
+
+/**
+ * Verify that a connections that timeout immediately don't invariant.
+ */
+TEST(ConnectionPoolASIO, ConnSetupTimeout) {
+    auto fixture = unittest::getFixtureConnectionString();
+
+    NetworkInterfaceASIO::Options options;
+    options.streamFactory = stdx::make_unique<AsyncStreamFactory>();
+    options.timerFactory = stdx::make_unique<AsyncTimerFactoryASIO>();
+    options.connectionPoolOptions.refreshTimeout = Milliseconds(-2);
+    NetworkInterfaceASIO net{std::move(options)};
+
+    net.startup();
+    auto guard = MakeGuard([&] { net.shutdown(); });
+
+    Deferred<StatusWith<RemoteCommandResponse>> deferred;
+    net.startCommand(
+        makeCallbackHandle(),
+        RemoteCommandRequest{fixture.getServers()[0], "admin", BSON("ping" << 1), BSONObj()},
+        [&](StatusWith<RemoteCommandResponse> resp) { deferred.emplace(std::move(resp)); });
+
+    ASSERT_EQ(deferred.get().getStatus().code(), ErrorCodes::ExceededTimeLimit);
 }
 
 }  // namespace

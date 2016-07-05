@@ -53,7 +53,7 @@ CollectionInfoCache::CollectionInfoCache(Collection* collection)
       _keysComputed(false),
       _planCache(new PlanCache(collection->ns().ns())),
       _querySettings(new QuerySettings()),
-      _indexUsageTracker(getGlobalServiceContext()->getClockSource()) {}
+      _indexUsageTracker(getGlobalServiceContext()->getPreciseClockSource()) {}
 
 
 const UpdateIndexData& CollectionInfoCache::getIndexKeys(OperationContext* txn) const {
@@ -156,11 +156,13 @@ void CollectionInfoCache::updatePlanCacheIndexEntries(OperationContext* txn) {
         indexEntries.emplace_back(desc->keyPattern(),
                                   desc->getAccessMethodName(),
                                   desc->isMultikey(txn),
+                                  ice->getMultikeyPaths(txn),
                                   desc->isSparse(),
                                   desc->unique(),
                                   desc->indexName(),
                                   ice->getFilterExpression(),
-                                  desc->infoObj());
+                                  desc->infoObj(),
+                                  ice->getCollator());
     }
 
     _planCache->notifyOfIndexEntries(indexEntries);

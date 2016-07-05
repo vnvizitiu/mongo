@@ -488,7 +488,8 @@ public:
 
         if (_forward && MONGO_FAIL_POINT(WTEmulateOutOfOrderNextRecordId)) {
             log() << "WTEmulateOutOfOrderNextRecordId fail point has triggerd so RecordId is now "
-                     "RecordId(1) instead of " << id;
+                     "RecordId(1) instead of "
+                  << id;
             // Replace the found RecordId with a (small) fake one.
             id = RecordId{1};
         }
@@ -649,7 +650,8 @@ StatusWith<std::string> WiredTigerRecordStore::parseOptionsField(const BSONObj o
             // Return error on first unrecognized field.
             return StatusWith<std::string>(ErrorCodes::InvalidOptions,
                                            str::stream() << '\'' << elem.fieldNameStringData()
-                                                         << '\'' << " is not a supported option.");
+                                                         << '\''
+                                                         << " is not a supported option.");
         }
     }
     return StatusWith<std::string>(ss.str());
@@ -708,7 +710,9 @@ public:
     void detachFromOperationContext() final {
         invariant(_txn);
         _txn = nullptr;
-        _cursor->close(_cursor);
+        if (_cursor) {
+            invariantWTOK(_cursor->close(_cursor));
+        }
         _cursor = nullptr;
     }
     void reattachToOperationContext(OperationContext* txn) final {
@@ -810,9 +814,14 @@ WiredTigerRecordStore::WiredTigerRecordStore(OperationContext* ctx,
       _sizeStorerCounter(0),
       _shuttingDown(false) {
     Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
-        ctx, uri, kMinimumRecordStoreVersion, kMaximumRecordStoreVersion);
+                               ctx, uri, kMinimumRecordStoreVersion, kMaximumRecordStoreVersion)
+                               .getStatus();
     if (!versionStatus.isOK()) {
-        fassertFailedWithStatusNoTrace(28548, versionStatus);
+        if (versionStatus.code() == ErrorCodes::FailedToParse) {
+            uasserted(28548, versionStatus.reason());
+        } else {
+            fassertFailedNoTrace(34433);
+        }
     }
 
     if (_isCapped) {
@@ -1255,11 +1264,17 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* txn) {
 Status WiredTigerRecordStore::insertRecords(OperationContext* txn,
                                             std::vector<Record>* records,
                                             bool enforceQuota) {
+    return _insertRecords(txn, records->data(), records->size());
+}
+
+Status WiredTigerRecordStore::_insertRecords(OperationContext* txn,
+                                             Record* records,
+                                             size_t nRecords) {
     // We are kind of cheating on capped collections since we write all of them at once ....
     // Simplest way out would be to just block vector writes for everything except oplog ?
-    int totalLength = 0;
-    for (auto& record : *records)
-        totalLength += record.data.size();
+    int64_t totalLength = 0;
+    for (size_t i = 0; i < nRecords; i++)
+        totalLength += records[i].data.size();
 
     // caller will retry one element at a time
     if (_isCapped && totalLength > _cappedMaxSize)
@@ -1271,8 +1286,9 @@ Status WiredTigerRecordStore::insertRecords(OperationContext* txn,
     invariant(c);
 
     RecordId highestId = RecordId();
-    dassert(!records->empty());
-    for (auto& record : *records) {
+    dassert(nRecords != 0);
+    for (size_t i = 0; i < nRecords; i++) {
+        auto& record = records[i];
         if (_useOplogHack) {
             StatusWith<RecordId> status =
                 oploghack::extractKey(record.data.data(), record.data.size());
@@ -1296,7 +1312,8 @@ Status WiredTigerRecordStore::insertRecords(OperationContext* txn,
             _oplog_highestSeen = highestId;
     }
 
-    for (auto& record : *records) {
+    for (size_t i = 0; i < nRecords; i++) {
+        auto& record = records[i];
         c->set_key(c, _makeKey(record.id));
         WiredTigerItem value(record.data.data(), record.data.size());
         c->set_value(c, value.Get());
@@ -1305,12 +1322,11 @@ Status WiredTigerRecordStore::insertRecords(OperationContext* txn,
             return wtRCToStatus(ret, "WiredTigerRecordStore::insertRecord");
     }
 
-    _changeNumRecords(txn, records->size());
+    _changeNumRecords(txn, nRecords);
     _increaseDataSize(txn, totalLength);
 
     if (_oplogStones) {
-        _oplogStones->updateCurrentStoneAfterInsertOnCommit(
-            txn, totalLength, highestId, records->size());
+        _oplogStones->updateCurrentStoneAfterInsertOnCommit(txn, totalLength, highestId, nRecords);
     } else {
         cappedDeleteAsNeeded(txn, highestId);
     }
@@ -1322,13 +1338,11 @@ StatusWith<RecordId> WiredTigerRecordStore::insertRecord(OperationContext* txn,
                                                          const char* data,
                                                          int len,
                                                          bool enforceQuota) {
-    std::vector<Record> records;
     Record record = {RecordId(), RecordData(data, len)};
-    records.push_back(record);
-    Status status = insertRecords(txn, &records, enforceQuota);
+    Status status = _insertRecords(txn, &record, 1);
     if (!status.isOK())
         return StatusWith<RecordId>(status);
-    return StatusWith<RecordId>(records[0].id);
+    return StatusWith<RecordId>(record.id);
 }
 
 void WiredTigerRecordStore::_dealtWithCappedId(SortedRecordIds::iterator it) {
@@ -1350,23 +1364,51 @@ RecordId WiredTigerRecordStore::lowestCappedHiddenRecord() const {
     return _uncommittedRecordIds.empty() ? RecordId() : _uncommittedRecordIds.front();
 }
 
-StatusWith<RecordId> WiredTigerRecordStore::insertRecord(OperationContext* txn,
-                                                         const DocWriter* doc,
-                                                         bool enforceQuota) {
-    const int len = doc->documentSize();
+Status WiredTigerRecordStore::insertRecordsWithDocWriter(OperationContext* txn,
+                                                         const DocWriter* const* docs,
+                                                         size_t nDocs,
+                                                         RecordId* idsOut) {
+    std::unique_ptr<Record[]> records(new Record[nDocs]);
 
-    std::unique_ptr<char[]> buf(new char[len]);
-    doc->writeDocument(buf.get());
+    // First get all the sizes so we can allocate a single buffer for all documents. Eventually it
+    // would be nice if we could either hand off the buffers to WT without copying or write them
+    // in-place as we do with MMAPv1, but for now this is the best we can do.
+    size_t totalSize = 0;
+    for (size_t i = 0; i < nDocs; i++) {
+        const size_t docSize = docs[i]->documentSize();
+        records[i].data = RecordData(nullptr, docSize);  // We fill in the real ptr in next loop.
+        totalSize += docSize;
+    }
 
-    return insertRecord(txn, buf.get(), len, enforceQuota);
+    std::unique_ptr<char[]> buffer(new char[totalSize]);
+    char* pos = buffer.get();
+    for (size_t i = 0; i < nDocs; i++) {
+        docs[i]->writeDocument(pos);
+        const size_t size = records[i].data.size();
+        records[i].data = RecordData(pos, size);
+        pos += size;
+    }
+    invariant(pos == (buffer.get() + totalSize));
+
+    Status s = _insertRecords(txn, records.get(), nDocs);
+    if (!s.isOK())
+        return s;
+
+    if (idsOut) {
+        for (size_t i = 0; i < nDocs; i++) {
+            idsOut[i] = records[i].id;
+        }
+    }
+
+    return s;
 }
 
-StatusWith<RecordId> WiredTigerRecordStore::updateRecord(OperationContext* txn,
-                                                         const RecordId& id,
-                                                         const char* data,
-                                                         int len,
-                                                         bool enforceQuota,
-                                                         UpdateNotifier* notifier) {
+Status WiredTigerRecordStore::updateRecord(OperationContext* txn,
+                                           const RecordId& id,
+                                           const char* data,
+                                           int len,
+                                           bool enforceQuota,
+                                           UpdateNotifier* notifier) {
     WiredTigerCursor curwrap(_uri, _tableId, true, txn);
     curwrap.assertInActiveTxn();
     WT_CURSOR* c = curwrap.get();
@@ -1396,7 +1438,7 @@ StatusWith<RecordId> WiredTigerRecordStore::updateRecord(OperationContext* txn,
         cappedDeleteAsNeeded(txn, id);
     }
 
-    return StatusWith<RecordId>(id);
+    return Status::OK();
 }
 
 bool WiredTigerRecordStore::updateWithDamagesSupported() const {
@@ -1488,8 +1530,7 @@ Status WiredTigerRecordStore::compact(OperationContext* txn,
 }
 
 Status WiredTigerRecordStore::validate(OperationContext* txn,
-                                       bool full,
-                                       bool scanData,
+                                       ValidateCmdLevel level,
                                        ValidateAdaptor* adaptor,
                                        ValidateResults* results,
                                        BSONObjBuilder* output) {
@@ -1498,7 +1539,7 @@ Status WiredTigerRecordStore::validate(OperationContext* txn,
         if (err == EBUSY) {
             const char* msg = "verify() returned EBUSY. Not treating as invalid.";
             warning() << msg;
-            results->errors.push_back(msg);
+            results->warnings.push_back(msg);
         } else if (err) {
             std::string msg = str::stream() << "verify() returned " << wiredtiger_strerror(err)
                                             << ". "
@@ -1513,21 +1554,32 @@ Status WiredTigerRecordStore::validate(OperationContext* txn,
 
     long long nrecords = 0;
     long long dataSizeTotal = 0;
+    long long nInvalid = 0;
+
     results->valid = true;
     Cursor cursor(txn, *this, true);
+    int interruptInterval = 4096;
+
     while (auto record = cursor.next()) {
+        if (!(nrecords % interruptInterval))
+            txn->checkForInterrupt();
         ++nrecords;
         auto dataSize = record->data.size();
         dataSizeTotal += dataSize;
-        if (full && scanData) {
+        if (level == kValidateFull) {
             size_t validatedSize;
-            Status status = adaptor->validate(record->data, &validatedSize);
+            Status status = adaptor->validate(record->id, record->data, &validatedSize);
 
             // The validatedSize equals dataSize below is not a general requirement, but must be
             // true for WT today because we never pad records.
             if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
+                if (results->valid) {
+                    // Only log once.
+                    results->errors.push_back("detected one or more invalid documents (see logs)");
+                }
+                nInvalid++;
                 results->valid = false;
-                results->errors.push_back(str::stream() << record->id << " is corrupted");
+                log() << "document at location: " << record->id << " is corrupted";
             }
         }
     }
@@ -1543,6 +1595,10 @@ Status WiredTigerRecordStore::validate(OperationContext* txn,
         _numRecords.store(nrecords);
         _dataSize.store(dataSizeTotal);
         _sizeStorer->storeToCache(_uri, _numRecords.load(), _dataSize.load());
+    }
+
+    if (level == kValidateFull) {
+        output->append("nInvalidDocuments", nInvalid);
     }
 
     output->appendNumber("nrecords", nrecords);

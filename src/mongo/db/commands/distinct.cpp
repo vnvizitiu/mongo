@@ -37,18 +37,24 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/parsed_distinct.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -58,12 +64,7 @@ using std::unique_ptr;
 using std::string;
 using std::stringstream;
 
-namespace {
-
-const char kKeyField[] = "key";
-const char kQueryField[] = "query";
-
-}  // namespace
+namespace dps = ::mongo::dotted_path_support;
 
 class DistinctCommand : public Command {
 public:
@@ -72,14 +73,21 @@ public:
     virtual bool slaveOk() const {
         return false;
     }
+
     virtual bool slaveOverrideOk() const {
         return true;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     bool supportsReadConcern() const final {
         return true;
+    }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
     }
 
     std::size_t reserveBytesForReply() const override {
@@ -98,46 +106,6 @@ public:
         help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
     }
 
-    /**
-     * Used by explain() and run() to get the PlanExecutor for the query.
-     */
-    StatusWith<unique_ptr<PlanExecutor>> getPlanExecutor(OperationContext* txn,
-                                                         Collection* collection,
-                                                         const string& ns,
-                                                         const BSONObj& cmdObj,
-                                                         bool isExplain) const {
-        // Extract the key field.
-        BSONElement keyElt;
-        auto statusKey = bsonExtractTypedField(cmdObj, kKeyField, BSONType::String, &keyElt);
-        if (!statusKey.isOK()) {
-            return {statusKey};
-        }
-        string key = keyElt.valuestrsafe();
-
-        // Extract the query field. If the query field is nonexistent, an empty query is used.
-        BSONObj query;
-        if (BSONElement queryElt = cmdObj[kQueryField]) {
-            if (queryElt.type() == BSONType::Object) {
-                query = queryElt.embeddedObject();
-            } else if (queryElt.type() != BSONType::jstNULL) {
-                return Status(ErrorCodes::TypeMismatch,
-                              str::stream() << "\"" << kQueryField
-                                            << "\" had the wrong type. Expected "
-                                            << typeName(BSONType::Object) << " or "
-                                            << typeName(BSONType::jstNULL) << ", found "
-                                            << typeName(queryElt.type()));
-            }
-        }
-
-        auto executor = getExecutorDistinct(
-            txn, collection, ns, query, key, isExplain, PlanExecutor::YIELD_AUTO);
-        if (!executor.isOK()) {
-            return executor.getStatus();
-        }
-
-        return std::move(executor.getValue());
-    }
-
     virtual Status explain(OperationContext* txn,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
@@ -145,17 +113,25 @@ public:
                            const rpc::ServerSelectionMetadata&,
                            BSONObjBuilder* out) const {
         const string ns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(ns);
+
+        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
+        auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, true);
+        if (!parsedDistinct.isOK()) {
+            return parsedDistinct.getStatus();
+        }
+
         AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
 
-        StatusWith<unique_ptr<PlanExecutor>> executor =
-            getPlanExecutor(txn, collection, ns, cmdObj, true);
+        auto executor = getExecutorDistinct(
+            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return executor.getStatus();
         }
 
-        Explain::explainStages(executor.getValue().get(), verbosity, out);
+        Explain::explainStages(executor.getValue().get(), collection, verbosity, out);
         return Status::OK();
     }
 
@@ -168,23 +144,38 @@ public:
         Timer t;
 
         const string ns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(ns);
+
+        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
+        auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, false);
+        if (!parsedDistinct.isOK()) {
+            return appendCommandStatus(result, parsedDistinct.getStatus());
+        }
+
         AutoGetCollectionForRead ctx(txn, ns);
 
         Collection* collection = ctx.getCollection();
 
-        auto executor = getPlanExecutor(txn, collection, ns, cmdObj, false);
+        auto executor = getExecutorDistinct(
+            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return appendCommandStatus(result, executor.getStatus());
         }
 
-        string key = cmdObj[kKeyField].valuestrsafe();
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            CurOp::get(txn)->setPlanSummary_inlock(
+                Explain::getPlanSummary(executor.getValue().get()));
+        }
+
+        string key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
 
         int bufSize = BSONObjMaxUserSize - 4096;
         BufBuilder bb(bufSize);
         char* start = bb.buf();
 
         BSONArrayBuilder arr(bb);
-        BSONElementSet values;
+        BSONElementSet values(executor.getValue()->getCanonicalQuery()->getCollator());
 
         BSONObj obj;
         PlanExecutor::ExecState state;
@@ -195,7 +186,7 @@ public:
             // available to us without this.  If a collection scan is providing the data, we may
             // have to expand an array.
             BSONElementSet elts;
-            obj.getFieldsDotted(key, elts);
+            dps::extractAllElementsAlongPath(obj, key, elts);
 
             for (BSONElementSet::iterator it = elts.begin(); it != elts.end(); ++it) {
                 BSONElement elt = *it;
@@ -228,14 +219,21 @@ public:
         }
 
 
+        auto curOp = CurOp::get(txn);
+
         // Get summary information about the plan.
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
             collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
         }
-        CurOp::get(txn)->debug().fromMultiPlanner = stats.fromMultiPlanner;
-        CurOp::get(txn)->debug().replanned = stats.replanned;
+        curOp->debug().setPlanSummaryMetrics(stats);
+
+        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(executor.getValue().get(), &execStatsBob);
+            curOp->debug().execStats = execStatsBob.obj();
+        }
 
         verify(start == bb.buf());
 

@@ -37,6 +37,7 @@
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
+#include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
@@ -54,8 +55,12 @@ typedef BSONElement be;
 typedef BSONObj bo;
 typedef BSONObjBuilder bob;
 
-/* l and r MUST have same type when called: check that first. */
-int compareElementValues(const BSONElement& l, const BSONElement& r);
+/** l and r MUST have same type when called: check that first.
+    If comparator is non-null, it is used for all comparisons between two strings.
+*/
+int compareElementValues(const BSONElement& l,
+                         const BSONElement& r,
+                         const StringData::ComparatorInterface* comparator = nullptr);
 
 /** BSONElement represents an "element" in a BSONObj.  So for the object { a : 3, b : "abc" },
     'a : 3' is the first element (key+value).
@@ -299,7 +304,9 @@ public:
 
     /** Return decimal128 value for this field. MUST be NumberDecimal type. */
     Decimal128 _numberDecimal() const {
-        return Decimal128(ConstDataView(value()).read<LittleEndian<Decimal128::Value>>());
+        uint64_t low = ConstDataView(value()).read<LittleEndian<long long>>();
+        uint64_t high = ConstDataView(value() + sizeof(long long)).read<LittleEndian<long long>>();
+        return Decimal128(Decimal128::Value({low, high}));
     }
 
     /** Return long long value for this field. MUST be NumberLong type. */
@@ -481,12 +488,29 @@ public:
         return !operator==(r);
     }
 
+    /**
+     * Compares the raw bytes of the two BSONElements, including the field names. This will treat
+     * different types (e.g. integers and doubles) as distinct values, even if they have the same
+     * field name and bit pattern in the value portion of the BSON element.
+     */
+    bool binaryEqual(const BSONElement& rhs) const;
+
+    /**
+     * Compares the raw bytes of the two BSONElements, excluding the field names. This will treat
+     * different types (e.g integers and doubles) as distinct values, even if they have the same bit
+     * pattern in the value portion of the BSON element.
+     */
+    bool binaryEqualValues(const BSONElement& rhs) const;
+
     /** Well ordered comparison.
         @return <0: l<r. 0:l==r. >0:l>r
         order by type, field name, and field value.
         If considerFieldName is true, pay attention to the field name.
+        If comparator is non-null, it is used for all comparisons between two strings.
     */
-    int woCompare(const BSONElement& e, bool considerFieldName = true) const;
+    int woCompare(const BSONElement& e,
+                  bool considerFieldName = true,
+                  const StringData::ComparatorInterface* comparator = nullptr) const;
 
     /**
      * Functor compatible with std::hash for std::unordered_{map,set}
@@ -666,9 +690,7 @@ inline bool BSONElement::isNumber() const {
     switch (type()) {
         case NumberLong:
         case NumberDouble:
-#ifdef MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT
         case NumberDecimal:
-#endif
         case NumberInt:
             return true;
         default:
@@ -703,7 +725,7 @@ inline Decimal128 BSONElement::numberDecimal() const {
         case NumberDecimal:
             return _numberDecimal();
         default:
-            return 0;
+            return Decimal128::kNormalizedZero;
     }
 }
 
@@ -794,7 +816,10 @@ inline long long BSONElement::safeNumberLong() const {
 }
 
 inline BSONElement::BSONElement() {
-    static const char kEooElement[] = "";
+    // This needs to be 2 elements because we check the strlen of data + 1 and GCC sees that as
+    // accessing beyond the end of a constant string, even though we always check whether the
+    // element is an eoo.
+    static const char kEooElement[2] = {'\0', '\0'};
     data = kEooElement;
     fieldNameSize_ = 0;
     totalSize = 1;

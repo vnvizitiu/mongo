@@ -95,6 +95,8 @@ const SpecificStats* EnsureSortedStage::getSpecificStats() const {
 }
 
 bool EnsureSortedStage::isInOrder(const BSONObj& lhsSortKey, const BSONObj& rhsSortKey) const {
+    // No need to compare with a collator, since the sort keys were extracted by the
+    // SortKeyGenerator, which has already mapped strings to their comparison keys.
     return lhsSortKey.woCompare(rhsSortKey, _pattern, /*considerFieldName*/ false) <= 0;
 }
 

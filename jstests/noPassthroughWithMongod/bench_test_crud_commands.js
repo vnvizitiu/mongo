@@ -7,9 +7,9 @@
     assert.commandWorked(coll.getDB().createCollection(coll.getName()));
 
     function makeDocument(docSize) {
-        var doc = { "fieldName":"" };
+        var doc = {"fieldName": ""};
         var longString = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        while(Object.bsonsize(doc) < docSize) {
+        while (Object.bsonsize(doc) < docSize) {
             if (Object.bsonsize(doc) < docSize - longString.length) {
                 doc.fieldName += longString;
             } else {
@@ -32,14 +32,16 @@
     function testInsert(docs, writeCmd, wc) {
         coll.drop();
 
-        var res = executeBenchRun([{ns: coll.getFullName(),
-                                    op: "insert",
-                                    doc: docs,
-                                    writeCmd: writeCmd,
-                                    writeConcern : wc}]);
+        var res = executeBenchRun([{
+            ns: coll.getFullName(),
+            op: "insert",
+            doc: docs,
+            writeCmd: writeCmd,
+            writeConcern: wc
+        }]);
 
         assert.gt(coll.count(), 0);
-        assert.eq(coll.findOne({}, {_id:0}), docs[0]);
+        assert.eq(coll.findOne({}, {_id: 0}), docs[0]);
     }
 
     function testFind(readCmd) {
@@ -48,11 +50,13 @@
             assert.writeOK(coll.insert({}));
         }
 
-        var res = executeBenchRun([{ns: coll.getFullName(),
-                                    op: "find",
-                                    query: {},
-                                    batchSize: NumberInt(10),
-                                    readCmd: readCmd}]);
+        var res = executeBenchRun([{
+            ns: coll.getFullName(),
+            op: "find",
+            query: {},
+            batchSize: NumberInt(10),
+            readCmd: readCmd
+        }]);
         assert.gt(res.query, 0, tojson(res));
     }
 
@@ -62,10 +66,8 @@
             assert.writeOK(coll.insert({}));
         }
 
-        var res = executeBenchRun([{ns: coll.getFullName(),
-                                    op: "findOne",
-                                    query: {},
-                                    readCmd: readCmd}]);
+        var res =
+            executeBenchRun([{ns: coll.getFullName(), op: "findOne", query: {}, readCmd: readCmd}]);
         assert.gt(res.findOne, 0, tojson(res));
     }
 
@@ -78,9 +80,9 @@
 
         testInsert([bigDoc], writeCmd, {});
         testInsert(docs, writeCmd, {});
-        testInsert(docs, writeCmd, {"writeConcern" : {"w" : "majority"}});
-        testInsert(docs, writeCmd, {"writeConcern" : {"w" : 1, "j": false}});
-        testInsert(docs, writeCmd, {"writeConcern" : {"j" : true}});
+        testInsert(docs, writeCmd, {"writeConcern": {"w": "majority"}});
+        testInsert(docs, writeCmd, {"writeConcern": {"w": 1, "j": false}});
+        testInsert(docs, writeCmd, {"writeConcern": {"j": true}});
     }
 
     testWriteConcern(false);

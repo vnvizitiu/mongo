@@ -5,8 +5,8 @@
  *
  * Runs an aggregation with a $match that returns half the documents.
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/agg_base.js'); // for $config
+load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
+load('jstests/concurrency/fsm_workloads/agg_base.js');    // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
 
@@ -17,13 +17,11 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.states.query = function query(db, collName) {
         // note that all threads output to the same collection
         var otherCollName = this.getOutCollName(collName);
-        var cursor = db[collName].aggregate([
-            { $match: { flag: true } },
-            { $out: otherCollName }
-        ]);
+        var cursor = db[collName].aggregate([{$match: {flag: true}}, {$out: otherCollName}]);
         assertAlways.eq(0, cursor.itcount(), 'cursor returned by $out should always be empty');
         // NOTE: This relies on the fast-path for .count() with no query being isolated.
-        // NOTE: There's a bug, SERVER-3645, where .count() is wrong on sharded collections, so we
+        // NOTE: There's a bug, SERVER-3645, where .count() is wrong on sharded collections, so
+        // we
         // blacklisted this test for sharded clusters.
         assertWhenOwnColl.eq(db[collName].count() / 2, db[otherCollName].count());
     };

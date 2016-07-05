@@ -38,12 +38,11 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -138,7 +137,7 @@ Status cloneCollectionAsCapped(OperationContext* txn,
     std::unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
         txn, fromNs, fromCollection, PlanExecutor::YIELD_MANUAL, InternalPlanner::FORWARD));
 
-    exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY);
+    exec->setYieldPolicy(PlanExecutor::WRITE_CONFLICT_RETRY_ONLY, fromCollection);
 
     Snapshotted<BSONObj> objToClone;
     RecordId loc;
@@ -183,7 +182,9 @@ Status cloneCollectionAsCapped(OperationContext* txn,
             }
 
             WriteUnitOfWork wunit(txn);
-            toCollection->insertDocument(txn, objToClone.value(), true, txn->writesAreReplicated());
+            OpDebug* const nullOpDebug = nullptr;
+            toCollection->insertDocument(
+                txn, objToClone.value(), nullOpDebug, true, txn->writesAreReplicated());
             wunit.commit();
 
             // Go to the next document

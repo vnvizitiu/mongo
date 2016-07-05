@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
@@ -210,7 +211,21 @@ public:
 
     // ---- modify single index
 
-    bool isMultikey(OperationContext* txn, const IndexDescriptor* idex);
+    /**
+     * Returns true if the index 'idx' is multikey, and returns false otherwise.
+     */
+    bool isMultikey(OperationContext* txn, const IndexDescriptor* idx);
+
+    /**
+     * Returns the path components that cause the index 'idx' to be multikey if the index supports
+     * path-level multikey tracking, and returns an empty vector if path-level multikey tracking
+     * isn't supported.
+     *
+     * If the index supports path-level multikey tracking but isn't multikey, then this function
+     * returns a vector with size equal to the number of elements in the index key pattern where
+     * each element in the vector is an empty set.
+     */
+    MultikeyPaths getMultikeyPaths(OperationContext* txn, const IndexDescriptor* idx);
 
     // --- these probably become private?
 
@@ -263,10 +278,25 @@ public:
 
     // ----- data modifiers ------
 
-    // this throws for now
-    Status indexRecords(OperationContext* txn, const std::vector<BsonRecord>& bsonRecords);
+    /**
+     * When 'keysInsertedOut' is not null, it will be set to the number of index keys inserted by
+     * this operation.
+     *
+     * This method may throw.
+     */
+    Status indexRecords(OperationContext* txn,
+                        const std::vector<BsonRecord>& bsonRecords,
+                        int64_t* keysInsertedOut);
 
-    void unindexRecord(OperationContext* txn, const BSONObj& obj, const RecordId& loc, bool noWarn);
+    /**
+     * When 'keysDeletedOut' is not null, it will be set to the number of index keys removed by
+     * this operation.
+     */
+    void unindexRecord(OperationContext* txn,
+                       const BSONObj& obj,
+                       const RecordId& loc,
+                       bool noWarn,
+                       int64_t* keysDeletedOut);
 
     // ------- temp internal -------
 
@@ -297,17 +327,20 @@ private:
 
     Status _indexFilteredRecords(OperationContext* txn,
                                  IndexCatalogEntry* index,
-                                 const std::vector<BsonRecord>& bsonRecords);
+                                 const std::vector<BsonRecord>& bsonRecords,
+                                 int64_t* keysInsertedOut);
 
     Status _indexRecords(OperationContext* txn,
                          IndexCatalogEntry* index,
-                         const std::vector<BsonRecord>& bsonRecords);
+                         const std::vector<BsonRecord>& bsonRecords,
+                         int64_t* keysInsertedOut);
 
     Status _unindexRecord(OperationContext* txn,
                           IndexCatalogEntry* index,
                           const BSONObj& obj,
                           const RecordId& loc,
-                          bool logIfError);
+                          bool logIfError,
+                          int64_t* keysDeletedOut);
 
     /**
      * this does no sanity checks
@@ -331,9 +364,11 @@ private:
     // conform to the standard for insertion.  This function adds the 'v' field if it didn't
     // exist, removes the '_id' field if it exists, applies plugin-level transformations if
     // appropriate, etc.
-    static BSONObj _fixIndexSpec(const BSONObj& spec);
+    static StatusWith<BSONObj> _fixIndexSpec(OperationContext* txn,
+                                             Collection* collection,
+                                             const BSONObj& spec);
 
-    Status _isSpecOk(const BSONObj& spec) const;
+    Status _isSpecOk(OperationContext* txn, const BSONObj& spec) const;
 
     Status _doesSpecConflictWithExisting(OperationContext* txn, const BSONObj& spec) const;
 

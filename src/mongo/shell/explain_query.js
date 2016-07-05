@@ -24,12 +24,12 @@ var DBExplainQuery = (function() {
         delete obj.stats;
 
         if (typeof(obj.length) === "number") {
-            for (var i=0; i < obj.length; i++) {
+            for (var i = 0; i < obj.length; i++) {
                 removeVerboseFields(obj[i]);
             }
         }
 
-        if (obj.shards){
+        if (obj.shards) {
             for (var key in obj.shards) {
                 removeVerboseFields(obj.shards[key]);
             }
@@ -75,7 +75,6 @@ var DBExplainQuery = (function() {
     }
 
     function constructor(query, verbosity) {
-
         //
         // Private vars.
         //
@@ -97,6 +96,7 @@ var DBExplainQuery = (function() {
         var delegationFuncNames = [
             "addOption",
             "batchSize",
+            "collation",
             "comment",
             "hint",
             "limit",
@@ -136,7 +136,7 @@ var DBExplainQuery = (function() {
 
             // Explain always gets pretty printed.
             this._query._prettyShell = true;
-            
+
             if (this._mongo.hasExplainCommand()) {
                 // The wire protocol version indicates that the server has the explain command.
                 // Convert this explain query into an explain command, and send the command to
@@ -145,8 +145,7 @@ var DBExplainQuery = (function() {
                 if (this._isCount) {
                     // True means to always apply the skip and limit values.
                     innerCmd = this._query._convertToCountCmd(this._applySkipLimit);
-                }
-                else {
+                } else {
                     var canAttachReadPref = false;
                     innerCmd = this._query._convertToCommand(canAttachReadPref);
                 }
@@ -171,8 +170,7 @@ var DBExplainQuery = (function() {
                 }
 
                 return Explainable.throwOrReturn(explainResult);
-            }
-            else {
+            } else {
                 return explainWithLegacyQueryOption(this);
             }
         };
@@ -227,6 +225,7 @@ var DBExplainQuery = (function() {
             print("\t.addOption(n)");
             print("\t.batchSize(n)");
             print("\t.comment(comment)");
+            print("\t.collation(collationSpec)");
             print("\t.count()");
             print("\t.hint(hintSpec)");
             print("\t.limit(n)");
@@ -240,7 +239,6 @@ var DBExplainQuery = (function() {
             print("\t.sort(sortSpec)");
             return __magicNoPrint;
         };
-
     }
 
     return constructor;

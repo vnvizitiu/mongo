@@ -9,22 +9,6 @@
 #include "wt_internal.h"
 
 /*
- * __wt_schema_create_strip --
- *	Discard any configuration information from a schema entry that is not
- * applicable to an session.create call, here for the wt dump command utility,
- * which only wants to dump the schema information needed for load.
- */
-int
-__wt_schema_create_strip(WT_SESSION_IMPL *session,
-    const char *v1, const char *v2, char **value_ret)
-{
-	const char *cfg[] =
-	    { WT_CONFIG_BASE(session, WT_SESSION_create), v1, v2, NULL };
-
-	return (__wt_config_collapse(session, cfg, value_ret));
-}
-
-/*
  * __wt_direct_io_size_check --
  *	Return a size from the configuration, complaining if it's insufficient
  * for direct I/O.
@@ -51,7 +35,7 @@ __wt_direct_io_size_check(WT_SESSION_IMPL *session,
 	 * units of its happy place.
 	 */
 	if (FLD_ISSET(conn->direct_io,
-	   WT_FILE_TYPE_CHECKPOINT | WT_FILE_TYPE_DATA)) {
+	   WT_DIRECT_IO_CHECKPOINT | WT_DIRECT_IO_DATA)) {
 		align = (int64_t)conn->buffer_alignment;
 		if (align != 0 && (cval.val < align || cval.val % align != 0))
 			WT_RET_MSG(session, EINVAL,
@@ -594,7 +578,7 @@ __create_table(WT_SESSION_IMPL *session,
 			WT_ERR(EEXIST);
 		exists = true;
 	}
-	WT_RET_NOTFOUND_OK(ret);
+	WT_ERR_NOTFOUND_OK(ret);
 
 	WT_ERR(__wt_config_gets(session, cfg, "colgroups", &cval));
 	WT_ERR(__wt_config_subinit(session, &conf, &cval));

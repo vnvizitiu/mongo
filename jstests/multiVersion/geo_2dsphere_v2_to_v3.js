@@ -3,12 +3,7 @@
 function generatePoint() {
     var longitude = Math.random() * 10 - 5;
     var latitude = Math.random() * 10 - 5;
-    var pt = {
-        geometry : {
-            type : "Point",
-            coordinates : [longitude, latitude]
-        }
-    };
+    var pt = {geometry: {type: "Point", coordinates: [longitude, latitude]}};
     return pt;
 }
 
@@ -28,17 +23,12 @@ function generatePolygons(amount) {
         var numpoints = 4 + Math.floor(Math.random() * 10);
         var dist = Math.random() * 5 + .01;
         var coordinates = [];
-        for (var j = 0; j < numpoints-1; j++) {
-            var angle = (j/numpoints) * 2 * Math.PI;
+        for (var j = 0; j < numpoints - 1; j++) {
+            var angle = (j / numpoints) * 2 * Math.PI;
             coordinates.push([dist * Math.cos(angle), dist * Math.sin(angle)]);
         }
         coordinates.push(coordinates[0]);
-        polygons.push({
-            geometry: {
-                type: "Polygon",
-                coordinates: [coordinates]
-            }
-        });
+        polygons.push({geometry: {type: "Polygon", coordinates: [coordinates]}});
     }
     return polygons;
 }
@@ -57,16 +47,7 @@ function get2dsphereIndexVersion(coll) {
     return -1;
 }
 
-var nearQuery = {
-    geometry: {
-        $near : {
-            $geometry : {
-                type: "Point",
-                coordinates: [0,0]
-            }
-        }
-    }
-};
+var nearQuery = {geometry: {$near: {$geometry: {type: "Point", coordinates: [0, 0]}}}};
 
 var mongod = MongoRunner.runMongod({binVersion: "3.0"});
 var coll = getCollection(mongod);

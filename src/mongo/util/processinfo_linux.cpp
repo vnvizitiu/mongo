@@ -29,24 +29,28 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include <malloc.h>
+#include "mongo/platform/basic.h"
+
+#include "processinfo.h"
+
 #include <iostream>
+#include <malloc.h>
 #include <sched.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 #ifdef __UCLIBC__
 #include <features.h>
 #else
 #include <gnu/libc-version.h>
 #endif
 
-#include "processinfo.h"
-#include "boost/filesystem.hpp"
+#include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
-#include <mongo/util/file.h>
+
+#include "mongo/util/file.h"
 #include "mongo/util/log.h"
 
 using namespace std;
@@ -451,7 +455,8 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
     struct mallinfo malloc_info =
         mallinfo();  // structure has same name as function that returns it. (see malloc.h)
     info.append("heap_usage_bytes",
-                malloc_info.uordblks /*main arena*/ + malloc_info.hblkhd /*mmap blocks*/);
+                static_cast<long long>(malloc_info.uordblks) /*main arena*/ +
+                    static_cast<long long>(malloc_info.hblkhd) /*mmap blocks*/);
     // docs claim hblkhd is included in uordblks but it isn't
 
     LinuxProc p(_pid);

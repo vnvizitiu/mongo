@@ -142,6 +142,8 @@ __logmgr_config(
 	}
 
 	WT_RET(__logmgr_sync_cfg(session, cfg));
+	if (conn->log_cond != NULL)
+		WT_RET(__wt_cond_auto_signal(session, conn->log_cond));
 	return (0);
 }
 
@@ -176,6 +178,7 @@ __log_archive_once(WT_SESSION_IMPL *session, uint32_t backup_file)
 	conn = S2C(session);
 	log = conn->log;
 	logcount = 0;
+	locked = false;
 	logfiles = NULL;
 
 	/*
@@ -196,14 +199,14 @@ __log_archive_once(WT_SESSION_IMPL *session, uint32_t backup_file)
 	 * Main archive code.  Get the list of all log files and
 	 * remove any earlier than the minimum log number.
 	 */
-	WT_RET(__wt_dirlist(session, conn->log_path,
-	    WT_LOG_FILENAME, WT_DIRLIST_INCLUDE, &logfiles, &logcount));
+	WT_ERR(__wt_fs_directory_list(
+	    session, conn->log_path, WT_LOG_FILENAME, &logfiles, &logcount));
 
 	/*
 	 * We can only archive files if a hot backup is not in progress or
 	 * if we are the backup.
 	 */
-	WT_RET(__wt_readlock(session, conn->hot_backup_lock));
+	WT_ERR(__wt_readlock(session, conn->hot_backup_lock));
 	locked = true;
 	if (!conn->hot_backup || backup_file != 0) {
 		for (i = 0; i < logcount; i++) {
@@ -216,9 +219,6 @@ __log_archive_once(WT_SESSION_IMPL *session, uint32_t backup_file)
 	}
 	WT_ERR(__wt_readunlock(session, conn->hot_backup_lock));
 	locked = false;
-	__wt_log_files_free(session, logfiles, logcount);
-	logfiles = NULL;
-	logcount = 0;
 
 	/*
 	 * Indicate what is our new earliest LSN.  It is the start
@@ -230,8 +230,7 @@ __log_archive_once(WT_SESSION_IMPL *session, uint32_t backup_file)
 err:		__wt_err(session, ret, "log archive server error");
 	if (locked)
 		WT_TRET(__wt_readunlock(session, conn->hot_backup_lock));
-	if (logfiles != NULL)
-		__wt_log_files_free(session, logfiles, logcount);
+	WT_TRET(__wt_fs_directory_list_free(session, &logfiles, logcount));
 	return (ret);
 }
 
@@ -257,11 +256,9 @@ __log_prealloc_once(WT_SESSION_IMPL *session)
 	 * Allocate up to the maximum number, accounting for any existing
 	 * files that may not have been used yet.
 	 */
-	WT_ERR(__wt_dirlist(session, conn->log_path,
-	    WT_LOG_PREPNAME, WT_DIRLIST_INCLUDE,
-	    &recfiles, &reccount));
-	__wt_log_files_free(session, recfiles, reccount);
-	recfiles = NULL;
+	WT_ERR(__wt_fs_directory_list(
+	    session, conn->log_path, WT_LOG_PREPNAME, &recfiles, &reccount));
+
 	/*
 	 * Adjust the number of files to pre-allocate if we find that
 	 * the critical path had to allocate them since we last ran.
@@ -291,8 +288,7 @@ __log_prealloc_once(WT_SESSION_IMPL *session)
 
 	if (0)
 err:		__wt_err(session, ret, "log pre-alloc server error");
-	if (recfiles != NULL)
-		__wt_log_files_free(session, recfiles, reccount);
+	WT_TRET(__wt_fs_directory_list_free(session, &recfiles, reccount));
 	return (ret);
 }
 
@@ -313,11 +309,14 @@ __wt_log_truncate_files(
 
 	WT_UNUSED(cfg);
 	conn = S2C(session);
-	log = conn->log;
+	if (!FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
+		return (0);
 	if (F_ISSET(conn, WT_CONN_SERVER_RUN) &&
 	    FLD_ISSET(conn->log_flags, WT_CONN_LOG_ARCHIVE))
 		WT_RET_MSG(session, EINVAL,
 		    "Attempt to archive manually while a server is running");
+
+	log = conn->log;
 
 	backup_file = 0;
 	if (cursor != NULL)
@@ -326,6 +325,7 @@ __wt_log_truncate_files(
 	WT_RET(__wt_verbose(session, WT_VERB_LOG,
 	    "log_truncate_files: Archive once up to %" PRIu32,
 	    backup_file));
+
 	WT_RET(__wt_writelock(session, log->log_archive_lock));
 	locked = true;
 	WT_ERR(__log_archive_once(session, backup_file));
@@ -397,7 +397,7 @@ __log_file_server(void *arg)
 				 * to move the sync_lsn into the next file for
 				 * later syncs.
 				 */
-				WT_ERR(__wt_fsync(session, close_fh));
+				WT_ERR(__wt_fsync(session, close_fh, true));
 				/*
 				 * We want to make sure the file size reflects
 				 * actual data and has minimal pre-allocated
@@ -449,7 +449,7 @@ __log_file_server(void *arg)
 				    log->bg_sync_lsn.l.file) ||
 				    (log->sync_lsn.l.file < min_lsn.l.file))
 					continue;
-				WT_ERR(__wt_fsync(session, log->log_fh));
+				WT_ERR(__wt_fsync(session, log->log_fh, true));
 				__wt_spin_lock(session, &log->log_sync_lock);
 				locked = true;
 				/*
@@ -468,7 +468,7 @@ __log_file_server(void *arg)
 				locked = false;
 				__wt_spin_unlock(session, &log->log_sync_lock);
 			} else {
-				WT_ERR(__wt_cond_signal(
+				WT_ERR(__wt_cond_auto_signal(
 				    session, conn->log_wrlsn_cond));
 				/*
 				 * We do not want to wait potentially a second
@@ -544,8 +544,6 @@ restart:
 	while (i < WT_SLOT_POOL) {
 		save_i = i;
 		slot = &log->slot_pool[i++];
-		WT_ASSERT(session, slot->slot_state != 0 ||
-		    slot->slot_release_lsn.l.file >= log->write_lsn.l.file);
 		if (slot->slot_state != WT_LOG_SLOT_WRITTEN)
 			continue;
 		written[written_i].slot_index = save_i;
@@ -667,31 +665,51 @@ __log_wrlsn_server(void *arg)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
+	WT_LOG *log;
+	WT_LSN prev;
 	WT_SESSION_IMPL *session;
 	int yield;
+	bool did_work;
 
 	session = arg;
 	conn = S2C(session);
+	log = conn->log;
 	yield = 0;
+	WT_INIT_LSN(&prev);
 	while (F_ISSET(conn, WT_CONN_LOG_SERVER_RUN)) {
 		/*
-		 * Write out any log record buffers.
+		 * Write out any log record buffers if anything was done
+		 * since last time.  Only call the function to walk the
+		 * slots if the system is not idle.  On an idle system
+		 * the alloc_lsn will not advance and the written lsn will
+		 * match the alloc_lsn.
 		 */
-		WT_ERR(__wt_log_wrlsn(session, &yield));
+		if (__wt_log_cmp(&prev, &log->alloc_lsn) != 0 ||
+		    __wt_log_cmp(&log->write_lsn, &log->alloc_lsn) != 0)
+			WT_ERR(__wt_log_wrlsn(session, &yield));
+		else
+			WT_STAT_FAST_CONN_INCR(session, log_write_lsn_skip);
+		prev = log->alloc_lsn;
+		did_work = yield == 0;
+
 		/*
 		 * If __wt_log_wrlsn did work we want to yield instead of sleep.
 		 */
 		if (yield++ < WT_THOUSAND)
 			__wt_yield();
 		else
-			WT_ERR(__wt_cond_wait(
-			    session, conn->log_wrlsn_cond, 10000));
+			/*
+			 * Send in false because if we did any work we would
+			 * not be on this path.
+			 */
+			WT_ERR(__wt_cond_auto_wait(
+			    session, conn->log_wrlsn_cond, did_work));
 	}
 	/*
 	 * On close we need to do this one more time because there could
 	 * be straggling log writes that need to be written.
 	 */
-	WT_ERR(__wt_log_force_write(session, 1));
+	WT_ERR(__wt_log_force_write(session, 1, NULL));
 	WT_ERR(__wt_log_wrlsn(session, NULL));
 	if (0) {
 err:		__wt_err(session, ret, "log wrlsn server error");
@@ -706,12 +724,13 @@ err:		__wt_err(session, ret, "log wrlsn server error");
 static WT_THREAD_RET
 __log_server(void *arg)
 {
+	struct timespec start, now;
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 	WT_LOG *log;
 	WT_SESSION_IMPL *session;
-	int freq_per_sec;
-	bool locked, signalled;
+	uint64_t timediff;
+	bool did_work, locked, signalled;
 
 	session = arg;
 	conn = S2C(session);
@@ -719,11 +738,10 @@ __log_server(void *arg)
 	locked = signalled = false;
 
 	/*
-	 * Set this to the number of times per second we want to force out the
-	 * log slot buffer.
+	 * Set this to the number of milliseconds we want to run archive and
+	 * pre-allocation.  Start it so that we run on the first time through.
 	 */
-#define	WT_FORCE_PER_SECOND	20
-	freq_per_sec = WT_FORCE_PER_SECOND;
+	timediff = WT_THOUSAND;
 
 	/*
 	 * The log server thread does a variety of work.  It forces out any
@@ -736,6 +754,7 @@ __log_server(void *arg)
 	 * don't want log records sitting in the buffer over the time it
 	 * takes to sync out an earlier file.
 	 */
+	did_work = true;
 	while (F_ISSET(conn, WT_CONN_LOG_SERVER_RUN)) {
 		/*
 		 * Slots depend on future activity.  Force out buffered
@@ -744,15 +763,14 @@ __log_server(void *arg)
 		 * and a buffer may need to wait for the write_lsn to advance
 		 * in the case of a synchronous buffer.  We end up with a hang.
 		 */
-		WT_ERR_BUSY_OK(__wt_log_force_write(session, 0));
+		WT_ERR_BUSY_OK(__wt_log_force_write(session, 0, &did_work));
 
 		/*
 		 * We don't want to archive or pre-allocate files as often as
 		 * we want to force out log buffers.  Only do it once per second
 		 * or if the condition was signalled.
 		 */
-		if (--freq_per_sec <= 0 || signalled) {
-			freq_per_sec = WT_FORCE_PER_SECOND;
+		if (timediff >= WT_THOUSAND || signalled) {
 
 			/*
 			 * Perform log pre-allocation.
@@ -793,8 +811,12 @@ __log_server(void *arg)
 		}
 
 		/* Wait until the next event. */
-		WT_ERR(__wt_cond_wait_signal(session, conn->log_cond,
-		    WT_MILLION / WT_FORCE_PER_SECOND, &signalled));
+
+		WT_ERR(__wt_epoch(session, &start));
+		WT_ERR(__wt_cond_auto_wait_signal(session, conn->log_cond,
+		    did_work, &signalled));
+		WT_ERR(__wt_epoch(session, &now));
+		timediff = WT_TIMEDIFF_MS(now, start);
 	}
 
 	if (0) {
@@ -839,9 +861,9 @@ __wt_logmgr_create(WT_SESSION_IMPL *session, const char *cfg[])
 	    "log write LSN"));
 	WT_RET(__wt_rwlock_alloc(session,
 	    &log->log_archive_lock, "log archive lock"));
-	if (FLD_ISSET(conn->direct_io, WT_FILE_TYPE_LOG))
-		log->allocsize =
-		    WT_MAX((uint32_t)conn->buffer_alignment, WT_LOG_ALIGN);
+	if (FLD_ISSET(conn->direct_io, WT_DIRECT_IO_LOG))
+		log->allocsize = (uint32_t)
+		    WT_MAX(conn->buffer_alignment, WT_LOG_ALIGN);
 	else
 		log->allocsize = WT_LOG_ALIGN;
 	WT_INIT_LSN(&log->alloc_lsn);
@@ -906,8 +928,9 @@ __wt_logmgr_open(WT_SESSION_IMPL *session)
 	 */
 	WT_RET(__wt_open_internal_session(conn, "log-wrlsn-server",
 	    false, session_flags, &conn->log_wrlsn_session));
-	WT_RET(__wt_cond_alloc(conn->log_wrlsn_session,
-	    "log write lsn server", false, &conn->log_wrlsn_cond));
+	WT_RET(__wt_cond_auto_alloc(conn->log_wrlsn_session,
+	    "log write lsn server", false, 10000, WT_MILLION,
+	    &conn->log_wrlsn_cond));
 	WT_RET(__wt_thread_create(conn->log_wrlsn_session,
 	    &conn->log_wrlsn_tid, __log_wrlsn_server, conn->log_wrlsn_session));
 	conn->log_wrlsn_tid_set = true;
@@ -921,13 +944,13 @@ __wt_logmgr_open(WT_SESSION_IMPL *session)
 	if (conn->log_session != NULL) {
 		WT_ASSERT(session, conn->log_cond != NULL);
 		WT_ASSERT(session, conn->log_tid_set == true);
-		WT_RET(__wt_cond_signal(session, conn->log_cond));
+		WT_RET(__wt_cond_auto_signal(session, conn->log_cond));
 	} else {
 		/* The log server gets its own session. */
 		WT_RET(__wt_open_internal_session(conn,
 		    "log-server", false, session_flags, &conn->log_session));
-		WT_RET(__wt_cond_alloc(conn->log_session,
-		    "log server", false, &conn->log_cond));
+		WT_RET(__wt_cond_auto_alloc(conn->log_session,
+		    "log server", false, 50000, WT_MILLION, &conn->log_cond));
 
 		/*
 		 * Start the thread.
@@ -963,7 +986,7 @@ __wt_logmgr_destroy(WT_SESSION_IMPL *session)
 		return (0);
 	}
 	if (conn->log_tid_set) {
-		WT_TRET(__wt_cond_signal(session, conn->log_cond));
+		WT_TRET(__wt_cond_auto_signal(session, conn->log_cond));
 		WT_TRET(__wt_thread_join(session, conn->log_tid));
 		conn->log_tid_set = false;
 	}
@@ -978,7 +1001,7 @@ __wt_logmgr_destroy(WT_SESSION_IMPL *session)
 		conn->log_file_session = NULL;
 	}
 	if (conn->log_wrlsn_tid_set) {
-		WT_TRET(__wt_cond_signal(session, conn->log_wrlsn_cond));
+		WT_TRET(__wt_cond_auto_signal(session, conn->log_wrlsn_cond));
 		WT_TRET(__wt_thread_join(session, conn->log_wrlsn_tid));
 		conn->log_wrlsn_tid_set = false;
 	}
@@ -999,9 +1022,9 @@ __wt_logmgr_destroy(WT_SESSION_IMPL *session)
 	}
 
 	/* Destroy the condition variables now that all threads are stopped */
-	WT_TRET(__wt_cond_destroy(session, &conn->log_cond));
+	WT_TRET(__wt_cond_auto_destroy(session, &conn->log_cond));
 	WT_TRET(__wt_cond_destroy(session, &conn->log_file_cond));
-	WT_TRET(__wt_cond_destroy(session, &conn->log_wrlsn_cond));
+	WT_TRET(__wt_cond_auto_destroy(session, &conn->log_wrlsn_cond));
 
 	WT_TRET(__wt_cond_destroy(session, &conn->log->log_sync_cond));
 	WT_TRET(__wt_cond_destroy(session, &conn->log->log_write_cond));

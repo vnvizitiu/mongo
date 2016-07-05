@@ -14,15 +14,15 @@
     var replTest = new ReplSetTest({name: name, nodes: 3});
     var nodes = replTest.nodeList();
     var conns = replTest.startSet();
-    replTest.initiate({"_id": name,
-                       "members": [
-                           { "_id": 0, "host": nodes[0] },
-                           { "_id": 1, "host": nodes[1], arbiterOnly: true },
-                           { "_id": 2, "host": nodes[2], priority: 0 }],
-                       "settings": {
-                           "chainingAllowed": false
-                       }
-                      });
+    replTest.initiate({
+        "_id": name,
+        "members": [
+            {"_id": 0, "host": nodes[0]},
+            {"_id": 1, "host": nodes[1], arbiterOnly: true},
+            {"_id": 2, "host": nodes[2], priority: 0}
+        ],
+        "settings": {"chainingAllowed": false}
+    });
     var c_conn = conns[2];
     var CID = replTest.getNodeId(c_conn);
 
@@ -56,6 +56,6 @@
         }
     }, "node C failed to fassert", 60 * 1000);
 
-    replTest.stopSet(undefined, undefined, { allowedExitCodes: [ MongoRunner.EXIT_ABRUPT ] });
+    replTest.stopSet(undefined, undefined, {allowedExitCodes: [MongoRunner.EXIT_ABRUPT]});
 
 }());

@@ -29,7 +29,7 @@ __lsm_copy_chunks(WT_SESSION_IMPL *session,
 	cookie->nchunks = 0;
 
 	WT_RET(__wt_lsm_tree_readlock(session, lsm_tree));
-	if (!F_ISSET(lsm_tree, WT_LSM_TREE_ACTIVE))
+	if (!lsm_tree->active)
 		return (__wt_lsm_tree_readunlock(session, lsm_tree));
 
 	/* Take a copy of the current state of the LSM tree. */
@@ -72,14 +72,14 @@ __wt_lsm_get_chunk_to_flush(WT_SESSION_IMPL *session,
 {
 	WT_DECL_RET;
 	WT_LSM_CHUNK *chunk, *evict_chunk, *flush_chunk;
-	u_int i;
+	uint32_t i;
 
 	*chunkp = NULL;
 	chunk = evict_chunk = flush_chunk = NULL;
 
 	WT_ASSERT(session, lsm_tree->queue_ref > 0);
 	WT_RET(__wt_lsm_tree_readlock(session, lsm_tree));
-	if (!F_ISSET(lsm_tree, WT_LSM_TREE_ACTIVE) || lsm_tree->nchunks == 0)
+	if (!lsm_tree->active || lsm_tree->nchunks == 0)
 		return (__wt_lsm_tree_readunlock(session, lsm_tree));
 
 	/* Search for a chunk to evict and/or a chunk to flush. */
@@ -118,7 +118,7 @@ __wt_lsm_get_chunk_to_flush(WT_SESSION_IMPL *session,
 
 	if (chunk != NULL) {
 		WT_ERR(__wt_verbose(session, WT_VERB_LSM,
-		    "Flush%s: return chunk %u of %u: %s",
+		    "Flush%s: return chunk %" PRIu32 " of %" PRIu32 ": %s",
 		    force ? " w/ force" : "",
 		    i, lsm_tree->nchunks, chunk->uri));
 
@@ -289,7 +289,8 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	}
 
 	/* Stop if a running transaction needs the chunk. */
-	__wt_txn_update_oldest(session, true);
+	WT_RET(__wt_txn_update_oldest(
+	    session, WT_TXN_OLDEST_STRICT | WT_TXN_OLDEST_WAIT));
 	if (chunk->switch_txn == WT_TXN_NONE ||
 	    !__wt_txn_visible_all(session, chunk->switch_txn)) {
 		WT_RET(__wt_verbose(session, WT_VERB_LSM,
@@ -322,7 +323,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 		 */
 		saved_isolation = session->txn.isolation;
 		session->txn.isolation = WT_ISO_READ_UNCOMMITTED;
-		ret = __wt_cache_op(session, NULL, WT_SYNC_WRITE_LEAVES);
+		ret = __wt_cache_op(session, WT_SYNC_WRITE_LEAVES);
 		session->txn.isolation = saved_isolation;
 		WT_TRET(__wt_session_release_btree(session));
 	}
@@ -525,7 +526,7 @@ __lsm_drop_file(WT_SESSION_IMPL *session, const char *uri)
 	    ret = __wt_schema_drop(session, uri, drop_cfg));
 
 	if (ret == 0)
-		ret = __wt_remove(session, uri + strlen("file:"));
+		ret = __wt_fs_remove(session, uri + strlen("file:"));
 	WT_RET(__wt_verbose(session, WT_VERB_LSM, "Dropped %s", uri));
 
 	if (ret == EBUSY || ret == ENOENT)

@@ -200,16 +200,80 @@ boost::optional<Document> DocumentSourceUnwind::getNext() {
     return out;
 }
 
+BSONObjSet DocumentSourceUnwind::getOutputSorts() {
+    BSONObjSet out;
+    std::string unwoundPath = getUnwindPath();
+    BSONObjSet inputSort = pSource->getOutputSorts();
+
+    for (auto&& sortObj : inputSort) {
+        // Truncate each sortObj at the unwindPath.
+        BSONObjBuilder outputSort;
+
+        for (BSONElement fieldSort : sortObj) {
+            if (fieldSort.fieldNameStringData() == unwoundPath) {
+                break;
+            }
+            outputSort.append(fieldSort);
+        }
+
+        BSONObj outSortObj = outputSort.obj();
+        if (!outSortObj.isEmpty()) {
+            out.insert(outSortObj);
+        }
+    }
+
+    return out;
+}
+
+Pipeline::SourceContainer::iterator DocumentSourceUnwind::optimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
+
+    if (auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get())) {
+        std::set<std::string> fields = {_unwindPath.fullPath()};
+
+        if (_indexPath) {
+            fields.insert((*_indexPath).fullPath());
+        }
+
+        auto splitMatch = nextMatch->splitSourceBy(fields);
+
+        invariant(splitMatch.first || splitMatch.second);
+
+        if (!splitMatch.first && splitMatch.second) {
+            // No optimization was possible.
+            return std::next(itr);
+        }
+
+        container->erase(std::next(itr));
+
+        // If splitMatch.second is not null, then there is a new $match stage to insert after
+        // ourselves.
+        if (splitMatch.second) {
+            container->insert(std::next(itr), std::move(splitMatch.second));
+        }
+
+        if (splitMatch.first) {
+            container->insert(itr, std::move(splitMatch.first));
+            if (std::prev(itr) == container->begin()) {
+                return std::prev(itr);
+            }
+            return std::prev(std::prev(itr));
+        }
+    }
+    return std::next(itr);
+}
+
 Value DocumentSourceUnwind::serialize(bool explain) const {
     return Value(DOC(getSourceName() << DOC(
-                         "path" << _unwindPath.getPath(true) << "preserveNullAndEmptyArrays"
+                         "path" << _unwindPath.fullPathWithPrefix() << "preserveNullAndEmptyArrays"
                                 << (_preserveNullAndEmptyArrays ? Value(true) : Value())
                                 << "includeArrayIndex"
-                                << (_indexPath ? Value((*_indexPath).getPath(false)) : Value()))));
+                                << (_indexPath ? Value((*_indexPath).fullPath()) : Value()))));
 }
 
 DocumentSource::GetDepsReturn DocumentSourceUnwind::getDependencies(DepsTracker* deps) const {
-    deps->fields.insert(_unwindPath.getPath(false));
+    deps->fields.insert(_unwindPath.fullPath());
     return SEE_NEXT;
 }
 
@@ -244,7 +308,8 @@ intrusive_ptr<DocumentSource> DocumentSourceUnwind::createFromBson(
                 indexPath = subElem.String();
                 uassert(28822,
                         str::stream() << "includeArrayIndex option to $unwind stage should not be "
-                                         "prefixed with a '$': " << (*indexPath),
+                                         "prefixed with a '$': "
+                                      << (*indexPath),
                         (*indexPath)[0] != '$');
             } else {
                 uasserted(28811,

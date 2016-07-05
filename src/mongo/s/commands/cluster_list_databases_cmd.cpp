@@ -35,7 +35,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -65,7 +65,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -99,12 +100,14 @@ public:
                 continue;
             }
 
-            BSONObj x = uassertStatusOK(grid.shardRegistry()->runCommandOnShard(
-                txn,
-                s,
-                ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
-                "admin",
-                BSON("listDatabases" << 1)));
+            auto response = uassertStatusOK(
+                s->runCommand(txn,
+                              ReadPreferenceSetting{ReadPreference::PrimaryPreferred},
+                              "admin",
+                              BSON("listDatabases" << 1),
+                              Shard::RetryPolicy::kIdempotent));
+            uassertStatusOK(response.commandStatus);
+            BSONObj x = std::move(response.response);
 
             BSONObjIterator j(x["databases"].Obj());
             while (j.more()) {
@@ -127,7 +130,7 @@ public:
                     bb.reset(new BSONObjBuilder());
                 }
 
-                bb->appendNumber(s->getId(), size);
+                bb->appendNumber(s->getId().toString(), size);
             }
         }
 
@@ -160,8 +163,8 @@ public:
         }
 
         // Get information for config and admin dbs from the config servers.
-        auto catalogManager = grid.catalogManager(txn);
-        auto appendStatus = catalogManager->appendInfoForConfigServerDatabases(txn, &dbListBuilder);
+        auto catalogClient = grid.catalogClient(txn);
+        auto appendStatus = catalogClient->appendInfoForConfigServerDatabases(txn, &dbListBuilder);
         if (!appendStatus.isOK()) {
             return Command::appendCommandStatus(result, appendStatus);
         }

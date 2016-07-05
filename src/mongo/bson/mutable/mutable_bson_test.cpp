@@ -32,9 +32,10 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/bson/mutable/damage_vector.h"
+#include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/json.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/unittest/unittest.h"
 
@@ -563,10 +564,8 @@ TEST(Element, setters) {
     t0.setValueDouble(123.45);
     ASSERT_EQUALS(mongo::NumberDouble, t0.getType());
 
-    if (mongo::Decimal128::enabled) {
-        t0.setValueDecimal(mongo::Decimal128("123.45E1234"));
-        ASSERT_EQUALS(mongo::NumberDecimal, t0.getType());
-    }
+    t0.setValueDecimal(mongo::Decimal128("123.45E1234"));
+    ASSERT_EQUALS(mongo::NumberDecimal, t0.getType());
 
     t0.setValueOID(mongo::OID("47cc67093475061e3d95369d"));
     ASSERT_EQUALS(mongo::jstOID, t0.getType());
@@ -613,40 +612,34 @@ TEST(Element, toString) {
 }
 
 TEST(DecimalType, createElement) {
-    if (mongo::Decimal128::enabled) {
-        mmb::Document doc;
+    mmb::Document doc;
 
-        mmb::Element d0 = doc.makeElementDecimal("d0", mongo::Decimal128("12345"));
-        ASSERT_TRUE(mongo::Decimal128("12345").isEqual(d0.getValueDecimal()));
-    }
+    mmb::Element d0 = doc.makeElementDecimal("d0", mongo::Decimal128("12345"));
+    ASSERT_TRUE(mongo::Decimal128("12345").isEqual(d0.getValueDecimal()));
 }
 
 TEST(DecimalType, setElement) {
-    if (mongo::Decimal128::enabled) {
-        mmb::Document doc;
+    mmb::Document doc;
 
-        mmb::Element d0 = doc.makeElementDecimal("d0", mongo::Decimal128("128"));
-        d0.setValueDecimal(mongo::Decimal128("123456"));
-        ASSERT_TRUE(mongo::Decimal128("123456").isEqual(d0.getValueDecimal()));
+    mmb::Element d0 = doc.makeElementDecimal("d0", mongo::Decimal128("128"));
+    d0.setValueDecimal(mongo::Decimal128("123456"));
+    ASSERT_TRUE(mongo::Decimal128("123456").isEqual(d0.getValueDecimal()));
 
-        d0.setValueDouble(0.1);
-        ASSERT_EQUALS(0.1, d0.getValueDouble());
-        d0.setValueDecimal(mongo::Decimal128("23"));
-        ASSERT_TRUE(mongo::Decimal128("23").isEqual(d0.getValueDecimal()));
-    }
+    d0.setValueDouble(0.1);
+    ASSERT_EQUALS(0.1, d0.getValueDouble());
+    d0.setValueDecimal(mongo::Decimal128("23"));
+    ASSERT_TRUE(mongo::Decimal128("23").isEqual(d0.getValueDecimal()));
 }
 
 TEST(DecimalType, appendElement) {
-    if (mongo::Decimal128::enabled) {
-        mmb::Document doc;
+    mmb::Document doc;
 
-        mmb::Element d0 = doc.makeElementObject("e0");
-        d0.appendDecimal("precision", mongo::Decimal128(34));
+    mmb::Element d0 = doc.makeElementObject("e0");
+    d0.appendDecimal("precision", mongo::Decimal128(34));
 
-        mmb::Element it = mmb::findFirstChildNamed(d0, "precision");
-        ASSERT_TRUE(it.ok());
-        ASSERT_TRUE(mongo::Decimal128(34).isEqual(it.getValueDecimal()));
-    }
+    mmb::Element it = mmb::findFirstChildNamed(d0, "precision");
+    ASSERT_TRUE(it.ok());
+    ASSERT_TRUE(mongo::Decimal128(34).isEqual(it.getValueDecimal()));
 }
 
 TEST(TimestampType, createElement) {
@@ -715,12 +708,10 @@ TEST(SafeNumType, getSafeNum) {
     num = t0.getValueSafeNum();
     ASSERT_EQUALS(num, 123.456789);
 
-    if (mongo::Decimal128::enabled) {
-        t0.setValueDecimal(mongo::Decimal128("12345678.1234"));
-        ASSERT_TRUE(mongo::Decimal128("12345678.1234").isEqual(t0.getValueDecimal()));
-        num = t0.getValueSafeNum();
-        ASSERT_EQUALS(num, mongo::Decimal128("12345678.1234"));
-    }
+    t0.setValueDecimal(mongo::Decimal128("12345678.1234"));
+    ASSERT_TRUE(mongo::Decimal128("12345678.1234").isEqual(t0.getValueDecimal()));
+    num = t0.getValueSafeNum();
+    ASSERT_EQUALS(num, mongo::Decimal128("12345678.1234"));
 }
 
 TEST(SafeNumType, setSafeNum) {
@@ -813,11 +804,7 @@ static const char jsonSampleWithDecimal[] =
 
 TEST(Serialization, RoundTrip) {
     mongo::BSONObj obj;
-    if (mongo::Decimal128::enabled) {
-        obj = mongo::fromjson(jsonSampleWithDecimal);
-    } else {
-        obj = mongo::fromjson(jsonSample);
-    }
+    obj = mongo::fromjson(jsonSampleWithDecimal);
     mmb::Document doc(obj.copy());
     mongo::BSONObj built = doc.getObject();
     ASSERT_EQUALS(obj, built);
@@ -1386,10 +1373,8 @@ TEST(Element, IsNumeric) {
     elt = doc.makeElementDouble("dummy", 42.0);
     ASSERT_TRUE(elt.isNumeric());
 
-    if (mongo::Decimal128::enabled) {
-        elt = doc.makeElementDecimal("dummy", mongo::Decimal128(20));
-        ASSERT_TRUE(elt.isNumeric());
-    }
+    elt = doc.makeElementDecimal("dummy", mongo::Decimal128(20));
+    ASSERT_TRUE(elt.isNumeric());
 }
 
 TEST(Element, IsIntegral) {
@@ -1410,10 +1395,8 @@ TEST(Element, IsIntegral) {
     elt = doc.makeElementDouble("dummy", 42.0);
     ASSERT_FALSE(elt.isIntegral());
 
-    if (mongo::Decimal128::enabled) {
-        elt = doc.makeElementDecimal("dummy", mongo::Decimal128(20));
-        ASSERT_FALSE(elt.isIntegral());
-    }
+    elt = doc.makeElementDecimal("dummy", mongo::Decimal128(20));
+    ASSERT_FALSE(elt.isIntegral());
 }
 
 TEST(Document, ArraySerialization) {
@@ -2575,45 +2558,43 @@ TEST(TypeSupport, EncodingEquivalenceLong) {
 }
 
 TEST(TypeSupport, EncodingEquivalenceDecimal) {
-    if (mongo::Decimal128::enabled) {
-        mongo::BSONObjBuilder builder;
-        const char name[] = "thing";
-        const mongo::Decimal128 value1 = mongo::Decimal128(2);
-        builder.append(name, value1);
-        mongo::BSONObj source = builder.done();
-        const mongo::BSONElement thing = source.firstElement();
-        ASSERT_TRUE(thing.type() == mongo::NumberDecimal);
+    mongo::BSONObjBuilder builder;
+    const char name[] = "thing";
+    const mongo::Decimal128 value1 = mongo::Decimal128(2);
+    builder.append(name, value1);
+    mongo::BSONObj source = builder.done();
+    const mongo::BSONElement thing = source.firstElement();
+    ASSERT_TRUE(thing.type() == mongo::NumberDecimal);
 
-        mmb::Document doc;
+    mmb::Document doc;
 
-        // Construct via direct call to append/make
-        ASSERT_OK(doc.root().appendDecimal(name, value1));
-        mmb::Element a = doc.root().rightChild();
-        ASSERT_TRUE(a.ok());
-        ASSERT_EQUALS(a.getType(), mongo::NumberDecimal);
-        ASSERT_TRUE(a.hasValue());
-        ASSERT_TRUE(value1.isEqual(mmb::ConstElement(a).getValueDecimal()));
+    // Construct via direct call to append/make
+    ASSERT_OK(doc.root().appendDecimal(name, value1));
+    mmb::Element a = doc.root().rightChild();
+    ASSERT_TRUE(a.ok());
+    ASSERT_EQUALS(a.getType(), mongo::NumberDecimal);
+    ASSERT_TRUE(a.hasValue());
+    ASSERT_TRUE(value1.isEqual(mmb::ConstElement(a).getValueDecimal()));
 
-        // Construct via call passong BSON element
-        ASSERT_OK(doc.root().appendElement(thing));
-        mmb::Element b = doc.root().rightChild();
-        ASSERT_TRUE(b.ok());
-        ASSERT_EQUALS(b.getType(), mongo::NumberDecimal);
-        ASSERT_TRUE(b.hasValue());
+    // Construct via call passong BSON element
+    ASSERT_OK(doc.root().appendElement(thing));
+    mmb::Element b = doc.root().rightChild();
+    ASSERT_TRUE(b.ok());
+    ASSERT_EQUALS(b.getType(), mongo::NumberDecimal);
+    ASSERT_TRUE(b.hasValue());
 
-        // Construct via setValue call
-        ASSERT_OK(doc.root().appendNull(name));
-        mmb::Element c = doc.root().rightChild();
-        ASSERT_TRUE(c.ok());
-        c.setValueDecimal(value1);
-        ASSERT_EQUALS(c.getType(), mongo::NumberDecimal);
-        ASSERT_TRUE(c.hasValue());
+    // Construct via setValue call
+    ASSERT_OK(doc.root().appendNull(name));
+    mmb::Element c = doc.root().rightChild();
+    ASSERT_TRUE(c.ok());
+    c.setValueDecimal(value1);
+    ASSERT_EQUALS(c.getType(), mongo::NumberDecimal);
+    ASSERT_TRUE(c.hasValue());
 
-        // Ensure identity:
-        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
-        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
-        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
-    }
+    // Ensure identity:
+    ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+    ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+    ASSERT_TRUE(identical(b.getValue(), c.getValue()));
 }
 
 TEST(TypeSupport, EncodingEquivalenceMinKey) {
@@ -3140,34 +3121,32 @@ TEST(DocumentInPlace, NumberDoubleLifecycle) {
 }
 
 TEST(DocumentInPlace, NumberDecimalLifecycle) {
-    if (mongo::Decimal128::enabled) {
-        const mongo::Decimal128 value1 = mongo::Decimal128(32);
-        const mongo::Decimal128 value2 = mongo::Decimal128(2);
+    const mongo::Decimal128 value1 = mongo::Decimal128(32);
+    const mongo::Decimal128 value2 = mongo::Decimal128(2);
 
-        mongo::BSONObj obj(BSON("x" << value1));
-        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+    mongo::BSONObj obj(BSON("x" << value1));
+    mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
 
-        mmb::Element x = doc.root().leftChild();
+    mmb::Element x = doc.root().leftChild();
 
-        mmb::DamageVector damages;
-        const char* source = NULL;
+    mmb::DamageVector damages;
+    const char* source = NULL;
 
-        x.setValueDecimal(value2);
-        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
-        ASSERT_EQUALS(1U, damages.size());
-        apply(&obj, damages, source);
-        ASSERT_TRUE(x.hasValue());
-        ASSERT_TRUE(x.isType(mongo::NumberDecimal));
-        ASSERT_TRUE(value2.isEqual(x.getValueDecimal()));
+    x.setValueDecimal(value2);
+    ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+    ASSERT_EQUALS(1U, damages.size());
+    apply(&obj, damages, source);
+    ASSERT_TRUE(x.hasValue());
+    ASSERT_TRUE(x.isType(mongo::NumberDecimal));
+    ASSERT_TRUE(value2.isEqual(x.getValueDecimal()));
 
-        // TODO: Re-enable when in-place updates to leaf elements is supported
-        // x.setValueDecimal(value1);
-        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
-        // apply(&obj, damages, source);
-        // ASSERT_TRUE(x.hasValue());
-        // ASSERT_TRUE(x.isType(mongo::NumberDecimal));
-        // ASSERT_TRUE(value1.isEqual(x.getValueDecimal()));
-    }
+    // TODO: Re-enable when in-place updates to leaf elements is supported
+    // x.setValueDecimal(value1);
+    // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+    // apply(&obj, damages, source);
+    // ASSERT_TRUE(x.hasValue());
+    // ASSERT_TRUE(x.isType(mongo::NumberDecimal));
+    // ASSERT_TRUE(value1.isEqual(x.getValueDecimal()));
 }
 
 // Doubles and longs are the same size, 8 bytes, so we should be able to do in-place
@@ -3252,6 +3231,106 @@ TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
     // Ensure that the two deserialized documents compare with each other correctly.
     ASSERT_EQUALS(0, doc1.compareWith(doc2));
     ASSERT_EQUALS(0, doc2.compareWith(doc1));
+}
+
+TEST(DocumentComparison, DocumentCompareWithRespectsCollation) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{a: 'foo'}"));
+    const mmb::Document doc2(mongo::fromjson("{a: 'bar'}"));
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, doc1.compareWith(doc2, true));
+    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+}
+
+TEST(DocumentComparison, DocumentCompareWithBSONObjRespectsCollation) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{a: 'foo'}"));
+    const mongo::BSONObj doc2 = mongo::fromjson("{a: 'bar'}");
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, doc1.compareWithBSONObj(doc2, true));
+    ASSERT_EQ(0, doc1.compareWithBSONObj(doc2, true, &collator));
+}
+
+TEST(DocumentComparison, ElementCompareWithElementRespectsCollator) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{a: 'foo'}"));
+    const mmb::Document doc2(mongo::fromjson("{a: 'bar'}"));
+    const mmb::ConstElement element1 = doc1.root().leftChild();
+    const mmb::ConstElement element2 = doc2.root().leftChild();
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, element1.compareWithElement(element2, true));
+    ASSERT_EQ(0, element1.compareWithElement(element2, true, &collator));
+}
+
+TEST(DocumentComparison, ElementCompareWithBSONElementRespectsCollator) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{a: 'foo'}"));
+    const mongo::BSONObj doc2 = mongo::fromjson("{a: 'bar'}");
+    const mmb::ConstElement element1 = doc1.root().leftChild();
+    const mongo::BSONElement element2 = doc2["a"];
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, element1.compareWithBSONElement(element2, true));
+    ASSERT_EQ(0, element1.compareWithBSONElement(element2, true, &collator));
+}
+
+TEST(DocumentComparison, ElementCompareWithBSONObjRespectsCollator) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{b: {c: 'foo'}}"));
+    const mongo::BSONObj doc2 = mongo::fromjson("{c: 'bar'}");
+    const mmb::ConstElement element1 = doc1.root().leftChild();
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, element1.compareWithBSONObj(doc2, true));
+    ASSERT_EQ(0, element1.compareWithBSONObj(doc2, true, &collator));
+}
+
+TEST(DocumentComparison, DocumentCompareWithRespectsCollationRecursively) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    const mmb::Document doc1(mongo::fromjson("{a: [{b: 'foo'}, {b: 'bar'}]}"));
+    const mmb::Document doc2(mongo::fromjson("{a: [{b: 'notFoo'}, {b: 'notBar'}]}"));
+    // Pass true to indicate that we should compare field names. The two documents should be unequal
+    // without the collator, but equal when using the "always equal" collator.
+    ASSERT_NE(0, doc1.compareWith(doc2, true));
+    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+}
+
+TEST(DocumentComparison, DocumentCompareWithRespectsCollationWithDeserializedElement) {
+    mongo::CollatorInterfaceMock collator(mongo::CollatorInterfaceMock::MockType::kAlwaysEqual);
+    mmb::Document doc1(mongo::fromjson("{a: ['foo', 'foo']}"));
+    mmb::Document doc2(mongo::fromjson("{a: ['bar', 'bar']}"));
+
+    // With the always equal collator, the documents should start out comparing equal.
+    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+    ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+
+    // They should still be equal after causing deserialization of one of the leaf elements of
+    // 'doc1'.
+    {
+        mmb::Element elementA = doc1.root()["a"];
+        ASSERT_TRUE(elementA.ok());
+        mmb::Element elementA0 = elementA[0];
+        ASSERT_TRUE(elementA0.ok());
+        ASSERT_OK(elementA0.remove());
+        ASSERT_OK(elementA.pushBack(elementA0));
+        ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+        ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+    }
+
+    // And they should remain equal after doing the same to 'doc2'.
+    {
+        mmb::Element elementA = doc2.root()["a"];
+        ASSERT_TRUE(elementA.ok());
+        mmb::Element elementA0 = elementA[0];
+        ASSERT_TRUE(elementA0.ok());
+        ASSERT_OK(elementA0.remove());
+        ASSERT_OK(elementA.pushBack(elementA0));
+        ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+        ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+    }
 }
 
 TEST(UnorderedEqualityChecker, Identical) {

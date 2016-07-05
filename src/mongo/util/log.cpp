@@ -40,8 +40,8 @@
 #include "mongo/logger/ramlog.h"
 #include "mongo/logger/rotatable_file_manager.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
@@ -119,11 +119,12 @@ string errnoWithDescription(int errNumber) {
             size = utf8ErrorText.length();
         }
 
-        if (size > kBuflen) {
-            size = kBuflen;
+        if (size >= kBuflen) {
+            size = kBuflen - 1;
         }
 
         memcpy(buf, utf8ErrorText.c_str(), size);
+        buf[size] = '\0';
         msg = buf;
         LocalFree(errorText);
     } else if (strerror_s(buf, kBuflen, errNumber) != 0) {

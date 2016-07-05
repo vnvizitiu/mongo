@@ -34,8 +34,8 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 
 namespace mongo {
@@ -57,7 +57,8 @@ public:
                                StringData name,
                                StringData path,
                                bool directoryperdb,
-                               bool transient);
+                               bool transient,
+                               std::unique_ptr<ExtentManager> extentManager);
 
     virtual ~MMAPV1DatabaseCatalogEntry();
 
@@ -81,7 +82,11 @@ public:
     virtual bool isOlderThan24(OperationContext* opCtx) const;
     virtual void markIndexSafe24AndUp(OperationContext* opCtx);
 
-    virtual bool currentFilesCompatible(OperationContext* opCtx) const;
+    // Records in the data file version bits that an index or collection may have an associated
+    // collation.
+    void markCollationFeatureAsInUse(OperationContext* opCtx);
+
+    virtual Status currentFilesCompatible(OperationContext* opCtx) const;
 
     virtual void appendExtraStats(OperationContext* opCtx, BSONObjBuilder* out, double scale) const;
 
@@ -110,11 +115,11 @@ public:
                                 const CollectionCatalogEntry* collection,
                                 IndexCatalogEntry* index);
 
-    const MmapV1ExtentManager* getExtentManager() const {
-        return &_extentManager;
+    const ExtentManager* getExtentManager() const {
+        return _extentManager.get();
     }
-    MmapV1ExtentManager* getExtentManager() {
-        return &_extentManager;
+    ExtentManager* getExtentManager() {
+        return _extentManager.get();
     }
 
     CollectionOptions getCollectionOptions(OperationContext* txn, StringData ns) const;
@@ -186,7 +191,7 @@ private:
     const std::string _path;
 
     NamespaceIndex _namespaceIndex;
-    MmapV1ExtentManager _extentManager;
+    std::unique_ptr<ExtentManager> _extentManager;
     CollectionMap _collections;
 };
 }

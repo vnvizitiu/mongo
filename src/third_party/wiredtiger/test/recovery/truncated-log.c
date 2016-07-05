@@ -26,22 +26,14 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "test_util.h"
+
 #include <sys/wait.h>
-#include <errno.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#ifndef _WIN32
-#include <unistd.h>
-#else
+
+#ifdef _WIN32
 /* snprintf is not supported on <= VS2013 */
 #define	snprintf _snprintf
 #endif
-
-#include <wiredtiger.h>
-
-#include "test_util.i"
 
 static char home[512];			/* Program working dir */
 static const char *progname;		/* Program name */
@@ -58,6 +50,8 @@ static const char * const uri = "table:main";
 #define	K_SIZE	16
 #define	V_SIZE	256
 
+static void usage(void)
+    WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static void
 usage(void)
 {
@@ -69,6 +63,7 @@ usage(void)
  * Child process creates the database and table, and then writes data into
  * the table until it is killed by the parent.
  */
+static void fill_db(void)WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static void
 fill_db(void)
 {
@@ -107,7 +102,7 @@ fill_db(void)
 	/*
 	 * Set to no buffering.
 	 */
-	(void)setvbuf(fp, NULL, _IONBF, 0);
+	__wt_stream_set_no_buffer(fp);
 	save_lsn.l.file = 0;
 
 	/*
@@ -156,14 +151,16 @@ fill_db(void)
 					    "%" PRIu32 " %" PRIu32 "\n",
 					    save_lsn.l.offset, i - 1) == -1)
 						testutil_die(errno, "fprintf");
-					if (fclose(fp) != 0)
-						testutil_die(errno, "fclose");
-					abort();
+					break;
 				}
 			}
 			first = false;
 		}
 	}
+	if (fclose(fp) != 0)
+		testutil_die(errno, "fclose");
+	abort();
+	/* NOTREACHED */
 }
 
 extern int __wt_optind;
@@ -243,8 +240,10 @@ main(int argc, char *argv[])
 	 * The offset is the beginning of the last record.  Truncate to
 	 * the middle of that last record (i.e. ahead of that offset).
 	 */
+	if (offset > UINT64_MAX - V_SIZE)
+		testutil_die(ERANGE, "offset");
 	new_offset = offset + V_SIZE;
-	printf("Parent: Truncate to %u\n", (uint32_t)new_offset);
+	printf("Parent: Truncate to %" PRIu64 "\n", new_offset);
 	if ((ret = truncate(LOG_FILE_1, (wt_off_t)new_offset)) != 0)
 		testutil_die(errno, "truncate");
 
@@ -267,9 +266,10 @@ main(int argc, char *argv[])
 	if ((ret = conn->close(conn, NULL)) != 0)
 		testutil_die(ret, "WT_CONNECTION:close");
 	if (count > max_key) {
-		printf("expected %u records found %u\n", max_key, count);
+		printf("expected %" PRIu32 " records found %" PRIu32 "\n",
+		    max_key, count);
 		return (EXIT_FAILURE);
 	}
-	printf("%u records verified\n", count);
+	printf("%" PRIu32 " records verified\n", count);
 	return (EXIT_SUCCESS);
 }

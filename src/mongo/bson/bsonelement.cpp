@@ -31,8 +31,8 @@
 
 #include "mongo/bson/bsonelement.h"
 
-#include <cmath>
 #include <boost/functional/hash.hpp>
+#include <cmath>
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_cursor.h"
@@ -379,7 +379,9 @@ std::vector<BSONElement> BSONElement::Array() const {
 /* wo = "well ordered"
    note: (mongodb related) : this can only change in behavior when index version # changes
 */
-int BSONElement::woCompare(const BSONElement& e, bool considerFieldName) const {
+int BSONElement::woCompare(const BSONElement& e,
+                           bool considerFieldName,
+                           const StringData::ComparatorInterface* comparator) const {
     int lt = (int)canonicalType();
     int rt = (int)e.canonicalType();
     int x = lt - rt;
@@ -390,8 +392,33 @@ int BSONElement::woCompare(const BSONElement& e, bool considerFieldName) const {
         if (x != 0)
             return x;
     }
-    x = compareElementValues(*this, e);
+    x = compareElementValues(*this, e, comparator);
     return x;
+}
+
+bool BSONElement::binaryEqual(const BSONElement& rhs) const {
+    const int elemSize = size();
+
+    if (elemSize != rhs.size()) {
+        return false;
+    }
+
+    return (elemSize == 0) || (memcmp(data, rhs.rawdata(), elemSize) == 0);
+}
+
+bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
+    // The binaryEqual method above implicitly compares the type, but we need to do so explicitly
+    // here. It doesn't make sense to consider to BSONElement objects as binaryEqual if they have
+    // the same bit pattern but different types (consider an integer and a double).
+    if (type() != rhs.type())
+        return false;
+
+    const int valueSize = valuesize();
+    if (valueSize != rhs.valuesize()) {
+        return false;
+    }
+
+    return (valueSize == 0) || (memcmp(value(), rhs.value(), valueSize) == 0);
 }
 
 BSONObj BSONElement::embeddedObjectUserCheck() const {
@@ -849,7 +876,9 @@ std::string escape(const std::string& s, bool escape_slash) {
 /**
  * l and r must be same canonicalType when called.
  */
-int compareElementValues(const BSONElement& l, const BSONElement& r) {
+int compareElementValues(const BSONElement& l,
+                         const BSONElement& r,
+                         const StringData::ComparatorInterface* comparator) {
     int f;
 
     switch (l.type()) {
@@ -946,9 +975,10 @@ int compareElementValues(const BSONElement& l, const BSONElement& r) {
             return memcmp(l.value(), r.value(), OID::kOIDSize);
         case Code:
         case Symbol:
-        case String:
-            /* todo: a utf sort order version one day... */
-            {
+        case String: {
+            if (comparator) {
+                return comparator->compare(l.valueStringData(), r.valueStringData());
+            } else {
                 // we use memcmp as we allow zeros in UTF8 strings
                 int lsz = l.valuestrsize();
                 int rsz = r.valuestrsize();
@@ -959,9 +989,15 @@ int compareElementValues(const BSONElement& l, const BSONElement& r) {
                 // longer std::string is the greater one
                 return lsz - rsz;
             }
+        }
         case Object:
         case Array:
-            return l.embeddedObject().woCompare(r.embeddedObject());
+            // woCompare parameters: r, ordering, considerFieldName, comparator.
+            // r: the BSONObj to compare with.
+            // ordering: the sort directions for each key.
+            // considerFieldName: whether field names should be considered in comparison.
+            // comparator: used for all string comparisons, if non-null.
+            return l.embeddedObject().woCompare(r.embeddedObject(), BSONObj(), true, comparator);
         case DBRef: {
             int lsz = l.valuesize();
             int rsz = r.valuesize();
@@ -988,7 +1024,16 @@ int compareElementValues(const BSONElement& l, const BSONElement& r) {
             if (cmp)
                 return cmp;
 
-            return l.codeWScopeObject().woCompare(r.codeWScopeObject());
+            return l.codeWScopeObject().woCompare(
+                // woCompare parameters: r, ordering, considerFieldName, comparator.
+                // r: the BSONObj to compare with.
+                // ordering: the sort directions for each key.
+                // considerFieldName: whether field names should be considered in comparison.
+                // comparator: used for all string comparisons, if non-null.
+                r.codeWScopeObject(),
+                BSONObj(),
+                true,
+                comparator);
         }
         default:
             verify(false);
@@ -1031,7 +1076,9 @@ size_t BSONElement::Hasher::operator()(const BSONElement& elem) const {
 
         case mongo::NumberDecimal: {
             const Decimal128 dcml = elem.numberDecimal();
-            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max())) &&
+            if (dcml.toAbs().isGreater(Decimal128(std::numeric_limits<double>::max(),
+                                                  Decimal128::kRoundTo34Digits,
+                                                  Decimal128::kRoundTowardZero)) &&
                 !dcml.isInfinite() && !dcml.isNaN()) {
                 // Normalize our decimal to force equivalent decimals
                 // in the same cohort to hash to the same value

@@ -27,8 +27,11 @@
  */
 
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -41,7 +44,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/plan_executor.h"
@@ -100,8 +102,10 @@ public:
         unique_ptr<WorkingSet> ws(new WorkingSet());
 
         // Canonicalize the query.
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(nss, filterObj, ExtensionsCallbackDisallowExtensions());
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(filterObj);
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            &_txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         verify(NULL != cq.get());
@@ -145,8 +149,9 @@ public:
         IndexScan* ix = new IndexScan(&_txn, ixparams, ws.get(), NULL);
         unique_ptr<PlanStage> root(new FetchStage(&_txn, ws.get(), ix, NULL, coll));
 
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(nss, BSONObj(), ExtensionsCallbackDisallowExtensions());
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        auto statusWithCQ = CanonicalQuery::canonicalize(
+            &_txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         verify(NULL != cq.get());
@@ -185,7 +190,8 @@ public:
     }
 
 protected:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
 
 private:
     IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
@@ -273,13 +279,12 @@ public:
         std::shared_ptr<PlanExecutor> innerExec(makeIndexScanExec(ctx.db(), indexSpec, 7, 10));
 
         // Create the aggregation pipeline.
-        boost::intrusive_ptr<ExpressionContext> expCtx =
-            new ExpressionContext(&_txn, NamespaceString(nss.ns()));
+        std::vector<BSONObj> rawPipeline = {fromjson("{$match: {a: {$gte: 7, $lte: 10}}}")};
+        boost::intrusive_ptr<ExpressionContext> expCtx = new ExpressionContext(
+            &_txn, AggregationRequest(NamespaceString(nss.ns()), rawPipeline));
 
-        string errmsg;
-        BSONObj inputBson = fromjson("{$match: {a: {$gte: 7, $lte: 10}}}");
-        boost::intrusive_ptr<Pipeline> pipeline = Pipeline::parseCommand(errmsg, inputBson, expCtx);
-        ASSERT_EQUALS(errmsg, "");
+        auto statusWithPipeline = Pipeline::parse(rawPipeline, expCtx);
+        auto pipeline = assertGet(statusWithPipeline);
 
         // Create the output PlanExecutor that pulls results from the pipeline.
         auto ws = make_unique<WorkingSet>();

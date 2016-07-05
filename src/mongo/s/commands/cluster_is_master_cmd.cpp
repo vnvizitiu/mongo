@@ -30,7 +30,6 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/s/catalog/forwarding_catalog_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 
@@ -41,7 +40,8 @@ class CmdIsMaster : public Command {
 public:
     CmdIsMaster() : Command("isMaster", false, "ismaster") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 

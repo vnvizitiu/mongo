@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -36,20 +37,30 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_noop.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 bool isMongos() {
     return false;
 }
+
+std::unique_ptr<ServiceContextNoop> makeTestServiceContext() {
+    auto service = stdx::make_unique<ServiceContextNoop>();
+    service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    service->setTickSource(stdx::make_unique<TickSourceMock>());
+    return service;
+}
 }
 
 // Stub to avoid including the server environment library.
 MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
-    setGlobalServiceContext(stdx::make_unique<ServiceContextNoop>());
+    setGlobalServiceContext(makeTestServiceContext());
     return Status::OK();
 }
 
@@ -77,8 +88,37 @@ BSONObj toBson(const intrusive_ptr<DocumentSource>& source) {
 namespace DocumentSourceClass {
 using mongo::DocumentSource;
 
+TEST(TruncateSort, SortTruncatesNormalField) {
+    BSONObj sortKey = BSON("a" << 1 << "b" << 1 << "c" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
+
+TEST(TruncateSort, SortTruncatesOnSubfield) {
+    BSONObj sortKey = BSON("a" << 1 << "b.c" << 1 << "d" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
+
+TEST(TruncateSort, SortDoesNotTruncateOnParent) {
+    BSONObj sortKey = BSON("a" << 1 << "b" << 1 << "d" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKey}, {"b.c"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1 << "b" << 1 << "d" << 1)), 1U);
+}
+
+TEST(TruncateSort, TruncateSortDedupsSortCorrectly) {
+    BSONObj sortKeyOne = BSON("a" << 1 << "b" << 1);
+    BSONObj sortKeyTwo = BSON("a" << 1);
+    auto truncated = DocumentSource::truncateSortSet({sortKeyOne, sortKeyTwo}, {"b"});
+    ASSERT_EQUALS(truncated.size(), 1U);
+    ASSERT_EQUALS(truncated.count(BSON("a" << 1)), 1U);
+}
+
 template <size_t ArrayLen>
-set<string> arrayToSet(const char*(&array)[ArrayLen]) {
+set<string> arrayToSet(const char* (&array)[ArrayLen]) {
     set<string> out;
     for (size_t i = 0; i < ArrayLen; i++)
         out.insert(array[i]);
@@ -156,25 +196,30 @@ public:
         }
     }
 };
-}
+
+
+}  // namespace DocumentSourceClass
 
 namespace Mock {
 using mongo::DocumentSourceMock;
 
+/**
+ * A fixture which provides access to things like a ServiceContext that are needed by other tests.
+ */
 class Base {
 public:
     Base()
-        : _service(),
-          _client(_service.makeClient("DocumentSourceTest")),
+        : _service(makeTestServiceContext()),
+          _client(_service->makeClient("DocumentSourceTest")),
           _opCtx(_client->makeOperationContext()),
-          _ctx(new ExpressionContext(_opCtx.get(), NamespaceString(ns))) {}
+          _ctx(new ExpressionContext(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}))) {}
 
 protected:
     intrusive_ptr<ExpressionContext> ctx() {
         return _ctx;
     }
 
-    ServiceContextNoop _service;
+    std::unique_ptr<ServiceContextNoop> _service;
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
 
@@ -349,6 +394,48 @@ public:
 
 }  // namespace DocumentSourceLimit
 
+namespace DocumentSourceLookup {
+
+TEST(QueryForInput, NonArrayValueUsesEqQuery) {
+    Document input = DOC("local" << 1);
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query, fromjson("{$and: [{foreign: {$eq: 1}}, {}]}"));
+}
+
+TEST(QueryForInput, RegexValueUsesEqQuery) {
+    BSONRegEx regex("^a");
+    Document input = DOC("local" << Value(regex));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query,
+              BSON("$and" << BSON_ARRAY(BSON("foreign" << BSON("$eq" << regex)) << BSONObj())));
+}
+
+TEST(QueryForInput, ArrayValueUsesInQuery) {
+    vector<Value> inputArray = {Value(1), Value(2)};
+    Document input = DOC("local" << Value(inputArray));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query, fromjson("{$and: [{foreign: {$in: [1, 2]}}, {}]}"));
+}
+
+TEST(QueryForInput, ArrayValueWithRegexUsesOrQuery) {
+    BSONRegEx regex("^a");
+    vector<Value> inputArray = {Value(1), Value(regex), Value(2)};
+    Document input = DOC("local" << Value(inputArray));
+    BSONObj query =
+        DocumentSourceLookUp::queryForInput(input, FieldPath("local"), "foreign", BSONObj());
+    ASSERT_EQ(query,
+              BSON("$and" << BSON_ARRAY(
+                       BSON("$or" << BSON_ARRAY(BSON("foreign" << BSON("$eq" << Value(1)))
+                                                << BSON("foreign" << BSON("$eq" << regex))
+                                                << BSON("foreign" << BSON("$eq" << Value(2)))))
+                       << BSONObj())));
+}
+
+}  // namespace DocumentSourceLookUp
+
 namespace DocumentSourceGroup {
 
 using mongo::DocumentSourceGroup;
@@ -359,21 +446,22 @@ public:
     Base() : _tempDir("DocumentSourceGroupTest") {}
 
 protected:
-    void createGroup(const BSONObj& spec, bool inShard = false) {
+    void createGroup(const BSONObj& spec, bool inShard = false, bool inRouter = false) {
         BSONObj namedSpec = BSON("$group" << spec);
         BSONElement specElement = namedSpec.firstElement();
 
         intrusive_ptr<ExpressionContext> expressionContext =
-            new ExpressionContext(_opCtx.get(), NamespaceString(ns));
+            new ExpressionContext(_opCtx.get(), AggregationRequest(NamespaceString(ns), {}));
         expressionContext->inShard = inShard;
+        expressionContext->inRouter = inRouter;
         // Won't spill to disk properly if it needs to.
         expressionContext->tempDir = _tempDir.path();
 
         _group = DocumentSourceGroup::createFromBson(specElement, expressionContext);
         assertRoundTrips(_group);
     }
-    DocumentSource* group() {
-        return _group.get();
+    DocumentSourceGroup* group() {
+        return static_cast<DocumentSourceGroup*>(_group.get());
     }
     /** Assert that iterator state accessors consistently report the source is exhausted. */
     void assertExhausted(const intrusive_ptr<DocumentSource>& source) const {
@@ -753,8 +841,9 @@ class TwoValuesTwoKeys : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$_id"
-                    << "a" << BSON("$push"
-                                   << "$a"));
+                    << "a"
+                    << BSON("$push"
+                            << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:[1]},{_id:1,a:[2]}]";
@@ -772,8 +861,9 @@ class FourValuesTwoKeys : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$id"
-                    << "a" << BSON("$push"
-                                   << "$a"));
+                    << "a"
+                    << BSON("$push"
+                            << "$a"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:0,a:[1,3]},{_id:1,a:[2,4]}]";
@@ -791,8 +881,10 @@ class FourValuesTwoKeysTwoAccumulators : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$id"
-                    << "list" << BSON("$push"
-                                      << "$a") << "sum"
+                    << "list"
+                    << BSON("$push"
+                            << "$a")
+                    << "sum"
                     << BSON("$sum" << BSON("$divide" << BSON_ARRAY("$a" << 2))));
     }
     virtual string expectedResultSetString() {
@@ -808,8 +900,9 @@ class GroupNullUndefinedIds : public CheckResultsBase {
     virtual BSONObj groupSpec() {
         return BSON("_id"
                     << "$a"
-                    << "sum" << BSON("$sum"
-                                     << "$b"));
+                    << "sum"
+                    << BSON("$sum"
+                            << "$b"));
     }
     virtual string expectedResultSetString() {
         return "[{_id:null,sum:110}]";
@@ -873,8 +966,9 @@ public:
         // Create a group source.
         createGroup(BSON("_id"
                          << "$x"
-                         << "list" << BSON("$push"
-                                           << "$y")));
+                         << "list"
+                         << BSON("$push"
+                                 << "$y")));
         // Create a merger version of the source.
         intrusive_ptr<DocumentSource> group = createMerger();
         // Attach the merger to the synthetic shard results.
@@ -905,6 +999,316 @@ public:
         ASSERT_EQUALS(1U, dependencies.fields.count("v"));
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
         ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
+
+class StreamingOptimization : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 0}", "{a: 0}", "{a: 1}", "{a: 1}"});
+        source->sorts = {BSON("a" << 1)};
+
+        createGroup(BSON("_id"
+                         << "$a"));
+        group()->setSource(source.get());
+
+        auto res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id"), Value(0));
+
+        ASSERT_TRUE(group()->isStreaming());
+
+        res = source->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("a"), Value(1));
+
+        assertExhausted(source);
+
+        res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id"), Value(1));
+
+        assertExhausted(group());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 1U);
+
+        ASSERT_EQUALS(outputSort.count(BSON("_id" << 1)), 1U);
+    }
+};
+
+class StreamingWithMultipleIdFields : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create(
+            {"{a: 1, b: 2}", "{a: 1, b: 2}", "{a: 1, b: 1}", "{a: 2, b: 1}", "{a: 2, b: 1}"});
+        source->sorts = {BSON("a" << 1 << "b" << -1)};
+
+        createGroup(fromjson("{_id: {x: '$a', y: '$b'}}"));
+        group()->setSource(source.get());
+
+        auto res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id")["x"], Value(1));
+        ASSERT_EQUALS(res->getField("_id")["y"], Value(2));
+
+        ASSERT_TRUE(group()->isStreaming());
+
+        res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id")["x"], Value(1));
+        ASSERT_EQUALS(res->getField("_id")["y"], Value(1));
+
+        res = source->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("a"), Value(2));
+        ASSERT_EQUALS(res->getField("b"), Value(1));
+
+        assertExhausted(source);
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 2U);
+
+        BSONObj correctSort = BSON("_id.x" << 1 << "_id.y" << -1);
+        ASSERT_EQUALS(outputSort.count(correctSort), 1U);
+
+        BSONObj prefixSort = BSON("_id.x" << 1);
+        ASSERT_EQUALS(outputSort.count(prefixSort), 1U);
+    }
+};
+
+class StreamingWithMultipleLevels : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create(
+            {"{a: {b: {c: 3}}, d: 1}", "{a: {b: {c: 1}}, d: 2}", "{a: {b: {c: 1}}, d: 0}"});
+        source->sorts = {BSON("a.b.c" << -1 << "a.b.d" << 1 << "d" << 1)};
+
+        createGroup(fromjson("{_id: {x: {y: {z: '$a.b.c', q: '$a.b.d'}}, v: '$d'}}"));
+        group()->setSource(source.get());
+
+        auto res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id")["x"]["y"]["z"], Value(3));
+
+        ASSERT_TRUE(group()->isStreaming());
+
+        res = source->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("a")["b"]["c"], Value(1));
+
+        assertExhausted(source);
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 3U);
+
+        BSONObj correctSort = fromjson("{'_id.x.y.z': -1, '_id.x.y.q': 1, '_id.v': 1}");
+        ASSERT_EQUALS(outputSort.count(correctSort), 1U);
+
+        BSONObj prefixSortTwo = fromjson("{'_id.x.y.z': -1, '_id.x.y.q': 1}");
+        ASSERT_EQUALS(outputSort.count(prefixSortTwo), 1U);
+
+        BSONObj prefixSortOne = fromjson("{'_id.x.y.z': -1}");
+        ASSERT_EQUALS(outputSort.count(prefixSortOne), 1U);
+    }
+};
+
+class StreamingWithFieldRepeated : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create(
+            {"{a: 1, b: 1}", "{a: 1, b: 1}", "{a: 2, b: 1}", "{a: 2, b: 3}"});
+        source->sorts = {BSON("a" << 1 << "b" << 1)};
+
+        createGroup(fromjson("{_id: {sub: {x: '$a', y: '$b', z: '$a'}}}"));
+        group()->setSource(source.get());
+
+        auto res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["x"], Value(1));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["y"], Value(1));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["z"], Value(1));
+
+        ASSERT_TRUE(group()->isStreaming());
+
+        res = source->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("a"), Value(2));
+        ASSERT_EQUALS(res->getField("b"), Value(3));
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+
+        ASSERT_EQUALS(outputSort.size(), 2U);
+
+        BSONObj correctSort = fromjson("{'_id.sub.z': 1}");
+        ASSERT_EQUALS(outputSort.count(correctSort), 1U);
+
+        BSONObj prefixSortTwo = fromjson("{'_id.sub.z': 1, '_id.sub.y': 1}");
+        ASSERT_EQUALS(outputSort.count(prefixSortTwo), 1U);
+    }
+};
+
+class StreamingWithConstantAndFieldPath : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create(
+            {"{a: 5, b: 1}", "{a: 5, b: 2}", "{a: 3, b: 1}", "{a: 1, b: 1}", "{a: 1, b: 1}"});
+        source->sorts = {BSON("a" << -1 << "b" << 1)};
+
+        createGroup(fromjson("{_id: {sub: {x: '$a', y: '$b', z: {$literal: 'c'}}}}"));
+        group()->setSource(source.get());
+
+        auto res = group()->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["x"], Value(5));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["y"], Value(1));
+        ASSERT_EQUALS(res->getField("_id")["sub"]["z"], Value("c"));
+
+        ASSERT_TRUE(group()->isStreaming());
+
+        res = source->getNext();
+        ASSERT_TRUE(bool(res));
+        ASSERT_EQUALS(res->getField("a"), Value(3));
+        ASSERT_EQUALS(res->getField("b"), Value(1));
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 2U);
+
+        BSONObj correctSort = fromjson("{'_id.sub.x': -1}");
+        ASSERT_EQUALS(outputSort.count(correctSort), 1U);
+
+        BSONObj prefixSortTwo = fromjson("{'_id.sub.x': -1, '_id.sub.y': 1}");
+        ASSERT_EQUALS(outputSort.count(prefixSortTwo), 1U);
+    }
+};
+
+class StreamingWithRootSubfield : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}", "{a: 3}"});
+        source->sorts = {BSON("a" << 1)};
+
+        createGroup(fromjson("{_id: '$$ROOT.a'}"));
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_TRUE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 1U);
+
+        BSONObj correctSort = fromjson("{_id: 1}");
+        ASSERT_EQUALS(outputSort.count(correctSort), 1U);
+    }
+};
+
+class StreamingWithConstant : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}", "{a: 3}"});
+        source->sorts = {BSON("$a" << 1)};
+
+        createGroup(fromjson("{_id: 1}"));
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_TRUE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 0U);
+    }
+};
+
+class StreamingWithEmptyId : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}", "{a: 3}"});
+        source->sorts = {BSON("$a" << 1)};
+
+        createGroup(fromjson("{_id: {}}"));
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_TRUE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 0U);
+    }
+};
+
+class NoOptimizationIfMissingDoubleSort : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}", "{a: 3}"});
+        source->sorts = {BSON("a" << 1)};
+
+        // We pretend to be in the router so that we don't spill to disk, because this produces
+        // inconsistent output on debug vs. non-debug builds.
+        const bool inRouter = true;
+        const bool inShard = false;
+
+        createGroup(BSON("_id" << BSON("x"
+                                       << "$a"
+                                       << "y"
+                                       << "$b")),
+                    inShard,
+                    inRouter);
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_FALSE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 0U);
+    }
+};
+
+class NoOptimizationWithRawRoot : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1}", "{a: 2}", "{a: 3}"});
+        source->sorts = {BSON("a" << 1)};
+
+        // We pretend to be in the router so that we don't spill to disk, because this produces
+        // inconsistent output on debug vs. non-debug builds.
+        const bool inRouter = true;
+        const bool inShard = false;
+
+        createGroup(BSON("_id" << BSON("a"
+                                       << "$$ROOT"
+                                       << "b"
+                                       << "$a")),
+                    inShard,
+                    inRouter);
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_FALSE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 0U);
+    }
+};
+
+class NoOptimizationIfUsingExpressions : public Base {
+public:
+    void run() {
+        auto source = DocumentSourceMock::create({"{a: 1, b: 1}", "{a: 2, b: 2}", "{a: 3, b: 1}"});
+        source->sorts = {BSON("a" << 1 << "b" << 1)};
+
+        // We pretend to be in the router so that we don't spill to disk, because this produces
+        // inconsistent output on debug vs. non-debug builds.
+        const bool inRouter = true;
+        const bool inShard = false;
+
+        createGroup(fromjson("{_id: {$sum: ['$a', '$b']}}"), inShard, inRouter);
+        group()->setSource(source.get());
+
+        group()->getNext();
+        ASSERT_FALSE(group()->isStreaming());
+
+        BSONObjSet outputSort = group()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.size(), 0U);
     }
 };
 
@@ -949,148 +1353,152 @@ public:
 
 namespace DocumentSourceProject {
 
-using mongo::DocumentSourceProject;
 using mongo::DocumentSourceMock;
+using mongo::DocumentSourceProject;
 
-class Base : public Mock::Base {
+//
+// DocumentSourceProject delegates much of its responsibilities to the ParsedAggregationProjection.
+// Most of the functional tests are testing ParsedAggregationProjection directly. These are meant as
+// simpler integration tests.
+//
+
+/**
+ * Class which provides useful helpers to test the functionality of the $project stage.
+ */
+class ProjectStageTest : public Mock::Base, public unittest::Test {
 protected:
-    void createProject(const BSONObj& projection = BSON("a" << true)) {
+    /**
+     * Creates the $project stage, which can be accessed via project().
+     */
+    void createProject(const BSONObj& projection) {
         BSONObj spec = BSON("$project" << projection);
         BSONElement specElement = spec.firstElement();
         _project = DocumentSourceProject::createFromBson(specElement, ctx());
-        checkBsonRepresentation(spec);
     }
+
     DocumentSource* project() {
         return _project.get();
     }
-    /** Assert that iterator state accessors consistently report the source is exhausted. */
+
+    /**
+     * Assert that iterator state accessors consistently report the source is exhausted.
+     */
     void assertExhausted() const {
         ASSERT(!_project->getNext());
         ASSERT(!_project->getNext());
         ASSERT(!_project->getNext());
-    }
-    /**
-     * Check that the BSON representation generated by the souce matches the BSON it was
-     * created with.
-     */
-    void checkBsonRepresentation(const BSONObj& spec) {
-        vector<Value> arr;
-        _project->serializeToArray(arr);
-        BSONObj generatedSpec = arr[0].getDocument().toBson();
-        ASSERT_EQUALS(spec, generatedSpec);
     }
 
 private:
     intrusive_ptr<DocumentSource> _project;
 };
 
-/** The 'a' and 'c.d' fields are included, but the 'b' field is not. */
-class Inclusion : public Base {
-public:
-    void run() {
-        createProject(BSON("a" << true << "c" << BSON("d" << true)));
-        auto source = DocumentSourceMock::create("{_id:0,a:1,b:1,c:{d:1}}");
-        project()->setSource(source.get());
-        // The first result exists and is as expected.
-        boost::optional<Document> next = project()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(1, next->getField("a").getInt());
-        ASSERT(next->getField("b").missing());
-        // The _id field is included by default in the root document.
-        ASSERT_EQUALS(0, next->getField("_id").getInt());
-        // The nested c.d inclusion.
-        ASSERT_EQUALS(1, (*next)["c"]["d"].getInt());
-    }
+TEST_F(ProjectStageTest, InclusionProjectionShouldRemoveUnspecifiedFields) {
+    createProject(BSON("a" << true << "c" << BSON("d" << true)));
+    auto source = DocumentSourceMock::create("{_id: 0, a: 1, b: 1, c: {d: 1}}");
+    project()->setSource(source.get());
+    // The first result exists and is as expected.
+    boost::optional<Document> next = project()->getNext();
+    ASSERT_TRUE(next);
+    ASSERT_EQUALS(1, next->getField("a").getInt());
+    ASSERT(next->getField("b").missing());
+    // The _id field is included by default in the root document.
+    ASSERT_EQUALS(0, next->getField("_id").getInt());
+    // The nested c.d inclusion.
+    ASSERT_EQUALS(1, (*next)["c"]["d"].getInt());
 };
 
-/** Optimize the projection. */
-class Optimize : public Base {
-public:
-    void run() {
-        createProject(BSON("a" << BSON("$and" << BSON_ARRAY(BSON("$const" << true)))));
-        project()->optimize();
-        // Optimizing the DocumentSourceProject optimizes the Expressions that comprise it,
-        // in this case replacing an expression depending on constants with a constant.
-        checkBsonRepresentation(fromjson("{$project:{a:{$const:true}}}"));
-    }
+TEST_F(ProjectStageTest, ShouldOptimizeInnerExpressions) {
+    createProject(BSON("a" << BSON("$and" << BSON_ARRAY(BSON("$const" << true)))));
+    project()->optimize();
+    // The $and should have been replaced with its only argument.
+    vector<Value> serializedArray;
+    project()->serializeToArray(serializedArray);
+    ASSERT_EQUALS(serializedArray[0].getDocument().toBson(),
+                  fromjson("{$project: {_id: true, a: {$const: true}}}"));
 };
 
-/** Projection spec is not an object. */
-class NonObjectSpec : public Base {
-public:
-    void run() {
-        BSONObj spec = BSON("$project"
-                            << "foo");
-        BSONElement specElement = spec.firstElement();
-        ASSERT_THROWS(DocumentSourceProject::createFromBson(specElement, ctx()), UserException);
-    }
+TEST_F(ProjectStageTest, ShouldErrorOnNonObjectSpec) {
+    // Can't use createProject() helper because we want to give a non-object spec.
+    BSONObj spec = BSON("$project"
+                        << "foo");
+    BSONElement specElement = spec.firstElement();
+    ASSERT_THROWS(DocumentSourceProject::createFromBson(specElement, ctx()), UserException);
 };
 
-/** Projection spec is an empty object. */
-class EmptyObjectSpec : public Base {
-public:
-    void run() {
-        ASSERT_THROWS(createProject(BSONObj()), UserException);
-    }
+/**
+ * Basic sanity check that two documents can be projected correctly with a simple inclusion
+ * projection.
+ */
+TEST_F(ProjectStageTest, InclusionShouldBeAbleToProcessMultipleDocuments) {
+    createProject(BSON("a" << true));
+    auto source = DocumentSourceMock::create({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    project()->setSource(source.get());
+    boost::optional<Document> next = project()->getNext();
+    ASSERT(bool(next));
+    ASSERT_EQUALS(1, next->getField("a").getInt());
+    ASSERT(next->getField("b").missing());
+
+    next = project()->getNext();
+    ASSERT(bool(next));
+    ASSERT_EQUALS(3, next->getField("a").getInt());
+    ASSERT(next->getField("b").missing());
+
+    assertExhausted();
 };
 
-/** Projection spec contains a top level dollar sign. */
-class TopLevelDollar : public Base {
-public:
-    void run() {
-        ASSERT_THROWS(createProject(BSON("$add" << BSONArray())), UserException);
-    }
+/**
+ * Basic sanity check that two documents can be projected correctly with a simple inclusion
+ * projection.
+ */
+TEST_F(ProjectStageTest, ExclusionShouldBeAbleToProcessMultipleDocuments) {
+    createProject(BSON("a" << false));
+    auto source = DocumentSourceMock::create({"{a: 1, b: 2}", "{a: 3, b: 4}"});
+    project()->setSource(source.get());
+    boost::optional<Document> next = project()->getNext();
+    ASSERT(bool(next));
+    ASSERT(next->getField("a").missing());
+    ASSERT_EQUALS(2, next->getField("b").getInt());
+
+    next = project()->getNext();
+    ASSERT(bool(next));
+    ASSERT(next->getField("a").missing());
+    ASSERT_EQUALS(4, next->getField("b").getInt());
+
+    assertExhausted();
 };
 
-/** Projection spec is invalid. */
-class InvalidSpec : public Base {
-public:
-    void run() {
-        ASSERT_THROWS(createProject(BSON("a" << BSON("$invalidOperator" << 1))), UserException);
-    }
+TEST_F(ProjectStageTest, InclusionShouldAddDependenciesOfIncludedAndComputedFields) {
+    createProject(fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"));
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, project()->getDependencies(&dependencies));
+    ASSERT_EQUALS(5U, dependencies.fields.size());
+
+    // Implicit _id dependency.
+    ASSERT_EQUALS(1U, dependencies.fields.count("_id"));
+
+    // Inclusion dependency.
+    ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+
+    // Field path expression dependency.
+    ASSERT_EQUALS(1U, dependencies.fields.count("b"));
+
+    // Nested expression dependencies.
+    ASSERT_EQUALS(1U, dependencies.fields.count("c"));
+    ASSERT_EQUALS(1U, dependencies.fields.count("d"));
+    ASSERT_EQUALS(false, dependencies.needWholeDocument);
+    ASSERT_EQUALS(true, dependencies.needTextScore);
 };
 
-/** Two documents are projected. */
-class TwoDocuments : public Base {
-public:
-    void run() {
-        createProject();
-        auto source = DocumentSourceMock::create({"{a: 1, b:2}", "{a: 3, b: 4}"});
-        project()->setSource(source.get());
-        boost::optional<Document> next = project()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(1, next->getField("a").getInt());
-        ASSERT(next->getField("b").missing());
+TEST_F(ProjectStageTest, ExclusionShouldNotAddDependencies) {
+    createProject(fromjson("{a: false, 'b.c': false}"));
 
-        next = project()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(3, next->getField("a").getInt());
-        ASSERT(next->getField("b").missing());
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, project()->getDependencies(&dependencies));
 
-        assertExhausted();
-    }
-};
-
-/** List of dependent field paths. */
-class Dependencies : public Base {
-public:
-    void run() {
-        createProject(fromjson("{a:true,x:'$b',y:{$and:['$c','$d']}, z: {$meta:'textScore'}}"));
-        DepsTracker dependencies;
-        ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, project()->getDependencies(&dependencies));
-        ASSERT_EQUALS(5U, dependencies.fields.size());
-        // Implicit _id dependency.
-        ASSERT_EQUALS(1U, dependencies.fields.count("_id"));
-        // Inclusion dependency.
-        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
-        // Field path expression dependency.
-        ASSERT_EQUALS(1U, dependencies.fields.count("b"));
-        // Nested expression dependencies.
-        ASSERT_EQUALS(1U, dependencies.fields.count("c"));
-        ASSERT_EQUALS(1U, dependencies.fields.count("d"));
-        ASSERT_EQUALS(false, dependencies.needWholeDocument);
-        ASSERT_EQUALS(true, dependencies.needTextScore);
-    }
+    ASSERT_EQUALS(0U, dependencies.fields.size());
+    ASSERT_EQUALS(false, dependencies.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies.needTextScore);
 };
 
 }  // namespace DocumentSourceProject
@@ -1114,7 +1522,7 @@ protected:
     }
 
     DocumentSource* sample() {
-        return static_cast<DocumentSourceSample*>(_sample.get());
+        return _sample.get();
     }
 
     DocumentSourceMock* source() {
@@ -1407,13 +1815,15 @@ TEST_F(SampleFromRandomCursorBasics, MimicNonOptimized) {
         ASSERT_TRUE((*doc).hasRandMetaField());
         secondTotal += (*doc).getRandMetaField();
     }
-    // The average random meta value of the first document should be about 0.75.
-    ASSERT_GTE(firstTotal / nTrials, 0.74);
-    ASSERT_LTE(firstTotal / nTrials, 0.76);
+    // The average random meta value of the first document should be about 0.75. We assume that
+    // 10000 trials is sufficient for us to apply the Central Limit Theorem. Using an error
+    // tolerance of 0.02 gives us a spurious failure rate approximately equal to 10^-24.
+    ASSERT_GTE(firstTotal / nTrials, 0.73);
+    ASSERT_LTE(firstTotal / nTrials, 0.77);
 
     // The average random meta value of the second document should be about 0.5.
-    ASSERT_GTE(secondTotal / nTrials, 0.49);
-    ASSERT_LTE(secondTotal / nTrials, 0.51);
+    ASSERT_GTE(secondTotal / nTrials, 0.48);
+    ASSERT_LTE(secondTotal / nTrials, 0.52);
 }
 }  // namespace DocumentSourceSampleFromRandomCursor
 
@@ -1846,6 +2256,17 @@ public:
     }
 };
 
+class OutputSort : public Base {
+public:
+    void run() {
+        createSort(BSON("a" << 1 << "b.c" << -1));
+        BSONObjSet outputSort = sort()->getOutputSorts();
+        ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
+        ASSERT_EQUALS(outputSort.count(BSON("a" << 1 << "b.c" << -1)), 1U);
+        ASSERT_EQUALS(outputSort.size(), 2U);
+    }
+};
+
 }  // namespace DocumentSourceSort
 
 namespace DocumentSourceUnwind {
@@ -1941,7 +2362,8 @@ private:
     void createUnwind(bool preserveNullAndEmptyArrays, bool includeArrayIndex) {
         auto specObj =
             DOC("$unwind" << DOC("path" << unwindFieldPath() << "preserveNullAndEmptyArrays"
-                                        << preserveNullAndEmptyArrays << "includeArrayIndex"
+                                        << preserveNullAndEmptyArrays
+                                        << "includeArrayIndex"
                                         << (includeArrayIndex ? Value(indexPath()) : Value())));
         _unwind = static_cast<DocumentSourceUnwind*>(
             DocumentSourceUnwind::createFromBson(specObj.toBson().firstElement(), ctx()).get());
@@ -1989,11 +2411,12 @@ private:
     }
 
     BSONObj expectedSerialization(bool preserveNullAndEmptyArrays, bool includeArrayIndex) const {
-        return DOC("$unwind" << DOC(
-                       "path" << Value(unwindFieldPath()) << "preserveNullAndEmptyArrays"
-                              << (preserveNullAndEmptyArrays ? Value(true) : Value())
-                              << "includeArrayIndex"
-                              << (includeArrayIndex ? Value(indexPath()) : Value()))).toBson();
+        return DOC("$unwind" << DOC("path" << Value(unwindFieldPath())
+                                           << "preserveNullAndEmptyArrays"
+                                           << (preserveNullAndEmptyArrays ? Value(true) : Value())
+                                           << "includeArrayIndex"
+                                           << (includeArrayIndex ? Value(indexPath()) : Value())))
+            .toBson();
     }
 
     /** Assert that iterator state accessors consistently report the source is exhausted. */
@@ -2448,6 +2871,21 @@ public:
     }
 };
 
+class OutputSort : public Mock::Base {
+public:
+    void run() {
+        auto unwind = DocumentSourceUnwind::create(ctx(), "x.y", false, boost::none);
+        auto source = DocumentSourceMock::create();
+        source->sorts = {BSON("a" << 1 << "x.y" << 1 << "b" << 1)};
+
+        unwind->setSource(source.get());
+
+        BSONObjSet outputSort = unwind->getOutputSorts();
+        ASSERT_EQUALS(1U, outputSort.size());
+        ASSERT_EQUALS(1U, outputSort.count(BSON("a" << 1)));
+    }
+};
+
 //
 // Error cases.
 //
@@ -2489,7 +2927,8 @@ TEST_F(InvalidUnwindSpec, NonDollarPrefixedPath) {
 TEST_F(InvalidUnwindSpec, NonBoolPreserveNullAndEmptyArrays) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays" << 2))),
+                                                           << "preserveNullAndEmptyArrays"
+                                                           << 2))),
                        UserException,
                        28809);
 }
@@ -2497,7 +2936,8 @@ TEST_F(InvalidUnwindSpec, NonBoolPreserveNullAndEmptyArrays) {
 TEST_F(InvalidUnwindSpec, NonStringIncludeArrayIndex) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "includeArrayIndex" << 2))),
+                                                           << "includeArrayIndex"
+                                                           << 2))),
                        UserException,
                        28810);
 }
@@ -2529,13 +2969,16 @@ TEST_F(InvalidUnwindSpec, DollarPrefixedIncludeArrayIndex) {
 TEST_F(InvalidUnwindSpec, UnrecognizedOption) {
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "preserveNullAndEmptyArrays" << true
-                                                           << "foo" << 3))),
+                                                           << "preserveNullAndEmptyArrays"
+                                                           << true
+                                                           << "foo"
+                                                           << 3))),
                        UserException,
                        28811);
     ASSERT_THROWS_CODE(createUnwind(BSON("$unwind" << BSON("path"
                                                            << "$x"
-                                                           << "foo" << 3))),
+                                                           << "foo"
+                                                           << 3))),
                        UserException,
                        28811);
 }
@@ -2574,10 +3017,29 @@ public:
         ASSERT_EQUALS(geoNear->getLimit(), 30);
     }
 };
+
+class OutputSort : public Mock::Base {
+public:
+    void run() {
+        BSONObj queryObj = fromjson(
+            "{geoNear: { near: {type: 'Point', coordinates: [0, 0]}, distanceField: 'dist', "
+            "maxDistance: 2}}");
+        intrusive_ptr<DocumentSource> geoNear =
+            DocumentSourceGeoNear::createFromBson(queryObj.firstElement(), ctx());
+
+        BSONObjSet outputSort = geoNear->getOutputSorts();
+
+        ASSERT_EQUALS(outputSort.count(BSON("dist" << -1)), 1U);
+        ASSERT_EQUALS(outputSort.size(), 1U);
+    }
+};
+
 }  // namespace DocumentSourceGeoNear
 
 namespace DocumentSourceMatch {
 using mongo::DocumentSourceMatch;
+
+using std::unique_ptr;
 
 // Helpers to make a DocumentSourceMatch from a query object or json string
 intrusive_ptr<DocumentSourceMatch> makeMatch(const BSONObj& query) {
@@ -2768,12 +3230,25 @@ public:
         DepsTracker dependencies;
         ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
         ASSERT_EQUALS(1U, dependencies.fields.count("a.c"));
-        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+        ASSERT_EQUALS(2U, dependencies.fields.size());
         ASSERT_EQUALS(false, dependencies.needWholeDocument);
         ASSERT_EQUALS(false, dependencies.needTextScore);
     }
 };
 
+class DependenciesElemMatchWithNoSubfield {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMatch> match = makeMatch("{a: {$elemMatch: {$gt: 1, $lt: 5}}}");
+        DepsTracker dependencies;
+        ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+        ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+        ASSERT_EQUALS(1U, dependencies.fields.size());
+        ASSERT_EQUALS(false, dependencies.needWholeDocument);
+        ASSERT_EQUALS(false, dependencies.needTextScore);
+    }
+};
 class DependenciesNotExpression {
 public:
     void run() {
@@ -2852,12 +3327,291 @@ public:
         match1->optimizeAt(container.begin(), &container);
         ASSERT_EQUALS(container.size(), 1U);
         ASSERT_EQUALS(match1->getQuery(),
-                      fromjson(
-                          "{'$and': [{'$and': [{a:1}, {b:1}]},"
-                          "{c:1}]}"));
+                      fromjson("{'$and': [{'$and': [{a:1}, {b:1}]},"
+                               "{c:1}]}"));
     }
 };
+
+TEST(ObjectForMatch, ShouldExtractTopLevelFieldIfDottedFieldNeeded) {
+    Document input(fromjson("{a: 1, b: {c: 1, d: 1}}"));
+    BSONObj expected = fromjson("{b: {c: 1, d: 1}}");
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, {"b.c"}));
+}
+
+TEST(ObjectForMatch, ShouldExtractEntireArray) {
+    Document input(fromjson("{a: [1, 2, 3], b: 1}"));
+    BSONObj expected = fromjson("{a: [1, 2, 3]}");
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, {"a"}));
+}
+
+TEST(ObjectForMatch, ShouldOnlyAddPrefixedFieldOnceIfTwoDottedSubfields) {
+    Document input(fromjson("{a: 1, b: {c: 1, f: {d: {e: 1}}}}"));
+    BSONObj expected = fromjson("{b: {c: 1, f: {d: {e: 1}}}}");
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, {"b.f", "b.f.d.e"}));
+}
+
+TEST(ObjectForMatch, MissingFieldShouldNotAppearInResult) {
+    Document input(fromjson("{a: 1}"));
+    BSONObj expected;
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, {"b", "c"}));
+}
+
+TEST(ObjectForMatch, ShouldSerializeNothingIfNothingIsNeeded) {
+    Document input(fromjson("{a: 1, b: {c: 1}}"));
+    BSONObj expected;
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, std::set<std::string>{}));
+}
+
+TEST(ObjectForMatch, ShouldExtractEntireArrayFromPrefixOfDottedField) {
+    Document input(fromjson("{a: [{b: 1}, {b: 2}], c: 1}"));
+    BSONObj expected = fromjson("{a: [{b: 1}, {b: 2}]}");
+    ASSERT_EQUALS(expected, DocumentSourceMatch::getObjectForMatch(input, {"a.b"}));
+}
+
+
 }  // namespace DocumentSourceMatch
+
+namespace DocumentSourceLookUp {
+using mongo::DocumentSourceLookUp;
+
+class OutputSortTruncatesOnEquality : public Mock::Base {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
+        source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
+        intrusive_ptr<DocumentSource> lookup =
+            DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
+                                                                        << "a"
+                                                                        << "localField"
+                                                                        << "b"
+                                                                        << "foreignField"
+                                                                        << "c"
+                                                                        << "as"
+                                                                        << "d.e"))
+                                                     .firstElement(),
+                                                 ctx());
+        lookup->setSource(source.get());
+
+        BSONObjSet outputSort = lookup->getOutputSorts();
+
+        ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
+        ASSERT_EQUALS(outputSort.size(), 1U);
+    }
+};
+
+class OutputSortTruncatesOnPrefix : public Mock::Base {
+public:
+    void run() {
+        intrusive_ptr<DocumentSourceMock> source = DocumentSourceMock::create();
+        source->sorts = {BSON("a" << 1 << "d.e" << 1 << "c" << 1)};
+        intrusive_ptr<DocumentSource> lookup =
+            DocumentSourceLookUp::createFromBson(BSON("$lookup" << BSON("from"
+                                                                        << "a"
+                                                                        << "localField"
+                                                                        << "b"
+                                                                        << "foreignField"
+                                                                        << "c"
+                                                                        << "as"
+                                                                        << "d"))
+                                                     .firstElement(),
+                                                 ctx());
+        lookup->setSource(source.get());
+
+        BSONObjSet outputSort = lookup->getOutputSorts();
+
+        ASSERT_EQUALS(outputSort.count(BSON("a" << 1)), 1U);
+        ASSERT_EQUALS(outputSort.size(), 1U);
+    }
+};
+}
+
+namespace DocumentSourceSortByCount {
+using mongo::DocumentSourceSortByCount;
+using mongo::DocumentSourceGroup;
+using mongo::DocumentSourceSort;
+using std::vector;
+using boost::intrusive_ptr;
+
+/**
+ * Fixture to test that $sortByCount returns a DocumentSourceGroup and DocumentSourceSort.
+ */
+class SortByCountReturnsGroupAndSort : public Mock::Base, public unittest::Test {
+public:
+    void testCreateFromBsonResult(BSONObj sortByCountSpec, Value expectedGroupExplain) {
+        vector<intrusive_ptr<DocumentSource>> result =
+            DocumentSourceSortByCount::createFromBson(sortByCountSpec.firstElement(), ctx());
+
+        ASSERT_EQUALS(result.size(), 2UL);
+
+        const auto* groupStage = dynamic_cast<DocumentSourceGroup*>(result[0].get());
+        ASSERT(groupStage);
+
+        const auto* sortStage = dynamic_cast<DocumentSourceSort*>(result[1].get());
+        ASSERT(sortStage);
+
+        // Serialize the DocumentSourceGroup and DocumentSourceSort from $sortByCount so that we can
+        // check the explain output to make sure $group and $sort have the correct fields.
+        const bool explain = true;
+        vector<Value> explainedStages;
+        groupStage->serializeToArray(explainedStages, explain);
+        sortStage->serializeToArray(explainedStages, explain);
+        ASSERT_EQUALS(explainedStages.size(), 2UL);
+
+        auto groupExplain = explainedStages[0];
+        ASSERT_EQ(groupExplain["$group"], expectedGroupExplain);
+
+        auto sortExplain = explainedStages[1];
+        auto expectedSortExplain = Value{Document{{"sortKey", Document{{"count", -1}}}}};
+        ASSERT_EQ(sortExplain["$sort"], expectedSortExplain);
+    }
+};
+
+TEST_F(SortByCountReturnsGroupAndSort, ExpressionFieldPathSpec) {
+    BSONObj spec = BSON("$sortByCount"
+                        << "$x");
+    Value expectedGroupExplain =
+        Value{Document{{"_id", "$x"}, {"count", Document{{"$sum", Document{{"$const", 1}}}}}}};
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(SortByCountReturnsGroupAndSort, ExpressionInObjectSpec) {
+    BSONObj spec = BSON("$sortByCount" << BSON("$floor"
+                                               << "$x"));
+    Value expectedGroupExplain =
+        Value{Document{{"_id", Document{{"$floor", Value{BSON_ARRAY("$x")}}}},
+                       {"count", Document{{"$sum", Document{{"$const", 1}}}}}}};
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+
+    spec = BSON("$sortByCount" << BSON("$eq" << BSON_ARRAY("$x" << 15)));
+    expectedGroupExplain =
+        Value{Document{{"_id", Document{{"$eq", Value{BSON_ARRAY("$x" << BSON("$const" << 15))}}}},
+                       {"count", Document{{"$sum", Document{{"$const", 1}}}}}}};
+    testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+/**
+ * Fixture to test error cases of the $sortByCount stage.
+ */
+class InvalidSortByCountSpec : public Mock::Base, public unittest::Test {
+public:
+    vector<intrusive_ptr<DocumentSource>> createSortByCount(BSONObj sortByCountSpec) {
+        auto specElem = sortByCountSpec.firstElement();
+        return DocumentSourceSortByCount::createFromBson(specElem, ctx());
+    }
+};
+
+TEST_F(InvalidSortByCountSpec, NonObjectNonStringSpec) {
+    BSONObj spec = BSON("$sortByCount" << 1);
+    ASSERT_THROWS_CODE(createSortByCount(spec), UserException, 40149);
+
+    spec = BSON("$sortByCount" << BSONNULL);
+    ASSERT_THROWS_CODE(createSortByCount(spec), UserException, 40149);
+}
+
+TEST_F(InvalidSortByCountSpec, NonExpressionInObjectSpec) {
+    BSONObj spec = BSON("$sortByCount" << BSON("field1"
+                                               << "$x"));
+    ASSERT_THROWS_CODE(createSortByCount(spec), UserException, 40147);
+}
+
+TEST_F(InvalidSortByCountSpec, NonFieldPathStringSpec) {
+    BSONObj spec = BSON("$sortByCount"
+                        << "test");
+    ASSERT_THROWS_CODE(createSortByCount(spec), UserException, 40148);
+}
+}  // namespace DocumentSourceSortByCount
+
+namespace DocumentSourceCount {
+using mongo::DocumentSourceCount;
+using mongo::DocumentSourceGroup;
+using mongo::DocumentSourceProject;
+using std::vector;
+using boost::intrusive_ptr;
+
+class CountReturnsGroupAndProjectStages : public Mock::Base, public unittest::Test {
+public:
+    void testCreateFromBsonResult(BSONObj countSpec) {
+        vector<intrusive_ptr<DocumentSource>> result =
+            DocumentSourceCount::createFromBson(countSpec.firstElement(), ctx());
+
+        ASSERT_EQUALS(result.size(), 2UL);
+
+        const auto* groupStage = dynamic_cast<DocumentSourceGroup*>(result[0].get());
+        ASSERT(groupStage);
+
+        const auto* projectStage = dynamic_cast<DocumentSourceProject*>(result[1].get());
+        ASSERT(projectStage);
+
+        const bool explain = true;
+        vector<Value> explainedStages;
+        groupStage->serializeToArray(explainedStages, explain);
+        projectStage->serializeToArray(explainedStages, explain);
+        ASSERT_EQUALS(explainedStages.size(), 2UL);
+
+        StringData countName = countSpec.firstElement().valueStringData();
+        Value expectedGroupExplain =
+            Value{Document{{"_id", Document{{"$const", BSONNULL}}},
+                           {countName, Document{{"$sum", Document{{"$const", 1}}}}}}};
+        auto groupExplain = explainedStages[0];
+        ASSERT_EQ(groupExplain["$group"], expectedGroupExplain);
+
+        Value expectedProjectExplain = Value{Document{{"_id", false}, {countName, true}}};
+        auto projectExplain = explainedStages[1];
+        ASSERT_EQ(projectExplain["$project"], expectedProjectExplain);
+    }
+};
+
+TEST_F(CountReturnsGroupAndProjectStages, ValidStringSpec) {
+    BSONObj spec = BSON("$count"
+                        << "myCount");
+    testCreateFromBsonResult(spec);
+
+    spec = BSON("$count"
+                << "quantity");
+    testCreateFromBsonResult(spec);
+}
+
+class InvalidCountSpec : public Mock::Base, public unittest::Test {
+public:
+    vector<intrusive_ptr<DocumentSource>> createCount(BSONObj countSpec) {
+        auto specElem = countSpec.firstElement();
+        return DocumentSourceCount::createFromBson(specElem, ctx());
+    }
+};
+
+TEST_F(InvalidCountSpec, NonStringSpec) {
+    BSONObj spec = BSON("$count" << 1);
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40156);
+
+    spec = BSON("$count" << BSON("field1"
+                                 << "test"));
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40156);
+}
+
+TEST_F(InvalidCountSpec, EmptyStringSpec) {
+    BSONObj spec = BSON("$count"
+                        << "");
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40157);
+}
+
+TEST_F(InvalidCountSpec, FieldPathSpec) {
+    BSONObj spec = BSON("$count"
+                        << "$x");
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40158);
+}
+
+TEST_F(InvalidCountSpec, EmbeddedNullByteSpec) {
+    BSONObj spec = BSON("$count"
+                        << "te\0st"_sd);
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40159);
+}
+
+TEST_F(InvalidCountSpec, PeriodInStringSpec) {
+    BSONObj spec = BSON("$count"
+                        << "test.string");
+    ASSERT_THROWS_CODE(createCount(spec), UserException, 40160);
+}
+}  // namespace DocumentSourceCount
 
 class All : public Suite {
 public:
@@ -2905,15 +3659,20 @@ public:
         add<DocumentSourceGroup::Dependencies>();
         add<DocumentSourceGroup::StringConstantIdAndAccumulatorExpressions>();
         add<DocumentSourceGroup::ArrayConstantAccumulatorExpression>();
-
-        add<DocumentSourceProject::Inclusion>();
-        add<DocumentSourceProject::Optimize>();
-        add<DocumentSourceProject::NonObjectSpec>();
-        add<DocumentSourceProject::EmptyObjectSpec>();
-        add<DocumentSourceProject::TopLevelDollar>();
-        add<DocumentSourceProject::InvalidSpec>();
-        add<DocumentSourceProject::TwoDocuments>();
-        add<DocumentSourceProject::Dependencies>();
+#if 0
+        // Disabled tests until SERVER-23318 is implemented.
+        add<DocumentSourceGroup::StreamingOptimization>();
+        add<DocumentSourceGroup::StreamingWithMultipleIdFields>();
+        add<DocumentSourceGroup::NoOptimizationIfMissingDoubleSort>();
+        add<DocumentSourceGroup::NoOptimizationWithRawRoot>();
+        add<DocumentSourceGroup::NoOptimizationIfUsingExpressions>();
+        add<DocumentSourceGroup::StreamingWithMultipleLevels>();
+        add<DocumentSourceGroup::StreamingWithConstant>();
+        add<DocumentSourceGroup::StreamingWithEmptyId>();
+        add<DocumentSourceGroup::StreamingWithRootSubfield>();
+        add<DocumentSourceGroup::StreamingWithConstantAndFieldPath>();
+        add<DocumentSourceGroup::StreamingWithFieldRepeated>();
+#endif
 
         add<DocumentSourceSort::Empty>();
         add<DocumentSourceSort::SingleValue>();
@@ -2936,6 +3695,7 @@ public:
         add<DocumentSourceSort::MissingObjectWithinArray>();
         add<DocumentSourceSort::ExtractArrayValues>();
         add<DocumentSourceSort::Dependencies>();
+        add<DocumentSourceSort::OutputSort>();
 
         add<DocumentSourceUnwind::Empty>();
         add<DocumentSourceUnwind::EmptyArray>();
@@ -2952,6 +3712,7 @@ public:
         add<DocumentSourceUnwind::SeveralDocuments>();
         add<DocumentSourceUnwind::SeveralMoreDocuments>();
         add<DocumentSourceUnwind::Dependencies>();
+        add<DocumentSourceUnwind::OutputSort>();
         add<DocumentSourceUnwind::IncludeArrayIndexSubObject>();
         add<DocumentSourceUnwind::IncludeArrayIndexOverrideExisting>();
         add<DocumentSourceUnwind::IncludeArrayIndexOverrideExistingNested>();
@@ -2959,12 +3720,17 @@ public:
         add<DocumentSourceUnwind::IncludeArrayIndexWithinUnwindPath>();
 
         add<DocumentSourceGeoNear::LimitCoalesce>();
+        add<DocumentSourceGeoNear::OutputSort>();
+
+        add<DocumentSourceLookUp::OutputSortTruncatesOnEquality>();
+        add<DocumentSourceLookUp::OutputSortTruncatesOnPrefix>();
 
         add<DocumentSourceMatch::RedactSafePortion>();
         add<DocumentSourceMatch::Coalesce>();
         add<DocumentSourceMatch::DependenciesOrExpression>();
         add<DocumentSourceMatch::DependenciesGTEExpression>();
         add<DocumentSourceMatch::DependenciesElemMatchExpression>();
+        add<DocumentSourceMatch::DependenciesElemMatchWithNoSubfield>();
         add<DocumentSourceMatch::DependenciesNotExpression>();
         add<DocumentSourceMatch::DependenciesNorExpression>();
         add<DocumentSourceMatch::DependenciesCommentExpression>();

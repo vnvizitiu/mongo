@@ -31,6 +31,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 
 #include "mongo/base/error_codes.h"
@@ -296,7 +298,7 @@ void WiredTigerSessionCache::releaseSession(WiredTigerSession* session) {
         delete session;
 
     if (_engine && _engine->haveDropsQueued())
-        _engine->dropAllQueued();
+        _engine->dropSomeQueuedIdents();
 }
 
 

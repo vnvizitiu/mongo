@@ -26,11 +26,11 @@
  *    it in the license file.
  */
 
+#include "mongo/db/geo/hash.h"
 #include "mongo/config.h"
 #include "mongo/db/field_parser.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/geo/hash.h"
 #include "mongo/db/geo/shapes.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
 
 #include <algorithm>  // for max()
@@ -471,10 +471,9 @@ GeoHash GeoHash::operator+(const std::string& s) const {
     return operator+(s.c_str());
 }
 
-/*
- * Keep the upper _bits*2 bits of _hash, clear the lower bits.
- * Maybe there's junk in there?  Not sure why this is done.
- */
+// Keep the most significant _bits*2 bits of _hash, clear the least significant bits. If shorter
+// than 64 bits, the hash occupies the higher order bits, so we ensure that the lower order bits are
+// zeroed.
 void GeoHash::clearUnusedBits() {
     // Left shift count should be less than 64
     if (_bits == 0) {
@@ -482,9 +481,8 @@ void GeoHash::clearUnusedBits() {
         return;
     }
 
-    static long long FULL = 0xFFFFFFFFFFFFFFFFLL;
-    long long mask = FULL << (64 - (_bits * 2));
-    _hash &= mask;
+    unsigned long long mask = (1LL << (64U - (_bits * 2U))) - 1LL;
+    _hash &= ~mask;
 }
 
 static void appendHashToBuilder(long long hash, BSONObjBuilder* builder, const char* fieldName) {
@@ -671,13 +669,19 @@ Status GeoHashConverter::parseParameters(const BSONObj& paramDoc,
     if (params->bits < 1 || params->bits > 32) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream() << "bits for hash must be > 0 and <= 32, "
-                                    << "but " << params->bits << " bits were specified");
+                                    << "but "
+                                    << params->bits
+                                    << " bits were specified");
     }
 
     if (params->min >= params->max) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream() << "region for hash must be valid and have positive area, "
-                                    << "but [" << params->min << ", " << params->max << "] "
+                                    << "but ["
+                                    << params->min
+                                    << ", "
+                                    << params->max
+                                    << "] "
                                     << "was specified");
     }
 
@@ -772,7 +776,8 @@ GeoHash GeoHashConverter::hash(const BSONObj& o, const BSONObj* src) const {
 GeoHash GeoHashConverter::hash(double x, double y) const {
     uassert(16433,
             str::stream() << "point not in interval of [ " << _params.min << ", " << _params.max
-                          << " ]" << causedBy(BSON_ARRAY(x << y).toString()),
+                          << " ]"
+                          << causedBy(BSON_ARRAY(x << y).toString()),
             x <= _params.max && x >= _params.min && y <= _params.max && y >= _params.min);
 
     return GeoHash(convertToHashScale(x), convertToHashScale(y), _params.bits);

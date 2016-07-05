@@ -22,7 +22,7 @@ var $config = (function() {
         },
 
         update: function update(db, collName) {
-            var res = db[collName].update({}, { $inc: { n: 1 } }, { multi: true });
+            var res = db[collName].update({}, {$inc: {n: 1}}, {multi: true});
             assertAlways.lte(0, res.nMatched, tojson(res));
             if (db.getMongo().writeMode() === 'commands') {
                 assertAlways.eq(res.nMatched, res.nModified, tojson(res));
@@ -31,10 +31,7 @@ var $config = (function() {
         }
     };
 
-    var transitions = {
-        insert: { insert: 0.2, update: 0.8 },
-        update: { insert: 0.2, update: 0.8 }
-    };
+    var transitions = {insert: {insert: 0.2, update: 0.8}, update: {insert: 0.2, update: 0.8}};
 
     return {
         threadCount: 5,

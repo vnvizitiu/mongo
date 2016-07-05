@@ -6,68 +6,88 @@
 // A restarted standalone will lose all data when using an ephemeral storage engine.
 // @tags: [requires_persistence]
 (function() {
-"use strict";
+    "use strict";
 
-var st = new ShardingTest({shards: 2});
+    /**
+     * Restarts the mongod backing the specified shard instance, without restarting the mongobridge.
+     */
+    function restartShard(shard, waitForConnect) {
+        MongoRunner.stopMongod(shard);
+        shard.restart = true;
+        shard.waitForConnect = waitForConnect;
+        MongoRunner.runMongod(shard);
+    }
 
-jsTestLog("Setting up initial data");
+    var st = new ShardingTest({shards: 2});
 
-for (var i = 0; i < 100; i++) {
-    assert.writeOK(st.s.getDB('test').foo.insert({_id:i}));
-}
+    jsTestLog("Setting up initial data");
 
-st.ensurePrimaryShard('test', 'shard0000');
+    for (var i = 0; i < 100; i++) {
+        assert.writeOK(st.s.getDB('test').foo.insert({_id: i}));
+    }
 
-st.adminCommand({enableSharding: 'test'});
-st.adminCommand({shardCollection: 'test.foo', key: {_id: 1}});
-st.adminCommand({split: 'test.foo', find: {_id: 50}});
-st.adminCommand({moveChunk: 'test.foo', find: {_id: 75}, to: 'shard0001'});
+    assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
+    st.ensurePrimaryShard('test', 'shard0000');
 
-// Make sure the pre-existing mongos already has the routing information loaded into memory
-assert.eq(100, st.s.getDB('test').foo.find().itcount());
+    assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.foo', key: {_id: 1}}));
+    assert.commandWorked(st.s0.adminCommand({split: 'test.foo', find: {_id: 50}}));
+    assert.commandWorked(
+        st.s0.adminCommand({moveChunk: 'test.foo', find: {_id: 75}, to: 'shard0001'}));
 
-jsTestLog("Shutting down all config servers");
-for (var i = 0; i < st._configServers.length; i++) {
-    st.stopConfigServer(i);
-}
+    // Make sure the pre-existing mongos already has the routing information loaded into memory
+    assert.eq(100, st.s.getDB('test').foo.find().itcount());
 
-jsTestLog("Starting a new mongos when there are no config servers up");
-var newMongosInfo = MongoRunner.runMongos({configdb: st._configDB, waitForConnect: false});
-// The new mongos won't accept any new connections, but it should stay up and continue trying
-// to contact the config servers to finish startup.
-assert.throws(function() { new Mongo(newMongosInfo.host); });
+    jsTestLog("Shutting down all config servers");
+    for (var i = 0; i < st._configServers.length; i++) {
+        st.stopConfigServer(i);
+    }
 
+    jsTestLog("Starting a new mongos when there are no config servers up");
+    var newMongosInfo = MongoRunner.runMongos({configdb: st._configDB, waitForConnect: false});
+    // The new mongos won't accept any new connections, but it should stay up and continue trying
+    // to contact the config servers to finish startup.
+    assert.throws(function() {
+        new Mongo(newMongosInfo.host);
+    });
 
-jsTestLog("Restarting a shard while there are no config servers up");
-MongoRunner.stopMongod(st.shard1);
-st.shard1.restart = true;
-MongoRunner.runMongod(st.shard1);
+    jsTestLog("Restarting a shard while there are no config servers up");
+    restartShard(st.shard1, false);
 
-jsTestLog("Queries should fail because the shard can't initialize sharding state");
-var error = assert.throws(function() {st.s.getDB('test').foo.find().itcount();});
-assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
+    jsTestLog("Queries should fail because the shard can't initialize sharding state");
+    var error = assert.throws(function() {
+        st.s.getDB('test').foo.find().itcount();
+    });
 
-jsTestLog("Restarting the config servers");
-for (var i = 0; i < st._configServers.length; i++) {
-    st.restartConfigServer(i);
-}
+    assert(ErrorCodes.ReplicaSetNotFound == error.code ||
+           ErrorCodes.ExceededTimeLimit == error.code || ErrorCodes.HostUnreachable == error.code);
 
-jsTestLog("Queries against the original mongos should work again");
-assert.eq(100, st.s.getDB('test').foo.find().itcount());
+    jsTestLog("Restarting the config servers");
+    for (var i = 0; i < st._configServers.length; i++) {
+        st.restartConfigServer(i);
+    }
 
-jsTestLog("Should now be possible to connect to the mongos that was started while the config "
-          + "servers were down");
-var mongos2 = null;
-assert.soon(function() {
-                try {
-                    mongos2 = new Mongo(newMongosInfo.host);
-                    return true;
-                } catch (e) {
-                    printjson(e);
-                    return false;
-                }
-            });
-assert.eq(100, mongos2.getDB('test').foo.find().itcount());
+    // TODO: SERVER-23192 - restart all shards and mongos because their replica set monitor has
+    // deemed the CSRS config server set as unusable.
+    restartShard(st.shard0, true);
+    restartShard(st.shard1, true);
+    st.restartMongos(0);
 
-st.stop();
+    jsTestLog("Queries against the original mongos should work again");
+    assert.eq(100, st.s.getDB('test').foo.find().itcount());
+
+    jsTestLog("Should now be possible to connect to the mongos that was started while the config " +
+              "servers were down");
+    var mongos2 = null;
+    assert.soon(function() {
+        try {
+            mongos2 = new Mongo(newMongosInfo.host);
+            return true;
+        } catch (e) {
+            printjson(e);
+            return false;
+        }
+    });
+    assert.eq(100, mongos2.getDB('test').foo.find().itcount());
+
+    st.stop();
 }());

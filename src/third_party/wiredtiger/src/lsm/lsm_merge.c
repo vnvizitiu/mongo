@@ -60,10 +60,11 @@ __lsm_merge_aggressive_update(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree)
 {
 	struct timespec now;
 	uint64_t msec_since_last_merge, msec_to_create_merge;
-	u_int new_aggressive;
+	uint32_t new_aggressive;
 
 	new_aggressive = 0;
 
+	WT_ASSERT(session, lsm_tree->merge_min != 0);
 	/*
 	 * If the tree is open read-only or we are compacting, be very
 	 * aggressive. Otherwise, we can spend a long time waiting for merges
@@ -124,8 +125,9 @@ __lsm_merge_aggressive_update(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree)
 
 	if (new_aggressive > lsm_tree->merge_aggressiveness) {
 		WT_RET(__wt_verbose(session, WT_VERB_LSM,
-		    "LSM merge %s got aggressive (old %u new %u), "
-		    "merge_min %d, %u / %" PRIu64,
+		    "LSM merge %s got aggressive "
+		    "(old %" PRIu32 " new %" PRIu32 "), "
+		    "merge_min %u, %" PRIu64 " / %" PRIu64,
 		    lsm_tree->name, lsm_tree->merge_aggressiveness,
 		    new_aggressive, lsm_tree->merge_min,
 		    msec_since_last_merge, lsm_tree->chunk_fill_ms));
@@ -150,15 +152,12 @@ __lsm_merge_span(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree,
 	u_int end_chunk, i, merge_max, merge_min, nchunks, start_chunk;
 	u_int oldest_gen, youngest_gen;
 
-	chunk_size = 0;
-	nchunks = 0;
-	record_count = 0;
-	chunk = youngest = NULL;
-
 	/* Clear the return parameters */
-	*start = 0;
-	*end = 0;
+	*start = *end = 0;
 	*records = 0;
+
+	chunk_size = 0;
+	chunk = youngest = NULL;
 
 	aggressive = lsm_tree->merge_aggressiveness;
 	merge_max = (aggressive > WT_LSM_AGGRESSIVE_THRESHOLD) ?
@@ -216,8 +215,8 @@ __lsm_merge_span(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree,
 	 */
 retry_find:
 	oldest_gen = youngest_gen = lsm_tree->chunk[end_chunk]->generation;
-	for (start_chunk = end_chunk + 1, record_count = 0;
-	    start_chunk > 0; ) {
+	for (record_count = 0,
+	    start_chunk = end_chunk + 1; start_chunk > 0;) {
 		chunk = lsm_tree->chunk[start_chunk - 1];
 		youngest = lsm_tree->chunk[end_chunk];
 		nchunks = (end_chunk + 1) - start_chunk;
@@ -304,14 +303,12 @@ retry_find:
 	}
 #endif
 
-	WT_ASSERT(session,
-	    nchunks == 0 || (chunk != NULL && youngest != NULL));
+	WT_ASSERT(session, nchunks == 0 || (chunk != NULL && youngest != NULL));
+
 	/*
-	 * Don't do merges that are too small or across too many
-	 * generations.
+	 * Don't do merges that are too small or across too many generations.
 	 */
-	if (nchunks < merge_min ||
-	    oldest_gen - youngest_gen > max_gap) {
+	if (nchunks < merge_min || oldest_gen - youngest_gen > max_gap) {
 		for (i = 0; i < nchunks; i++) {
 			chunk = lsm_tree->chunk[start_chunk + i];
 			WT_ASSERT(session,
@@ -363,7 +360,6 @@ __wt_lsm_merge(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree, u_int id)
 	bloom = NULL;
 	chunk = NULL;
 	dest = src = NULL;
-	start_id = 0;
 	created_chunk = create_bloom = locked = in_sync = false;
 
 	/* Fast path if it's obvious no merges could be done. */
@@ -410,7 +406,8 @@ __wt_lsm_merge(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree, u_int id)
 		    start_chunk, end_chunk, dest_id, record_count, generation));
 		for (verb = start_chunk; verb <= end_chunk; verb++)
 			WT_ERR(__wt_verbose(session, WT_VERB_LSM,
-			    "Merging %s: Chunk[%u] id %u, gen: %" PRIu32
+			    "Merging %s: Chunk[%u] id %" PRIu32
+			    ", gen: %" PRIu32
 			    ", size: %" PRIu64 ", records: %" PRIu64,
 			    lsm_tree->name, verb, lsm_tree->chunk[verb]->id,
 			    lsm_tree->chunk[verb]->generation,
@@ -460,7 +457,7 @@ __wt_lsm_merge(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree, u_int id)
 #define	LSM_MERGE_CHECK_INTERVAL	WT_THOUSAND
 	for (insert_count = 0; (ret = src->next(src)) == 0; insert_count++) {
 		if (insert_count % LSM_MERGE_CHECK_INTERVAL == 0) {
-			if (!F_ISSET(lsm_tree, WT_LSM_TREE_ACTIVE))
+			if (!lsm_tree->active)
 				WT_ERR(EINTR);
 
 			WT_STAT_FAST_CONN_INCRV(session,
@@ -482,7 +479,7 @@ __wt_lsm_merge(WT_SESSION_IMPL *session, WT_LSM_TREE *lsm_tree, u_int id)
 	    lsm_rows_merged, insert_count % LSM_MERGE_CHECK_INTERVAL);
 	++lsm_tree->merge_progressing;
 	WT_ERR(__wt_verbose(session, WT_VERB_LSM,
-	    "Bloom size for %" PRIu64 " has %" PRIu64 " items inserted.",
+	    "Bloom size for %" PRIu64 " has %" PRIu64 " items inserted",
 	    record_count, insert_count));
 
 	/*

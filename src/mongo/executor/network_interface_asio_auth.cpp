@@ -40,11 +40,11 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/factory.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/legacy_request_builder.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
@@ -61,6 +61,7 @@ void NetworkInterfaceASIO::_runIsMaster(AsyncOp* op) {
 
     BSONObjBuilder bob;
     bob.append("isMaster", 1);
+    bob.append("hangUpOnStepDown", false);
 
     if (Command::testCommandsEnabled) {
         // Only include the host:port of this process in the isMaster command request if test
@@ -90,6 +91,12 @@ void NetworkInterfaceASIO::_runIsMaster(AsyncOp* op) {
         }
 
         auto commandReply = std::move(swCommandReply.getValue());
+
+        // Ensure that the isMaster response is "ok:1".
+        auto commandStatus = getStatusFromCommandResult(commandReply.data);
+        if (!commandStatus.isOK()) {
+            return _completeOperation(op, commandStatus);
+        }
 
         auto protocolSet = rpc::parseProtocolSetFromIsMasterReply(commandReply.data);
         if (!protocolSet.isOK())
@@ -135,10 +142,9 @@ void NetworkInterfaceASIO::_runIsMaster(AsyncOp* op) {
 
     };
 
-    _asyncRunCommand(op,
-                     [this, op, parseIsMaster](std::error_code ec, size_t bytes) {
-                         _validateAndRun(op, ec, std::move(parseIsMaster));
-                     });
+    _asyncRunCommand(op, [this, op, parseIsMaster](std::error_code ec, size_t bytes) {
+        _validateAndRun(op, ec, std::move(parseIsMaster));
+    });
 }
 
 void NetworkInterfaceASIO::_authenticate(AsyncOp* op) {

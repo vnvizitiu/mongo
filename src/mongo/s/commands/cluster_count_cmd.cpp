@@ -31,9 +31,9 @@
 #include <vector>
 
 #include "mongo/db/commands.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/commands/cluster_explain.h"
+#include "mongo/s/commands/strategy.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -82,7 +82,8 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -100,6 +101,10 @@ public:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(
+            ErrorCodes::InvalidNamespace, "count command requires valid namespace", nss.isValid());
+
         long long skip = 0;
 
         if (cmdObj["skip"].isNumber()) {
@@ -113,11 +118,8 @@ public:
             return false;
         }
 
-        const string collection = cmdObj.firstElement().valuestrsafe();
-        const string fullns = dbname + "." + collection;
-
         BSONObjBuilder countCmdBuilder;
-        countCmdBuilder.append("count", collection);
+        countCmdBuilder.append("count", nss.coll());
 
         BSONObj filter;
         if (cmdObj["query"].isABSONObj()) {
@@ -142,7 +144,7 @@ public:
         }
 
         const std::initializer_list<StringData> passthroughFields = {
-            "hint", "$queryOptions", "readConcern", LiteParsedQuery::cmdOptionMaxTimeMS,
+            "$queryOptions", "collation", "hint", "readConcern", QueryRequest::cmdOptionMaxTimeMS,
         };
         for (auto name : passthroughFields) {
             if (auto field = cmdObj[name]) {
@@ -152,7 +154,7 @@ public:
 
         vector<Strategy::CommandResult> countResult;
         Strategy::commandOp(
-            txn, dbname, countCmdBuilder.done(), options, fullns, filter, &countResult);
+            txn, dbname, countCmdBuilder.done(), options, nss.ns(), filter, &countResult);
 
         long long total = 0;
         BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
@@ -160,16 +162,16 @@ public:
         for (vector<Strategy::CommandResult>::const_iterator iter = countResult.begin();
              iter != countResult.end();
              ++iter) {
-            const string& shardName = iter->shardTargetId;
+            const ShardId& shardName = iter->shardTargetId;
 
             if (iter->result["ok"].trueValue()) {
                 long long shardCount = iter->result["n"].numberLong();
 
-                shardSubTotal.appendNumber(shardName, shardCount);
+                shardSubTotal.appendNumber(shardName.toString(), shardCount);
                 total += shardCount;
             } else {
                 shardSubTotal.doneFast();
-                errmsg = "failed on : " + shardName;
+                errmsg = "failed on : " + shardName.toString();
                 result.append("cause", iter->result);
 
                 // Add "code" to the top-level response, if the failure of the sharded command
@@ -196,7 +198,11 @@ public:
                            ExplainCommon::Verbosity verbosity,
                            const rpc::ServerSelectionMetadata& serverSelectionMetadata,
                            BSONObjBuilder* out) const {
-        const string fullns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        if (!nss.isValid()) {
+            return Status{ErrorCodes::InvalidNamespace,
+                          str::stream() << "Invalid collection name: " << nss.ns()};
+        }
 
         // Extract the targeting query.
         BSONObj targetingQuery;
@@ -214,7 +220,7 @@ public:
 
         vector<Strategy::CommandResult> shardResults;
         Strategy::commandOp(
-            txn, dbname, explainCmdBob.obj(), options, fullns, targetingQuery, &shardResults);
+            txn, dbname, explainCmdBob.obj(), options, nss.ns(), targetingQuery, &shardResults);
 
         long long millisElapsed = timer.millis();
 

@@ -41,16 +41,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
-#include "mongo/util/concurrency/rwlock.h"
-#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
+#include "mongo/util/concurrency/rwlock.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -99,7 +97,7 @@ const int nthr = 135;
 #endif
 class MongoMutexTest : public ThreadedTest<nthr> {
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
-    enum { N = 2000 };
+    enum {N = 2000};
 #else
     enum { N = 4000 /*0*/ };
 #endif
@@ -119,7 +117,8 @@ private:
     virtual void subthread(int tnumber) {
         Client::initThread("mongomutextest");
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
 
         sleepmillis(0);
         for (int i = 0; i < N; i++) {
@@ -610,59 +609,6 @@ private:
     }
 };
 
-class CondSlack : public ThreadedTest<17> {
-    Notification n;
-
-public:
-    CondSlack() {
-        k = 0;
-        done = false;
-        a = b = 0;
-        locks = 0;
-    }
-
-private:
-    unsigned a, b;
-    virtual void validate() {
-        cout << "CondSlack useful work fraction: " << ((double)a) / b << " locks:" << locks << endl;
-    }
-    unsigned locks;
-    volatile int k;
-    void watch() {
-        while (1) {
-            b++;
-            if (k) {
-                a++;
-            }
-            sleepmillis(0);
-            if (done)
-                break;
-        }
-    }
-    volatile bool done;
-    virtual void subthread(int x) {
-        if (x == 1) {
-            n.notifyOne();
-            watch();
-            return;
-        }
-        Timer t;
-        while (1) {
-            n.waitToBeNotified();
-            verify(k == 0);
-            k = 1;
-            // not very long, we'd like to simulate about 100K locks per second
-            sleepalittle();
-            k = 0;
-            locks++;
-            n.notifyOne();
-            if (done || t.millis() > 1500)
-                break;
-        }
-        done = true;
-    }
-};
-
 const int WriteLocksAreGreedy_ThreadCount = 3;
 class WriteLocksAreGreedy : public ThreadedTest<WriteLocksAreGreedy_ThreadCount> {
 public:
@@ -778,7 +724,6 @@ public:
         // would have very little slack.
         add<Slack<SimpleMutex, stdx::lock_guard<SimpleMutex>>>();
         add<Slack<SimpleRWLock, SimpleRWLock::Exclusive>>();
-        add<CondSlack>();
 
         add<UpgradableTest>();
 

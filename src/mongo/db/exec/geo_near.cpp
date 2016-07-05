@@ -35,8 +35,9 @@
 #include "third_party/s2/s2regionintersection.h"
 
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/db/exec/index_scan.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/exec/fetch.h"
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/geoparser.h"
@@ -53,6 +54,8 @@ namespace mongo {
 
 using std::abs;
 using std::unique_ptr;
+
+namespace dps = ::mongo::dotted_path_support;
 
 //
 // Shared GeoNear search functionality
@@ -100,7 +103,7 @@ static void extractGeometries(const BSONObj& doc,
     BSONElementSet geomElements;
     // NOTE: Annoyingly, we cannot just expand arrays b/c single 2d points are arrays, we need
     // to manually expand all results to check if they are geometries
-    doc.getFieldsDotted(path, geomElements, false /* expand arrays */);
+    dps::extractAllElementsAlongPath(doc, path, geomElements, false /* expand arrays */);
 
     for (BSONElementSet::iterator it = geomElements.begin(); it != geomElements.end(); ++it) {
         const BSONElement& el = *it;
@@ -459,10 +462,10 @@ class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
     TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS), _annulus(annulus) {
-        initPath(twoDPath);
+        setPath(twoDPath);
     }
 
-    void toBSON(BSONObjBuilder* out) const final {
+    void serialize(BSONObjBuilder* out) const final {
         out->append("TwoDPtInAnnulusExpression", true);
     }
 
@@ -743,7 +746,13 @@ GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
     _specificStats.keyPattern = s2Index->keyPattern();
     _specificStats.indexName = s2Index->indexName();
     _specificStats.indexVersion = s2Index->version();
-    ExpressionParams::parse2dsphereParams(s2Index->infoObj(), &_indexParams);
+
+    // initialize2dsphereParams() does not require the collator during the GEO_NEAR_2DSPHERE stage.
+    // It only requires the collator for index key generation. For query execution,
+    // _nearParams.baseBounds should have collator-generated comparison keys in place of raw
+    // strings, and _nearParams.filter should have the collator.
+    const CollatorInterface* collator = nullptr;
+    ExpressionParams::initialize2dsphereParams(s2Index->infoObj(), collator, &_indexParams);
 }
 
 GeoNear2DSphereStage::~GeoNear2DSphereStage() {}

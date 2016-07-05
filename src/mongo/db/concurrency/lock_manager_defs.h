@@ -29,8 +29,8 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
 #include <limits>
+#include <string>
 
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
@@ -152,10 +152,13 @@ enum ResourceType {
     RESOURCE_GLOBAL,        // Used for mode changes or global exclusive operations
     RESOURCE_MMAPV1_FLUSH,  // Necessary only for the MMAPv1 engine
 
-    // Generic resources
+    // Generic resources, used for multi-granularity locking, together with RESOURCE_GLOBAL
     RESOURCE_DATABASE,
     RESOURCE_COLLECTION,
     RESOURCE_METADATA,
+
+    // Resource type used for locking general resources not related to the storage hierarchy.
+    RESOURCE_MUTEX,
 
     // Counts the rest. Always insert new resource types above this entry.
     ResourceTypesCount

@@ -43,11 +43,12 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/commands/cluster_commands_common.h"
 #include "mongo/s/config.h"
 #include "mongo/s/grid.h"
@@ -73,124 +74,75 @@ static const BSONObj kSortKeyMetaProjection = BSON("$meta"
 static const int kPerDocumentOverheadBytesUpperBound = 10;
 
 /**
- * Given the LiteParsedQuery 'lpq' being executed by mongos, returns a copy of the query which is
+ * Given the QueryRequest 'qr' being executed by mongos, returns a copy of the query which is
  * suitable for forwarding to the targeted hosts.
  */
-std::unique_ptr<LiteParsedQuery> transformQueryForShards(const LiteParsedQuery& lpq) {
+StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(const QueryRequest& qr) {
     // If there is a limit, we forward the sum of the limit and the skip.
     boost::optional<long long> newLimit;
-    if (lpq.getLimit()) {
-        newLimit = *lpq.getLimit() + lpq.getSkip().value_or(0);
+    if (qr.getLimit()) {
+        long long newLimitValue;
+        if (mongoSignedAddOverflow64(*qr.getLimit(), qr.getSkip().value_or(0), &newLimitValue)) {
+            return Status(
+                ErrorCodes::Overflow,
+                str::stream()
+                    << "sum of limit and skip cannot be represented as a 64-bit integer, limit: "
+                    << *qr.getLimit()
+                    << ", skip: "
+                    << qr.getSkip().value_or(0));
+        }
+        newLimit = newLimitValue;
     }
 
     // Similarly, if nToReturn is set, we forward the sum of nToReturn and the skip.
     boost::optional<long long> newNToReturn;
-    if (lpq.getNToReturn()) {
+    if (qr.getNToReturn()) {
         // !wantMore and ntoreturn mean the same as !wantMore and limit, so perform the conversion.
-        if (!lpq.wantMore()) {
-            newLimit = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+        if (!qr.wantMore()) {
+            long long newLimitValue;
+            if (mongoSignedAddOverflow64(
+                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newLimitValue)) {
+                return Status(ErrorCodes::Overflow,
+                              str::stream()
+                                  << "sum of ntoreturn and skip cannot be represented as a 64-bit "
+                                     "integer, ntoreturn: "
+                                  << *qr.getNToReturn()
+                                  << ", skip: "
+                                  << qr.getSkip().value_or(0));
+            }
+            newLimit = newLimitValue;
         } else {
-            newNToReturn = *lpq.getNToReturn() + lpq.getSkip().value_or(0);
+            long long newNToReturnValue;
+            if (mongoSignedAddOverflow64(
+                    *qr.getNToReturn(), qr.getSkip().value_or(0), &newNToReturnValue)) {
+                return Status(ErrorCodes::Overflow,
+                              str::stream()
+                                  << "sum of ntoreturn and skip cannot be represented as a 64-bit "
+                                     "integer, ntoreturn: "
+                                  << *qr.getNToReturn()
+                                  << ", skip: "
+                                  << qr.getSkip().value_or(0));
+            }
+            newNToReturn = newNToReturnValue;
         }
     }
 
     // If there is a sort other than $natural, we send a sortKey meta-projection to the remote node.
-    BSONObj newProjection = lpq.getProj();
-    if (!lpq.getSort().isEmpty() && !lpq.getSort()["$natural"]) {
+    BSONObj newProjection = qr.getProj();
+    if (!qr.getSort().isEmpty() && !qr.getSort()["$natural"]) {
         BSONObjBuilder projectionBuilder;
-        projectionBuilder.appendElements(lpq.getProj());
+        projectionBuilder.appendElements(qr.getProj());
         projectionBuilder.append(ClusterClientCursorParams::kSortKeyField, kSortKeyMetaProjection);
         newProjection = projectionBuilder.obj();
     }
 
-    return LiteParsedQuery::makeAsFindCmd(lpq.nss(),
-                                          lpq.getFilter(),
-                                          newProjection,
-                                          lpq.getSort(),
-                                          lpq.getHint(),
-                                          lpq.getReadConcern(),
-                                          boost::none,  // Don't forward skip.
-                                          newLimit,
-                                          lpq.getBatchSize(),
-                                          newNToReturn,
-                                          lpq.wantMore(),
-                                          lpq.isExplain(),
-                                          lpq.getComment(),
-                                          lpq.getMaxScan(),
-                                          lpq.getMaxTimeMS(),
-                                          lpq.getMin(),
-                                          lpq.getMax(),
-                                          lpq.returnKey(),
-                                          lpq.showRecordId(),
-                                          lpq.isSnapshot(),
-                                          lpq.hasReadPref(),
-                                          lpq.isTailable(),
-                                          lpq.isSlaveOk(),
-                                          lpq.isOplogReplay(),
-                                          lpq.isNoCursorTimeout(),
-                                          lpq.isAwaitData(),
-                                          lpq.isAllowPartialResults());
-}
-
-/**
- * Runs a find command against the "config" shard in SyncClusterConnection (SCCC) mode. Special
- * handling is required for SCCC since the config shard's NS targeter is only available if the
- * config servers are in CSRS mode.
- *
- * 'query' is the query to run against the config shard. 'shard' must represent the config shard.
- *
- * On success, fills out 'results' with the documents returned from the config shard and returns the
- * cursor id which should be handed back to the client.
- *
- * TODO: This should not be required for 3.4, since the config server mode must be config server
- * replica set (CSRS) in order to upgrade.
- */
-StatusWith<CursorId> runConfigServerQuerySCCC(const CanonicalQuery& query,
-                                              const Shard& shard,
-                                              std::vector<BSONObj>* results) {
-    BSONObj findCommand = query.getParsed().asFindCommand();
-
-    // XXX: This is a temporary hack. We use ScopedDbConnection and query the $cmd namespace
-    // explicitly because this gives us the particular host that the command ran on via
-    // originalHost(). We need to know the host that the remote cursor was established on in order
-    // to issue getMore or killCursors operations against this remote cursor.
-    ScopedDbConnection conn(shard.getConnString());
-    auto cursor = conn->query(str::stream() << query.nss().db() << ".$cmd",
-                              findCommand,
-                              -1,       // nToReturn
-                              0,        // nToSkip
-                              nullptr,  // fieldsToReturn
-                              0);       // options
-    if (!cursor || !cursor->more()) {
-        return {ErrorCodes::OperationFailed, "failed to run find command against config shard"};
-    }
-    BSONObj result = cursor->nextSafe().getOwned();
-    conn.done();
-
-    auto status = Command::getStatusFromCommandResult(result);
-    if (ErrorCodes::SendStaleConfig == status || ErrorCodes::RecvStaleConfig == status) {
-        throw RecvStaleConfigException("find command failed because of stale config", result);
-    }
-
-    auto executorPool = grid.shardRegistry()->getExecutorPool();
-    auto transformedResult = storePossibleCursor(HostAndPort(cursor->originalHost()),
-                                                 result,
-                                                 executorPool->getArbitraryExecutor(),
-                                                 grid.getCursorManager());
-    if (!transformedResult.isOK()) {
-        return transformedResult.getStatus();
-    }
-
-    auto outgoingCursorResponse = CursorResponse::parseFromBSON(transformedResult.getValue());
-    if (!outgoingCursorResponse.isOK()) {
-        return outgoingCursorResponse.getStatus();
-    }
-
-    for (const auto& doc : outgoingCursorResponse.getValue().getBatch()) {
-        results->push_back(doc.getOwned());
-    }
-
-    return outgoingCursorResponse.getValue().getCursorId();
+    auto newQR = stdx::make_unique<QueryRequest>(qr);
+    newQR->setProj(newProjection);
+    newQR->setSkip(boost::none);
+    newQR->setLimit(newLimit);
+    newQR->setNToReturn(newNToReturn);
+    invariantOK(newQR->validate());
+    return std::move(newQR);
 }
 
 StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
@@ -209,7 +161,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         invariant(chunkManager);
 
         std::set<ShardId> shardIds;
-        chunkManager->getShardIdsForQuery(txn, query.getParsed().getFilter(), &shardIds);
+        chunkManager->getShardIdsForQuery(txn, query.getQueryRequest().getFilter(), &shardIds);
 
         for (auto id : shardIds) {
             auto shard = shardRegistry->getShard(txn, id);
@@ -222,12 +174,12 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     }
 
     ClusterClientCursorParams params(query.nss(), readPref);
-    params.limit = query.getParsed().getLimit();
-    params.batchSize = query.getParsed().getEffectiveBatchSize();
-    params.skip = query.getParsed().getSkip();
-    params.isTailable = query.getParsed().isTailable();
-    params.isAwaitData = query.getParsed().isAwaitData();
-    params.isAllowPartialResults = query.getParsed().isAllowPartialResults();
+    params.limit = query.getQueryRequest().getLimit();
+    params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
+    params.skip = query.getQueryRequest().getSkip();
+    params.isTailable = query.getQueryRequest().isTailable();
+    params.isAwaitData = query.getQueryRequest().isAwaitData();
+    params.isAllowPartialResults = query.getQueryRequest().isAllowPartialResults();
 
     // This is the batchSize passed to each subsequent getMore command issued by the cursor. We
     // usually use the batchSize associated with the initial find, but as it is illegal to send a
@@ -239,37 +191,26 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     // $natural sort is actually a hint to use a collection scan, and shouldn't be treated like a
     // sort on mongos. Including a $natural anywhere in the sort spec results in the whole sort
     // being considered a hint to use a collection scan.
-    if (!query.getParsed().getSort().hasField("$natural")) {
-        params.sort = FindCommon::transformSortSpec(query.getParsed().getSort());
+    if (!query.getQueryRequest().getSort().hasField("$natural")) {
+        params.sort = FindCommon::transformSortSpec(query.getQueryRequest().getSort());
     }
 
     // Tailable cursors can't have a sort, which should have already been validated.
     invariant(params.sort.isEmpty() || !params.isTailable);
 
-    const auto lpqToForward = transformQueryForShards(query.getParsed());
+    const auto qrToForward = transformQueryForShards(query.getQueryRequest());
+    if (!qrToForward.isOK()) {
+        return qrToForward.getStatus();
+    }
 
     // Use read pref to target a particular host from each shard. Also construct the find command
     // that we will forward to each shard.
     for (const auto& shard : shards) {
-        // The unified targeting logic only works for config server replica sets, so we need special
-        // handling for querying config server content with legacy 3-host config servers.
-        if (shard->isConfig() && shard->getConnString().type() == ConnectionString::SYNC) {
-            invariant(shards.size() == 1U);
-            try {
-                return runConfigServerQuerySCCC(query, *shard, results);
-            } catch (const DBException& e) {
-                if (e.getCode() != ErrorCodes::IncompatibleCatalogManager) {
-                    throw;
-                }
-                grid.forwardingCatalogManager()->waitForCatalogManagerChange(txn);
-                // Fall through to normal code path now that the catalog manager mode has been
-                // swapped and the config servers are a normal replica set.
-            }
-        }
+        invariant(!shard->isConfig() || shard->getConnString().type() != ConnectionString::INVALID);
 
         // Build the find command, and attach shard version if necessary.
         BSONObjBuilder cmdBuilder;
-        lpqToForward->asFindCommand(&cmdBuilder);
+        qrToForward.getValue()->asFindCommand(&cmdBuilder);
 
         if (chunkManager) {
             ChunkVersion version(chunkManager->getVersion(shard->getId()));
@@ -283,11 +224,11 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     }
 
     auto ccc = ClusterClientCursorImpl::make(
-        shardRegistry->getExecutorPool()->getArbitraryExecutor(), std::move(params));
+        Grid::get(txn)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
     int bytesBuffered = 0;
-    while (!FindCommon::enoughForFirstBatch(query.getParsed(), results->size())) {
+    while (!FindCommon::enoughForFirstBatch(query.getQueryRequest(), results->size())) {
         auto next = ccc->next();
         if (!next.isOK()) {
             return next.getStatus();
@@ -317,7 +258,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
         results->push_back(std::move(*next.getValue()));
     }
 
-    if (!query.getParsed().wantMore() && !ccc->isTailable()) {
+    if (!query.getQueryRequest().wantMore() && !ccc->isTailable()) {
         cursorState = ClusterCursorManager::CursorState::Exhausted;
     }
 
@@ -331,7 +272,7 @@ StatusWith<CursorId> runQueryWithoutRetrying(OperationContext* txn,
     auto cursorManager = grid.getCursorManager();
     const auto cursorType = chunkManager ? ClusterCursorManager::CursorType::NamespaceSharded
                                          : ClusterCursorManager::CursorType::NamespaceNotSharded;
-    const auto cursorLifetime = query.getParsed().isNoCursorTimeout()
+    const auto cursorLifetime = query.getQueryRequest().isNoCursorTimeout()
         ? ClusterCursorManager::CursorLifetime::Immortal
         : ClusterCursorManager::CursorLifetime::Mortal;
     return cursorManager->registerCursor(
@@ -349,11 +290,12 @@ StatusWith<CursorId> ClusterFind::runQuery(OperationContext* txn,
     invariant(results);
 
     // Projection on the reserved sort key field is illegal in mongos.
-    if (query.getParsed().getProj().hasField(ClusterClientCursorParams::kSortKeyField)) {
+    if (query.getQueryRequest().getProj().hasField(ClusterClientCursorParams::kSortKeyField)) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Projection contains illegal field '"
                               << ClusterClientCursorParams::kSortKeyField
-                              << "': " << query.getParsed().getProj()};
+                              << "': "
+                              << query.getQueryRequest().getProj()};
     }
 
     auto dbConfig = grid.catalogCache()->getDatabase(txn, query.nss().db().toString());
@@ -475,14 +417,13 @@ StatusWith<ReadPreferenceSetting> ClusterFind::extractUnwrappedReadPref(const BS
                                                                         const bool isSlaveOk) {
     BSONElement queryOptionsElt;
     auto status = bsonExtractTypedField(
-        cmdObj, LiteParsedQuery::kUnwrappedReadPrefField, BSONType::Object, &queryOptionsElt);
+        cmdObj, QueryRequest::kUnwrappedReadPrefField, BSONType::Object, &queryOptionsElt);
     if (status.isOK()) {
         // There must be a nested object containing the read preference if there is a queryOptions
         // field.
         BSONObj queryOptionsObj = queryOptionsElt.Obj();
-        invariant(queryOptionsObj[LiteParsedQuery::kWrappedReadPrefField].type() ==
-                  BSONType::Object);
-        BSONObj readPrefObj = queryOptionsObj[LiteParsedQuery::kWrappedReadPrefField].Obj();
+        invariant(queryOptionsObj[QueryRequest::kWrappedReadPrefField].type() == BSONType::Object);
+        BSONObj readPrefObj = queryOptionsObj[QueryRequest::kWrappedReadPrefField].Obj();
 
         auto readPref = ReadPreferenceSetting::fromBSON(readPrefObj);
         if (!readPref.isOK()) {

@@ -49,7 +49,7 @@ public:
     virtual ~Locker() {}
 
     /**
-     * Require global lock attempts with obtain tickets from 'reading' (for MODE_S and MODE_IS),
+     * Require global lock attempts to obtain tickets from 'reading' (for MODE_S and MODE_IS),
      * and from 'writing' (for MODE_IX), which must have static lifetimes. There is no throttling
      * for MODE_X, as there can only ever be a single locker using this mode. The throttling is
      * intended to defend against arge drops in throughput under high load due to too much
@@ -82,7 +82,7 @@ public:
      *          shutdown, etc).
      *
      * This method can be called recursively, but each call to lockGlobal must be accompanied
-     * by a call to unlockAll.
+     * by a call to unlockGlobal.
      *
      * @param mode Mode in which the global lock should be acquired. Also indicates the intent
      *              of the operation.
@@ -111,7 +111,8 @@ public:
 
     /**
      * Decrements the reference count on the global lock.  If the reference count on the
-     * global lock hits zero, the transaction is over, and unlockAll unlocks all other locks.
+     * global lock hits zero, the transaction is over, and unlockGlobal unlocks all other locks
+     * except for RESOURCE_MUTEX locks.
      *
      * @return true if this is the last endTransaction call (i.e., the global lock was
      *          released); false if there are still references on the global lock. This value
@@ -119,7 +120,7 @@ public:
      *
      * @return false if the global lock is still held.
      */
-    virtual bool unlockAll() = 0;
+    virtual bool unlockGlobal() = 0;
 
     /**
      * This is only necessary for the MMAP V1 engine and in particular, the fsyncLock command
@@ -251,11 +252,12 @@ public:
     };
 
     /**
-     * Retrieves all locks held by this transaction, and what mode they're held in.
+     * Retrieves all locks held by this transaction, other than RESOURCE_MUTEX locks, and what mode
+     * they're held in.
      * Stores these locks in 'stateOut', destroying any previous state.  Unlocks all locks
-     * held by this transaction.  This functionality is used for yielding in the MMAPV1
-     * storage engine.  MMAPV1 uses voluntary/cooperative lock release and reacquisition
-     * in order to allow for interleaving of otherwise conflicting long-running operations.
+     * held by this transaction.  This functionality is used for yielding, which is
+     * voluntary/cooperative lock release and reacquisition in order to allow for interleaving
+     * of otherwise conflicting long-running operations.
      *
      * This functionality is also used for releasing locks on databases and collections
      * when cursors are dormant and waiting for a getMore request.
@@ -303,12 +305,6 @@ public:
     // Used for the replication parallel log op application threads
     virtual void setIsBatchWriter(bool newValue) = 0;
     virtual bool isBatchWriter() const = 0;
-
-    /**
-     * A string lock is MODE_X or MODE_S.
-     * These are incompatible with other locks and therefore are strong.
-     */
-    virtual bool hasStrongLocks() const = 0;
 
 protected:
     Locker() {}

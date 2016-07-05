@@ -28,12 +28,15 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include "mongo/base/disallow_copying.h"
+#include "mongo/base/string_data.h"
+#include "mongo/base/string_data_comparator_interface.h"
 #include "mongo/db/query/collation/collation_spec.h"
 
 namespace mongo {
-
-class StringData;
 
 /**
  * An interface for ordering and matching according to a collation. Instances should be retrieved
@@ -42,14 +45,45 @@ class StringData;
  * All methods are thread-safe.
  *
  * Does not throw exceptions.
- *
- * TODO SERVER-22738: Extend interface with a getComparisonKey() method and implement a
- * MongoDB-specific abstraction for a collator-generated comparison key.
  */
-class CollatorInterface {
+class CollatorInterface : public StringData::ComparatorInterface {
     MONGO_DISALLOW_COPYING(CollatorInterface);
 
 public:
+    /**
+     * Every string has a corresponding ComparisonKey with respect to this collator. Two
+     * ComparisonKeys can be lexicographically ordered in order to obtain the collation's sort order
+     * and equivalence classes.
+     *
+     * A ComparisonKey is logically an owned array of bytes. It is cheap to move but potentially
+     * expensive to copy.
+     *
+     * ComparisonKeys may only be obtained via CollatorInterface::getComparisonKey().
+     *
+     * In general, two strings should be compared with respect to a collation using
+     * CollatorInterface::compare(). ComparisonKey::compare() may be faster if repeatedly comparing
+     * the same string(s).
+     */
+    class ComparisonKey {
+    public:
+        /**
+         * Returns the underlying byte array represented by this ComparisonKey.
+         *
+         * The returned StringData may not outlive the ComparisonKey used to create it, since the
+         * ComparisonKey owns the underlying byte array.
+         */
+        StringData getKeyData() const {
+            return StringData(_key);
+        }
+
+    private:
+        friend class CollatorInterface;
+
+        ComparisonKey(std::string key) : _key(std::move(key)) {}
+
+        std::string _key;
+    };
+
     /**
      * Constructs a CollatorInterface capable of computing the collation described by 'spec'.
      */
@@ -57,12 +91,20 @@ public:
 
     virtual ~CollatorInterface() {}
 
+    virtual std::unique_ptr<CollatorInterface> clone() const = 0;
+
     /**
      * Returns a number < 0 if 'left' is less than 'right' with respect to the collation, a number >
      * 0 if 'left' is greater than 'right' w.r.t. the collation, and 0 if 'left' and 'right' are
      * equal w.r.t. the collation.
      */
-    virtual int compare(StringData left, StringData right) = 0;
+    virtual int compare(StringData left, StringData right) const = 0;
+
+    /**
+     * Returns the comparison key for 'stringData', according to this collation. See ComparisonKey's
+     * comments for details.
+     */
+    virtual ComparisonKey getComparisonKey(StringData stringData) const = 0;
 
     /**
      * Returns whether this collation has the same matching and sorting semantics as 'other'.
@@ -84,6 +126,24 @@ public:
      */
     const CollationSpec& getSpec() const {
         return _spec;
+    }
+
+    /**
+     * Returns true if lhs and rhs are both nullptr, or if they point to equivalent collators.
+     */
+    static bool collatorsMatch(const CollatorInterface* lhs, const CollatorInterface* rhs) {
+        if (lhs == nullptr && rhs == nullptr) {
+            return true;
+        }
+        if (lhs == nullptr || rhs == nullptr) {
+            return false;
+        }
+        return (*lhs == *rhs);
+    }
+
+protected:
+    static ComparisonKey makeComparisonKey(std::string key) {
+        return ComparisonKey(std::move(key));
     }
 
 private:

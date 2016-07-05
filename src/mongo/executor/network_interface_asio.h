@@ -43,8 +43,8 @@
 #include "mongo/base/system_error.h"
 #include "mongo/executor/async_stream_factory_interface.h"
 #include "mongo/executor/async_stream_interface.h"
-#include "mongo/executor/connection_pool.h"
 #include "mongo/executor/async_timer_interface.h"
+#include "mongo/executor/connection_pool.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/remote_command_request.h"
@@ -100,15 +100,6 @@ public:
     struct Options {
         Options();
 
-// Explicit move construction and assignment to support MSVC
-#if defined(_MSC_VER) && _MSC_VER < 1900
-        Options(Options&&);
-        Options& operator=(Options&&);
-#else
-        Options(Options&&) = default;
-        Options& operator=(Options&&) = default;
-#endif
-
         std::string instanceName = "NetworkInterfaceASIO";
         ConnectionPool::Options connectionPoolOptions;
         std::unique_ptr<AsyncTimerFactoryInterface> timerFactory;
@@ -120,24 +111,29 @@ public:
     NetworkInterfaceASIO(Options = Options());
 
     std::string getDiagnosticString() override;
+
+    uint64_t getNumCanceledOps();
+    uint64_t getNumFailedOps();
+    uint64_t getNumSucceededOps();
+    uint64_t getNumTimedOutOps();
+
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
     std::string getHostName() override;
     void startup() override;
     void shutdown() override;
+    bool inShutdown() const override;
     void waitForWork() override;
     void waitForWorkUntil(Date_t when) override;
     void signalWorkAvailable() override;
     Date_t now() override;
-    void startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                      const RemoteCommandRequest& request,
-                      const RemoteCommandCompletionFn& onFinish) override;
+    Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                        const RemoteCommandRequest& request,
+                        const RemoteCommandCompletionFn& onFinish) override;
     void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) override;
     void cancelAllCommands() override;
-    void setAlarm(Date_t when, const stdx::function<void()>& action) override;
+    Status setAlarm(Date_t when, const stdx::function<void()>& action) override;
 
     bool onNetworkThread() override;
-
-    bool inShutdown() const;
 
 private:
     using ResponseStatus = TaskExecutor::ResponseStatus;
@@ -163,15 +159,6 @@ private:
         rpc::ProtocolSet serverProtocols() const;
         rpc::ProtocolSet clientProtocols() const;
         void setServerProtocols(rpc::ProtocolSet protocols);
-
-// Explicit move construction and assignment to support MSVC
-#if defined(_MSC_VER) && _MSC_VER < 1900
-        AsyncConnection(AsyncConnection&&);
-        AsyncConnection& operator=(AsyncConnection&&);
-#else
-        AsyncConnection(AsyncConnection&&) = default;
-        AsyncConnection& operator=(AsyncConnection&&) = default;
-#endif
 
     private:
         std::unique_ptr<AsyncStreamInterface> _stream;
@@ -245,6 +232,7 @@ private:
      */
     class AsyncOp {
         friend class NetworkInterfaceASIO;
+        friend class connection_pool_asio::ASIOConnection;
 
     public:
         /**
@@ -350,6 +338,8 @@ private:
     private:
         // Type to represent the internal id of this request.
         using AsyncOpId = uint64_t;
+
+        static const TableRow kFieldLabels;
 
         // Return string representation of a given state.
         std::string _stateToString(State state) const;
@@ -503,6 +493,12 @@ private:
     stdx::mutex _inProgressMutex;
     std::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
     std::unordered_set<TaskExecutor::CallbackHandle> _inGetConnection;
+
+    // Operation counters
+    AtomicUInt64 _numCanceledOps;
+    AtomicUInt64 _numFailedOps;  // includes timed out ops but does not include canceled ops
+    AtomicUInt64 _numSucceededOps;
+    AtomicUInt64 _numTimedOutOps;
 
     stdx::mutex _executorMutex;
     bool _isExecutorRunnable;

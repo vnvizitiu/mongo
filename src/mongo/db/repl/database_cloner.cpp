@@ -37,8 +37,11 @@
 #include <set>
 
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -96,7 +99,8 @@ DatabaseCloner::DatabaseCloner(ReplicationExecutor* executor,
                                          this,
                                          stdx::placeholders::_1,
                                          stdx::placeholders::_2,
-                                         stdx::placeholders::_3)),
+                                         stdx::placeholders::_3),
+                              rpc::ServerSelectionMetadata(true, boost::none).toBSON()),
       _scheduleDbWorkFn([this](const ReplicationExecutor::CallbackFn& work) {
           return _executor->scheduleDBWork(work);
       }),
@@ -218,16 +222,17 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
     for (auto&& info : _collectionInfos) {
         BSONElement nameElement = info.getField(kNameFieldName);
         if (nameElement.eoo()) {
-            _finishCallback(Status(ErrorCodes::FailedToParse,
-                                   str::stream() << "collection info must contain '"
-                                                 << kNameFieldName << "' "
-                                                 << "field : " << info));
+            _finishCallback(
+                Status(ErrorCodes::FailedToParse,
+                       str::stream() << "collection info must contain '" << kNameFieldName << "' "
+                                     << "field : "
+                                     << info));
             return;
         }
         if (nameElement.type() != mongo::String) {
-            _finishCallback(Status(ErrorCodes::TypeMismatch,
-                                   str::stream() << "'" << kNameFieldName
-                                                 << "' field must be a string: " << info));
+            _finishCallback(Status(
+                ErrorCodes::TypeMismatch,
+                str::stream() << "'" << kNameFieldName << "' field must be a string: " << info));
             return;
         }
         const std::string collectionName = nameElement.String();
@@ -235,22 +240,27 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
             _finishCallback(Status(ErrorCodes::DuplicateKey,
                                    str::stream()
                                        << "collection info contains duplicate collection name "
-                                       << "'" << collectionName << "': " << info));
+                                       << "'"
+                                       << collectionName
+                                       << "': "
+                                       << info));
             return;
         }
 
         BSONElement optionsElement = info.getField(kOptionsFieldName);
         if (optionsElement.eoo()) {
-            _finishCallback(Status(ErrorCodes::FailedToParse,
-                                   str::stream() << "collection info must contain '"
-                                                 << kOptionsFieldName << "' "
-                                                 << "field : " << info));
+            _finishCallback(Status(
+                ErrorCodes::FailedToParse,
+                str::stream() << "collection info must contain '" << kOptionsFieldName << "' "
+                              << "field : "
+                              << info));
             return;
         }
         if (!optionsElement.isABSONObj()) {
             _finishCallback(Status(ErrorCodes::TypeMismatch,
                                    str::stream() << "'" << kOptionsFieldName
-                                                 << "' field must be an object: " << info));
+                                                 << "' field must be an object: "
+                                                 << info));
             return;
         }
         const BSONObj optionsObj = optionsElement.Obj();

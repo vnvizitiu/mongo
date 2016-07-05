@@ -1,9 +1,12 @@
 # DO NOT EDIT: automatically built by dist/stat.py. */
 
 no_scale_per_second_list = [
+    'async: current work queue length',
     'async: maximum work queue length',
     'cache: bytes currently in the cache',
     'cache: eviction currently operating in aggressive mode',
+    'cache: files with active eviction walks',
+    'cache: hazard pointer maximum array length',
     'cache: maximum bytes configured',
     'cache: maximum page size at eviction',
     'cache: pages currently held in the cache',
@@ -25,6 +28,9 @@ no_scale_per_second_list = [
     'reconciliation: split objects currently awaiting free',
     'session: open cursor count',
     'session: open session count',
+    'thread-state: active filesystem fsync calls',
+    'thread-state: active filesystem read calls',
+    'thread-state: active filesystem write calls',
     'transaction: transaction checkpoint currently running',
     'transaction: transaction checkpoint generation',
     'transaction: transaction checkpoint max time (msecs)',
@@ -36,6 +42,7 @@ no_scale_per_second_list = [
     'transaction: transaction range of IDs currently pinned by named snapshots',
     'block-manager: checkpoint size',
     'block-manager: file allocation unit size',
+    'block-manager: file bytes available for reuse',
     'block-manager: file magic number',
     'block-manager: file major version number',
     'block-manager: file size in bytes',
@@ -69,6 +76,7 @@ no_clear_list = [
     'async: maximum work queue length',
     'cache: bytes currently in the cache',
     'cache: eviction currently operating in aggressive mode',
+    'cache: files with active eviction walks',
     'cache: maximum bytes configured',
     'cache: maximum page size at eviction',
     'cache: pages currently held in the cache',
@@ -90,6 +98,9 @@ no_clear_list = [
     'reconciliation: split objects currently awaiting free',
     'session: open cursor count',
     'session: open session count',
+    'thread-state: active filesystem fsync calls',
+    'thread-state: active filesystem read calls',
+    'thread-state: active filesystem write calls',
     'transaction: transaction checkpoint currently running',
     'transaction: transaction checkpoint generation',
     'transaction: transaction checkpoint max time (msecs)',
@@ -116,6 +127,7 @@ prefix_list = [
     'thread-yield',
     'async',
     'btree',
+    'thread-state',
     'compression',
 ]
-groups = {'cursor': ['cursor', 'session'], 'lsm': ['LSM', 'transaction'], 'system': ['connection', 'data-handle', 'session'], 'evict': ['cache', 'connection', 'block-manager'], 'memory': ['cache', 'connection', 'reconciliation']}
+groups = {'cursor': ['cursor', 'session'], 'lsm': ['LSM', 'transaction'], 'system': ['connection', 'data-handle', 'session', 'thread-state'], 'evict': ['block-manager', 'cache', 'connection', 'thread-state'], 'memory': ['cache', 'connection', 'reconciliation']}

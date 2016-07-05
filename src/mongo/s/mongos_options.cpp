@@ -42,7 +42,6 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
-#include "mongo/s/chunk.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -82,14 +81,11 @@ Status addMongosOptions(moe::OptionSection* options) {
 
     moe::OptionSection sharding_options("Sharding options");
 
-    sharding_options.addOptionChaining(
-        "sharding.configDB",
-        "configdb",
-        moe::String,
-        "Connection string for communicating with config servers. Acceptable forms:\n"
-        "CSRS: <config replset name>/<host1:port>,<host2:port>,[...]\n"
-        "SCCC (deprecated): <host1:port>,<host2:port>,<host3:port>\n"
-        "Single-node (for testing only): <host1:port>");
+    sharding_options.addOptionChaining("sharding.configDB",
+                                       "configdb",
+                                       moe::String,
+                                       "Connection string for communicating with config servers:\n"
+                                       "<config replset name>/<host1:port>,<host2:port>,[...]");
 
     sharding_options.addOptionChaining(
         "replication.localPingThresholdMs",
@@ -103,14 +99,15 @@ Status addMongosOptions(moe::OptionSection* options) {
     sharding_options.addOptionChaining(
         "sharding.chunkSize", "chunkSize", moe::Int, "maximum amount of data per chunk");
 
-    sharding_options.addOptionChaining("net.http.JSONPEnabled",
-                                       "jsonp",
-                                       moe::Switch,
-                                       "allow JSONP access via http (has security implications)")
+    sharding_options
+        .addOptionChaining("net.http.JSONPEnabled",
+                           "jsonp",
+                           moe::Switch,
+                           "allow JSONP access via http (has security implications)")
         .setSources(moe::SourceAllLegacy);
 
-    sharding_options.addOptionChaining(
-                         "noscripting", "noscripting", moe::Switch, "disable scripting engine")
+    sharding_options
+        .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
         .setSources(moe::SourceAllLegacy);
 
 
@@ -126,15 +123,14 @@ Status addMongosOptions(moe::OptionSection* options) {
     options->addSection(ssl_options);
 #endif
 
-    options->addOptionChaining("noAutoSplit",
-                               "noAutoSplit",
-                               moe::Switch,
-                               "do not send split commands with writes")
+    options
+        ->addOptionChaining(
+            "noAutoSplit", "noAutoSplit", moe::Switch, "do not send split commands with writes")
         .hidden()
         .setSources(moe::SourceAllLegacy);
 
-    options->addOptionChaining(
-                 "sharding.autoSplit", "", moe::Bool, "send split commands with writes")
+    options
+        ->addOptionChaining("sharding.autoSplit", "", moe::Bool, "send split commands with writes")
         .setSources(moe::SourceYAMLConfig);
 
 
@@ -210,19 +206,6 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
         return ret;
     }
 
-    if (params.count("sharding.chunkSize")) {
-        int csize = params["sharding.chunkSize"].as<int>();
-
-        // validate chunksize before proceeding
-        if (csize == 0) {
-            return Status(ErrorCodes::BadValue, "error: need a non-zero chunksize");
-        }
-
-        if (!Chunk::setMaxChunkSizeSizeMB(csize)) {
-            return Status(ErrorCodes::BadValue, "MaxChunkSize invalid");
-        }
-    }
-
     if (params.count("net.port")) {
         int port = params["net.port"].as<int>();
         if (port <= 0 || port > 65535) {
@@ -244,8 +227,8 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
     }
 
     if (params.count("sharding.autoSplit")) {
-        Chunk::ShouldAutoSplit = params["sharding.autoSplit"].as<bool>();
-        if (Chunk::ShouldAutoSplit == false) {
+        mongosGlobalParams.shouldAutoSplit = params["sharding.autoSplit"].as<bool>();
+        if (!mongosGlobalParams.shouldAutoSplit) {
             warning() << "running with auto-splitting disabled";
         }
     }
@@ -254,41 +237,32 @@ Status storeMongosOptions(const moe::Environment& params, const std::vector<std:
         return Status(ErrorCodes::BadValue, "error: no args for --configdb");
     }
 
-    {
-        std::string configdbString = params["sharding.configDB"].as<std::string>();
+    std::string configdbString = params["sharding.configDB"].as<std::string>();
 
-        auto configdbConnectionString = ConnectionString::parse(configdbString);
-        if (!configdbConnectionString.isOK()) {
-            return Status(ErrorCodes::BadValue,
-                          str::stream() << "Invalid configdb connection string: "
-                                        << configdbConnectionString.getStatus().toString());
-        }
-
-        std::vector<HostAndPort> seedServers;
-        for (const auto& host : configdbConnectionString.getValue().getServers()) {
-            seedServers.push_back(host);
-            if (!seedServers.back().hasPort()) {
-                seedServers.back() = HostAndPort{host.host(), ServerGlobalParams::ConfigServerPort};
-            }
-        }
-
-        mongosGlobalParams.configdbs =
-            ConnectionString{configdbConnectionString.getValue().type(),
-                             seedServers,
-                             configdbConnectionString.getValue().getSetName()};
+    auto configdbConnectionString = ConnectionString::parse(configdbString);
+    if (!configdbConnectionString.isOK()) {
+        return configdbConnectionString.getStatus();
     }
 
-    std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
-
-    if (mongosGlobalParams.configdbs.type() != ConnectionString::SYNC &&
-        mongosGlobalParams.configdbs.type() != ConnectionString::SET &&
-        mongosGlobalParams.configdbs.type() != ConnectionString::MASTER) {
+    if (configdbConnectionString.getValue().type() != ConnectionString::SET) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Invalid config server value "
-                                    << mongosGlobalParams.configdbs.toString());
+                      str::stream() << "configdb supports only replica set connection string");
     }
 
-    if (configServers.size() < 3) {
+    std::vector<HostAndPort> seedServers;
+    for (const auto& host : configdbConnectionString.getValue().getServers()) {
+        seedServers.push_back(host);
+        if (!seedServers.back().hasPort()) {
+            seedServers.back() = HostAndPort{host.host(), ServerGlobalParams::ConfigServerPort};
+        }
+    }
+
+    mongosGlobalParams.configdbs =
+        ConnectionString{configdbConnectionString.getValue().type(),
+                         seedServers,
+                         configdbConnectionString.getValue().getSetName()};
+
+    if (mongosGlobalParams.configdbs.getServers().size() < 3) {
         warning() << "Running a sharded cluster with fewer than 3 config servers should only be "
                      "done for testing purposes and is not recommended for production.";
     }

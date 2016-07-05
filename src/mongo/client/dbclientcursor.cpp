@@ -43,6 +43,7 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -177,16 +178,6 @@ bool DBClientCursor::initLazyFinish(bool& retry) {
     dataReceived(retry, _lazyHost);
 
     return !retry;
-}
-
-bool DBClientCursor::initCommand() {
-    BSONObj res;
-
-    bool ok = _client->runCommand(nsGetDB(ns), query, res, opts);
-    replyToQuery(0, batch.m, res);
-    dataReceived();
-
-    return ok;
 }
 
 void DBClientCursor::requestMore() {
@@ -432,8 +423,7 @@ void DBClientCursor::attach(AScopedConnection* conn) {
     verify(conn);
     verify(conn->get());
 
-    if (conn->get()->type() == ConnectionString::SET ||
-        conn->get()->type() == ConnectionString::SYNC) {
+    if (conn->get()->type() == ConnectionString::SET) {
         if (_lazyHost.size() > 0)
             _scopedHost = _lazyHost;
         else if (_client)

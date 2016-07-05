@@ -32,7 +32,8 @@ GLOBAL g;
 
 static int  handle_error(WT_EVENT_HANDLER *, WT_SESSION *, int, const char *);
 static int  handle_message(WT_EVENT_HANDLER *, WT_SESSION *, const char *);
-static void onint(int);
+static void onint(int)
+    WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static int  cleanup(void);
 static int  usage(void);
 static int  wt_connect(const char *);
@@ -61,8 +62,7 @@ main(int argc, char *argv[])
 	working_dir = NULL;
 	ttype = MIX;
 	g.checkpoint_name = "WiredTigerCheckpoint";
-	if ((g.home = malloc(512)) == NULL)
-		testutil_die(ENOMEM, "Unable to allocate memory");
+	g.home = dmalloc(512);
 	g.nkeys = 10000;
 	g.nops = 100000;
 	g.ntables = 3;
@@ -136,7 +136,7 @@ main(int argc, char *argv[])
 
 	printf("%s: process %" PRIu64 "\n", g.progname, (uint64_t)getpid());
 	for (cnt = 1; (runs == 0 || cnt <= runs) && g.status == 0; ++cnt) {
-		printf("    %d: %u workers, %u tables\n",
+		printf("    %d: %d workers, %d tables\n",
 		    cnt, g.nworkers, g.ntables);
 
 		(void)cleanup();		/* Clean up previous runs */

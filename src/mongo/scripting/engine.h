@@ -29,8 +29,8 @@
 
 #pragma once
 
-#include "mongo/db/service_context.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
@@ -292,8 +292,6 @@ private:
 void installGlobalUtils(Scope& scope);
 bool hasJSReturn(const std::string& s);
 const char* jsSkipWhiteSpace(const char* raw);
-
-DBClientBase* createDirectClient(OperationContext* txn);
 
 extern ScriptEngine* globalScriptEngine;
 }

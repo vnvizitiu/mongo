@@ -105,7 +105,7 @@ public:
     void help(stringstream& h) const {
         h << "internal";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -363,7 +363,7 @@ public:
     void help(stringstream& h) const {
         h << "de-authenticate";
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     CmdLogout() : Command("logout") {}

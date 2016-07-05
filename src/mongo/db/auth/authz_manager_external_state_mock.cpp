@@ -77,7 +77,8 @@ void addPrivilegeObjectsOrWarningsToArrayElement(mutablebson::Element privileges
                         std::string(mongoutils::str::stream()
                                     << "Skipped privileges on resource "
                                     << privileges[i].getResourcePattern().toString()
-                                    << ". Reason: " << errmsg)));
+                                    << ". Reason: "
+                                    << errmsg)));
         }
     }
 }
@@ -204,7 +205,7 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* txn,
         if (query.hasField("_id")) {
             document.root().appendElement(query["_id"]);
         }
-        status = driver.populateDocumentWithQueryFields(query, NULL, document);
+        status = driver.populateDocumentWithQueryFields(txn, query, NULL, document);
         if (!status.isOK()) {
             return status;
         }
@@ -274,8 +275,9 @@ Status AuthzManagerExternalStateMock::_queryVector(
     const NamespaceString& collectionName,
     const BSONObj& query,
     std::vector<BSONObjCollection::iterator>* result) {
+    CollatorInterface* collator = nullptr;
     StatusWithMatchExpression parseResult =
-        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions());
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
     if (!parseResult.isOK()) {
         return parseResult.getStatus();
     }

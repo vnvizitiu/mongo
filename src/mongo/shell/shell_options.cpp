@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/shell/shell_options.h"
@@ -42,8 +44,8 @@
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/version.h"
@@ -82,14 +84,15 @@ Status addMongoShellOptions(moe::OptionSection* options) {
     authenticationOptions.addOptionChaining(
         "username", "username,u", moe::String, "username for authentication");
 
-    authenticationOptions.addOptionChaining(
-                              "password", "password,p", moe::String, "password for authentication")
+    authenticationOptions
+        .addOptionChaining("password", "password,p", moe::String, "password for authentication")
         .setImplicit(moe::Value(std::string("")));
 
-    authenticationOptions.addOptionChaining("authenticationDatabase",
-                                            "authenticationDatabase",
-                                            moe::String,
-                                            "user source (defaults to dbname)")
+    authenticationOptions
+        .addOptionChaining("authenticationDatabase",
+                           "authenticationDatabase",
+                           moe::String,
+                           "user source (defaults to dbname)")
         .setDefault(moe::Value(std::string("")));
 
     authenticationOptions.addOptionChaining("authenticationMechanism",
@@ -97,11 +100,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                                             moe::String,
                                             "authentication mechanism");
 
-    authenticationOptions.addOptionChaining(
-                              "gssapiServiceName",
-                              "gssapiServiceName",
-                              moe::String,
-                              "Service name to use when authenticating using GSSAPI/Kerberos")
+    authenticationOptions
+        .addOptionChaining("gssapiServiceName",
+                           "gssapiServiceName",
+                           moe::String,
+                           "Service name to use when authenticating using GSSAPI/Kerberos")
         .setDefault(moe::Value(std::string(saslDefaultServiceName)));
 
     authenticationOptions.addOptionChaining(
@@ -126,10 +129,12 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                                moe::Switch,
                                "disable the Javascript Just In Time compiler");
 
-    options->addOptionChaining("enableJavaScriptProtection",
-                               "enableJavaScriptProtection",
-                               moe::Switch,
-                               "disable automatic JavaScript function marshalling");
+    options
+        ->addOptionChaining("disableJavaScriptProtection",
+                            "disableJavaScriptProtection",
+                            moe::Switch,
+                            "allow automatic JavaScript function marshalling")
+        .incompatibleWith("enableJavaScriptProtection");
 
     Status ret = Status::OK();
 #ifdef MONGO_CONFIG_SSL
@@ -138,6 +143,14 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         return ret;
     }
 #endif
+
+    options
+        ->addOptionChaining("enableJavaScriptProtection",
+                            "enableJavaScriptProtection",
+                            moe::Switch,
+                            "disable automatic JavaScript function marshalling (defaults to true)")
+        .hidden()
+        .incompatibleWith("disableJavaScriptProtection");
 
     options->addOptionChaining("dbaddress", "dbaddress", moe::String, "dbaddress")
         .hidden()
@@ -154,27 +167,33 @@ Status addMongoShellOptions(moe::OptionSection* options) {
     // for testing, will kill op without prompting
     options->addOptionChaining("autokillop", "autokillop", moe::Switch, "autokillop").hidden();
 
-    options->addOptionChaining("useLegacyWriteOps",
-                               "useLegacyWriteOps",
-                               moe::Switch,
-                               "use legacy write ops instead of write commands").hidden();
+    options
+        ->addOptionChaining("useLegacyWriteOps",
+                            "useLegacyWriteOps",
+                            moe::Switch,
+                            "use legacy write ops instead of write commands")
+        .hidden();
 
-    options->addOptionChaining("writeMode",
-                               "writeMode",
-                               moe::String,
-                               "mode to determine how writes are done:"
-                               " commands, compatibility, legacy").hidden();
+    options
+        ->addOptionChaining("writeMode",
+                            "writeMode",
+                            moe::String,
+                            "mode to determine how writes are done:"
+                            " commands, compatibility, legacy")
+        .hidden();
 
-    options->addOptionChaining("readMode",
-                               "readMode",
-                               moe::String,
-                               "mode to determine how .find() queries are done:"
-                               " commands, compatibility, legacy").hidden();
+    options
+        ->addOptionChaining("readMode",
+                            "readMode",
+                            moe::String,
+                            "mode to determine how .find() queries are done:"
+                            " commands, compatibility, legacy")
+        .hidden();
 
-    options->addOptionChaining("rpcProtocols",
-                               "rpcProtocols",
-                               moe::String,
-                               " none, opQueryOnly, opCommandOnly, all").hidden();
+    options
+        ->addOptionChaining(
+            "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opCommandOnly, all")
+        .hidden();
 
     return Status::OK();
 }
@@ -267,8 +286,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("nodb")) {
         shellGlobalParams.nodb = true;
     }
-    if (params.count("enableJavaScriptProtection")) {
-        shellGlobalParams.javascriptProtection = true;
+    if (params.count("disableJavaScriptProtection")) {
+        shellGlobalParams.javascriptProtection = false;
     }
     if (params.count("norc")) {
         shellGlobalParams.norc = true;
@@ -302,7 +321,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
             throw MsgAssertionException(
                 17397,
                 mongoutils::str::stream()
-                    << "Unknown readMode option: '" << mode
+                    << "Unknown readMode option: '"
+                    << mode
                     << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
@@ -380,16 +400,6 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::InvalidOptions, sb.str());
     }
 
-    return Status::OK();
-}
-
-Status validateMongoShellOptions(const moe::Environment& params) {
-#ifdef MONGO_CONFIG_SSL
-    Status ret = validateSSLMongoShellOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
     return Status::OK();
 }
 }

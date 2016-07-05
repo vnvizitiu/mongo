@@ -38,6 +38,8 @@
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/balancer/balancer.h"
+#include "mongo/s/balancer/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_connection.h"
@@ -68,8 +70,8 @@ public:
         return true;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual void help(std::stringstream& help) const {
@@ -102,8 +104,6 @@ public:
                      int options,
                      std::string& errmsg,
                      BSONObjBuilder& result) {
-        ShardConnection::sync();
-
         Timer t;
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
@@ -111,11 +111,6 @@ public:
         std::shared_ptr<DBConfig> config;
 
         {
-            if (nss.size() == 0) {
-                return appendCommandStatus(
-                    result, Status(ErrorCodes::InvalidNamespace, "no namespace specified"));
-            }
-
             auto status = grid.catalogCache()->getDatabase(txn, nss.db().toString());
             if (!status.isOK()) {
                 return appendCommandStatus(result, status.getStatus());
@@ -134,7 +129,7 @@ public:
             }
         }
 
-        string toString = cmdObj["to"].valuestrsafe();
+        const string toString = cmdObj["to"].valuestrsafe();
         if (!toString.size()) {
             errmsg = "you have to specify where you want to move the chunk";
             return false;
@@ -143,7 +138,8 @@ public:
         const auto to = grid.shardRegistry()->getShard(txn, toString);
         if (!to) {
             string msg(str::stream() << "Could not move chunk in '" << nss.ns() << "' to shard '"
-                                     << toString << "' because that shard does not exist");
+                                     << toString
+                                     << "' because that shard does not exist");
             log() << msg;
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
@@ -151,7 +147,7 @@ public:
         // so far, chunk size serves test purposes; it may or may not become a supported parameter
         long long maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
         if (maxChunkSizeBytes == 0) {
-            maxChunkSizeBytes = Chunk::MaxChunkSize;
+            maxChunkSizeBytes = Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes();
         }
 
         BSONObj find = cmdObj.getObjectField("find");
@@ -164,11 +160,12 @@ public:
         }
 
         // This refreshes the chunk metadata if stale.
-        ChunkManagerPtr info = config->getChunkManager(txn, nss.ns(), true);
-        ChunkPtr chunk;
+        shared_ptr<ChunkManager> info = config->getChunkManager(txn, nss.ns(), true);
+        shared_ptr<Chunk> chunk;
 
         if (!find.isEmpty()) {
-            StatusWith<BSONObj> status = info->getShardKeyPattern().extractShardKeyFromQuery(find);
+            StatusWith<BSONObj> status =
+                info->getShardKeyPattern().extractShardKeyFromQuery(txn, find);
 
             // Bad query
             if (!status.isOK())
@@ -182,7 +179,6 @@ public:
             }
 
             chunk = info->findIntersectingChunk(txn, shardKey);
-            verify(chunk.get());
         } else {
             // Bounds
             if (!info->getShardKeyPattern().isShardKey(bounds[0].Obj()) ||
@@ -198,56 +194,36 @@ public:
             BSONObj maxKey = info->getShardKeyPattern().normalizeShardKey(bounds[1].Obj());
 
             chunk = info->findIntersectingChunk(txn, minKey);
-            verify(chunk.get());
 
             if (chunk->getMin().woCompare(minKey) != 0 || chunk->getMax().woCompare(maxKey) != 0) {
                 errmsg = str::stream() << "no chunk found with the shard key bounds "
-                                       << "[" << minKey << "," << maxKey << ")";
+                                       << ChunkRange(minKey, maxKey).toString();
                 return false;
             }
         }
 
-        {
-            const auto from = grid.shardRegistry()->getShard(txn, chunk->getShardId());
-            if (from->getId() == to->getId()) {
-                errmsg = "that chunk is already on that shard";
-                return false;
-            }
-        }
+        const auto from = grid.shardRegistry()->getShard(txn, chunk->getShardId());
+        if (from->getId() != to->getId()) {
+            const auto secondaryThrottle =
+                uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
 
-        LOG(0) << "CMD: movechunk: " << cmdObj;
+            ChunkType chunkType;
+            chunkType.setNS(nss.ns());
+            chunkType.setMin(chunk->getMin());
+            chunkType.setMax(chunk->getMax());
+            chunkType.setShard(chunk->getShardId());
+            chunkType.setVersion(info->getVersion());
 
-        StatusWith<int> maxTimeMS =
-            LiteParsedQuery::parseMaxTimeMS(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
-
-        if (!maxTimeMS.isOK()) {
-            errmsg = maxTimeMS.getStatus().reason();
-            return false;
-        }
-
-        const auto secondaryThrottle =
-            uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
-
-        BSONObj res;
-        if (!chunk->moveAndCommit(txn,
-                                  to->getId(),
-                                  maxChunkSizeBytes,
-                                  secondaryThrottle,
-                                  cmdObj["_waitForDelete"].trueValue(),
-                                  maxTimeMS.getValue(),
-                                  res)) {
-            errmsg = "move failed";
-            result.append("cause", res);
-
-            if (!res["code"].eoo()) {
-                result.append(res["code"]);
-            }
-
-            return false;
+            uassertStatusOK(
+                Balancer::get(txn)->moveSingleChunk(txn,
+                                                    chunkType,
+                                                    to->getId(),
+                                                    maxChunkSizeBytes,
+                                                    secondaryThrottle,
+                                                    cmdObj["_waitForDelete"].trueValue()));
         }
 
         result.append("millis", t.millis());
-
         return true;
     }
 

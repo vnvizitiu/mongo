@@ -51,13 +51,13 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/handshake_args.h"
@@ -71,6 +71,7 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/quick_exit.h"
 
 using std::cout;
 using std::endl;
@@ -217,9 +218,7 @@ void ReplSource::save(OperationContext* txn) {
     LOG(1) << "Saving repl source: " << o << endl;
 
     {
-        OpDebug debug;
-
-        OldClientContext ctx(txn, "local.sources");
+        OldClientContext ctx(txn, "local.sources", false);
 
         const NamespaceString requestNs("local.sources");
         UpdateRequest request(requestNs);
@@ -228,7 +227,7 @@ void ReplSource::save(OperationContext* txn) {
         request.setUpdates(o);
         request.setUpsert();
 
-        UpdateResult res = update(txn, ctx.db(), request, &debug);
+        UpdateResult res = update(txn, ctx.db(), request);
 
         verify(!res.modifiers);
         verify(res.numMatched == 1 || !res.upserted.isEmpty());
@@ -258,7 +257,7 @@ static void addSourceToList(OperationContext* txn,
 */
 void ReplSource::loadAll(OperationContext* txn, SourceVector& v) {
     const char* localSources = "local.sources";
-    OldClientContext ctx(txn, localSources);
+    OldClientContext ctx(txn, localSources, false);
     SourceVector old = v;
     v.clear();
 
@@ -282,14 +281,14 @@ void ReplSource::loadAll(OperationContext* txn, SourceVector& v) {
                 log() << "http://dochub.mongodb.org/core/masterslave" << endl;
                 log() << "terminating mongod after 30 seconds" << endl;
                 sleepsecs(30);
-                dbexit(EXIT_REPLICATION_ERROR);
+                quickExit(EXIT_REPLICATION_ERROR);
             }
             if (tmp.only != replSettings.getOnly()) {
                 log() << "--only " << replSettings.getOnly() << " != " << tmp.only
                       << " from local.sources collection" << endl;
                 log() << "terminating after 30 seconds" << endl;
                 sleepsecs(30);
-                dbexit(EXIT_REPLICATION_ERROR);
+                quickExit(EXIT_REPLICATION_ERROR);
             }
         }
         uassert(17065, "Internal error reading from local.sources", PlanExecutor::IS_EOF == state);
@@ -305,7 +304,7 @@ void ReplSource::loadAll(OperationContext* txn, SourceVector& v) {
         try {
             massert(10384, "--only requires use of --source", replSettings.getOnly().empty());
         } catch (...) {
-            dbexit(EXIT_BADOPTIONS);
+            quickExit(EXIT_BADOPTIONS);
         }
     }
 
@@ -355,7 +354,7 @@ public:
         h << "internal";
     }
     HandshakeCmd() : Command("handshake") {}
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -459,10 +458,12 @@ void ReplSource::forceResync(OperationContext* txn, const char* requester) {
     save(txn);
 }
 
-void ReplSource::resyncDrop(OperationContext* txn, const string& db) {
-    log() << "resync: dropping database " << db;
-    OldClientContext ctx(txn, db);
-    dropDatabase(txn, ctx.db());
+void ReplSource::resyncDrop(OperationContext* txn, const string& dbName) {
+    log() << "resync: dropping database " << dbName;
+    invariant(txn->lockState()->isW());
+
+    Database* const db = dbHolder().get(txn, dbName);
+    Database::dropDatabase(txn, db);
 }
 
 /* grab initial copy of a database from the master */
@@ -604,8 +605,8 @@ bool ReplSource::handleDuplicateDbName(OperationContext* txn,
         incompleteCloneDbs.erase(*i);
         addDbNextPass.erase(*i);
 
-        OldClientContext ctx(txn, *i);
-        dropDatabase(txn, ctx.db());
+        AutoGetDb autoDb(txn, *i, MODE_X);
+        Database::dropDatabase(txn, autoDb.getDb());
     }
 
     massert(14034,
@@ -780,7 +781,7 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* txn,
                       << "' did not complete, now resyncing." << endl;
             }
             save(txn);
-            OldClientContext ctx(txn, ns);
+            OldClientContext ctx(txn, ns, false);
             nClonedThisPass++;
             resync(txn, ctx.db()->name());
             addDbNextPass.erase(clientName);
@@ -936,7 +937,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
 
     Timestamp nextOpTime;
     {
-        BSONObj op = oplogReader.next();
+        BSONObj op = oplogReader.nextSafe();
         BSONElement ts = op.getField("ts");
         if (ts.type() != Date && ts.type() != bsonTimestamp) {
             string err = op.getStringField("$err");
@@ -974,8 +975,8 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
                   << ((nextOpTime < syncedTo) ? "<??" : ">") << " syncedTo "
                   << syncedTo.toStringLong() << '\n'
                   << "time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs()) << "sec\n"
-                  << "tailing: " << tailing << '\n' << "data too stale, halting replication"
-                  << endl;
+                  << "tailing: " << tailing << '\n'
+                  << "data too stale, halting replication" << endl;
             replInfo = replAllDead = "data too stale halted replication";
             verify(syncedTo < nextOpTime);
             throw SyncException();
@@ -1021,7 +1022,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
                 n = 0;
             }
 
-            BSONObj op = oplogReader.next();
+            BSONObj op = oplogReader.nextSafe();
 
             int b = replApplyBatchSize;
             bool justOne = b == 1;
@@ -1079,7 +1080,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
                     // break if no more in batch so we release lock while reading from the master
                     break;
                 }
-                op = oplogReader.next();
+                op = oplogReader.nextSafe();
             }
         }
     }
@@ -1271,7 +1272,8 @@ static void replMasterThread() {
         // Write a keep-alive like entry to the log. This will make things like
         // printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date even
         // when things are idle.
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
 
         Lock::GlobalWrite globalWrite(txn.lockState(), 1);
@@ -1296,7 +1298,8 @@ static void replSlaveThread() {
     sleepsecs(1);
     Client::initThread("replslave");
 
-    OperationContextImpl txn;
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;
     AuthorizationSession::get(txn.getClient())->grantInternalAuthorization();
     DisableDocumentValidation validationDisabler(&txn);
 
@@ -1353,7 +1356,8 @@ int _dummy_z;
 void pretouchN(vector<BSONObj>& v, unsigned a, unsigned b) {
     Client::initThreadIfNotAlready("pretouchN");
 
-    OperationContextImpl txn;  // XXX
+    const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+    OperationContext& txn = *txnPtr;  // XXX
     ScopedTransaction transaction(&txn, MODE_S);
     Lock::GlobalRead lk(txn.lockState());
 
@@ -1377,7 +1381,7 @@ void pretouchN(vector<BSONObj>& v, unsigned a, unsigned b) {
                 BSONObjBuilder b;
                 b.append(_id);
                 BSONObj result;
-                OldClientContext ctx(&txn, ns);
+                OldClientContext ctx(&txn, ns, false);
                 if (Helpers::findById(&txn, ctx.db(), ns, b.done(), result))
                     _dummy_z += result.objsize();  // touch
             }

@@ -59,15 +59,19 @@ env.Library('authorization_manager_global',
                 '$BUILD_DIR/mongo/db/service_context',
             ])
 
-env.Library('authorization_manager_mock_init',
-            [
-                'authorization_manager_mock_init.cpp'
-            ],
-            LIBDEPS=[
-                'authcore',
-                'authmocks',
-                '$BUILD_DIR/mongo/db/service_context',
-            ])
+env.Library(
+    target='authorization_manager_mock_init',
+    source=[
+        'authorization_manager_mock_init.cpp'
+    ],
+    LIBDEPS=[
+        'authcore',
+        'authmocks',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
+        '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
+        '$BUILD_DIR/mongo/executor/network_interface_factory'
+    ],
+)
 
 env.Library('authservercommon',
             [
@@ -142,10 +146,6 @@ env.Library('authmongos',
                 'authservercommon',
                 '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
                 '$BUILD_DIR/mongo/s/coreshard',
-            ],
-            LIBDEPS_TAGS=[
-                # Depends on inShutdown
-                'incomplete',
             ],
 )
 

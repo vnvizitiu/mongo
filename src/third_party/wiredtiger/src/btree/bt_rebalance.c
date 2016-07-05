@@ -90,7 +90,7 @@ __rebalance_leaf_append(WT_SESSION_IMPL *session,
 	if (recno == WT_RECNO_OOB)
 		WT_RET(__wt_row_ikey(session, 0, key, key_len, copy));
 	else
-		copy->key.recno = recno;
+		copy->ref_recno = recno;
 
 	copy->page_del = NULL;
 	return (0);
@@ -147,8 +147,7 @@ __rebalance_internal(WT_SESSION_IMPL *session, WT_REBALANCE_STUFF *rs)
 	leaf_next = (uint32_t)rs->leaf_next;
 
 	/* Allocate a row-store root (internal) page and fill it in. */
-	WT_RET(__wt_page_alloc(session, rs->type,
-	    rs->type == WT_PAGE_COL_INT ? 1 : 0, leaf_next, false, &page));
+	WT_RET(__wt_page_alloc(session, rs->type, leaf_next, false, &page));
 	page->pg_intl_parent_ref = &btree->root;
 	WT_ERR(__wt_page_modify_init(session, page));
 	__wt_page_modify_set(session, page);
@@ -412,6 +411,7 @@ __wt_bt_rebalance(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_UNUSED(cfg);
 
 	btree = S2BT(session);
+	evict_reset = false;
 
 	/*
 	 * If the tree has never been written to disk, we're done, rebalance
@@ -438,7 +438,8 @@ __wt_bt_rebalance(WT_SESSION_IMPL *session, const char *cfg[])
 	 * cache is the root page, and that cannot be evicted; however, this way
 	 * eviction ignores the tree entirely.)
 	 */
-	WT_ERR(__wt_evict_file_exclusive_on(session, &evict_reset));
+	WT_ERR(__wt_evict_file_exclusive_on(session));
+	evict_reset = true;
 
 	/* Recursively walk the tree. */
 	switch (rs->type) {
@@ -470,7 +471,10 @@ __wt_bt_rebalance(WT_SESSION_IMPL *session, const char *cfg[])
 	btree->root.page = rs->root;
 	rs->root = NULL;
 
-err:	/* Discard any leftover root page we created. */
+err:	if (evict_reset)
+	    __wt_evict_file_exclusive_off(session);
+
+	/* Discard any leftover root page we created. */
 	if (rs->root != NULL) {
 		__wt_page_modify_clear(session, rs->root);
 		__wt_page_out(session, &rs->root);

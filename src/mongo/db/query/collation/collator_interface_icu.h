@@ -31,7 +31,10 @@
 #include "mongo/db/query/collation/collator_interface.h"
 
 #include <memory>
-#include <unicode/coll.h>
+
+namespace icu {
+class Collator;
+}  // namespace icu
 
 namespace mongo {
 
@@ -39,11 +42,15 @@ namespace mongo {
  * An implementation of the CollatorInterface which is backed by the implementation of collations
  * from the ICU library.
  */
-class CollatorInterfaceICU : public CollatorInterface {
+class CollatorInterfaceICU final : public CollatorInterface {
 public:
     CollatorInterfaceICU(CollationSpec spec, std::unique_ptr<icu::Collator> collator);
 
-    int compare(StringData left, StringData right) final;
+    std::unique_ptr<CollatorInterface> clone() const final;
+
+    int compare(StringData left, StringData right) const final;
+
+    ComparisonKey getComparisonKey(StringData stringData) const final;
 
 private:
     // The ICU implementation of the collator to which we delegate interesting work. Const methods

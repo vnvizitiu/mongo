@@ -43,9 +43,9 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -68,12 +68,11 @@ static ServerStatusMetricField<Counter64> displayReadersCreated("repl.network.re
 
 
 bool replAuthenticate(DBClientBase* conn) {
-    if (!getGlobalAuthorizationManager()->isAuthEnabled())
-        return true;
-
-    if (!isInternalAuthSet())
+    if (isInternalAuthSet())
+        return conn->authenticateInternalUser();
+    if (getGlobalAuthorizationManager()->isAuthEnabled())
         return false;
-    return conn->authenticateInternalUser();
+    return true;
 }
 
 const Seconds OplogReader::kSocketTimeout(30);
@@ -94,13 +93,13 @@ bool OplogReader::connect(const HostAndPort& host) {
         _conn = shared_ptr<DBClientConnection>(
             new DBClientConnection(false, durationCount<Seconds>(kSocketTimeout)));
         string errmsg;
-        if (!_conn->connect(host, errmsg) ||
-            (getGlobalAuthorizationManager()->isAuthEnabled() && !replAuthenticate(_conn.get()))) {
+        if (!_conn->connect(host, errmsg) || !replAuthenticate(_conn.get())) {
             resetConnection();
             error() << errmsg << endl;
             return false;
         }
-        _conn->port().tag |= executor::NetworkInterface::kMessagingPortKeepOpen;
+        _conn->port().setTag(_conn->port().getTag() |
+                             executor::NetworkInterface::kMessagingPortKeepOpen);
         _host = host;
     }
     return true;
@@ -140,7 +139,8 @@ HostAndPort OplogReader::getHost() const {
 void OplogReader::connectToSyncSource(OperationContext* txn,
                                       const OpTime& lastOpTimeFetched,
                                       ReplicationCoordinator* replCoord) {
-    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Milliseconds(curTimeMillis64())), 0);
+    const Timestamp sentinelTimestamp(duration_cast<Seconds>(Date_t::now().toDurationSinceEpoch()),
+                                      0);
     const OpTime sentinel(sentinelTimestamp, std::numeric_limits<long long>::max());
     OpTime oldestOpTimeSeen = sentinel;
 
@@ -165,7 +165,7 @@ void OplogReader::connectToSyncSource(OperationContext* txn,
             log() << "our last optime : " << lastOpTimeFetched;
             log() << "oldest available is " << oldestOpTimeSeen;
             log() << "See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember";
-            setMinValid(txn, {lastOpTimeFetched, oldestOpTimeSeen});
+            StorageInterface::get(txn)->setMinValid(txn, {lastOpTimeFetched, oldestOpTimeSeen});
             auto status = replCoord->setMaintenanceMode(true);
             if (!status.isOK()) {
                 warning() << "Failed to transition into maintenance mode.";

@@ -47,11 +47,11 @@
 #include <mutex>
 
 #include "mongo/config.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
 #include "mongo/db/storage/storage_options.h"
@@ -75,6 +75,8 @@ using std::setprecision;
 using std::setw;
 using std::string;
 using std::vector;
+
+namespace dps = ::mongo::dotted_path_support;
 
 const bool profiling = false;
 
@@ -106,7 +108,8 @@ protected:
     }
 
 private:
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     DBDirectClient _client;
 };
 
@@ -199,7 +202,8 @@ public:
                             cout << "stats " << setw(42) << right << "new/old:" << ' ' << setw(9);
                             cout << fixed << setprecision(2) << rps / lastrps;
                             if (needver) {
-                                cout << "         " << o.getFieldDotted("info.git").toString();
+                                cout << "         "
+                                     << dps::extractElementAtPath(o, "info.git").toString();
                             }
                             cout << '\n';
                         }
@@ -327,7 +331,8 @@ public:
         srand(++z ^ (unsigned)time(0));
 #endif
         Client::initThreadIfNotAlready("perftestthr");
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient c(&txn);
 
         const unsigned int Batch = batchSize();

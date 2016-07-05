@@ -62,17 +62,24 @@ class GeoHaystackSearchCommand : public Command {
 public:
     GeoHaystackSearchCommand() : Command("geoSearch") {}
 
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     bool slaveOk() const {
         return true;
     }
+
     bool slaveOverrideOk() const {
         return true;
     }
+
     bool supportsReadConcern() const final {
         return true;
+    }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
     }
 
     std::size_t reserveBytesForReply() const override {
@@ -93,9 +100,9 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
 
-        AutoGetCollectionForRead ctx(txn, ns);
+        AutoGetCollectionForRead ctx(txn, nss.ns());
 
         Collection* collection = ctx.getCollection();
         if (!collection) {

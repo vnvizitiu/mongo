@@ -74,27 +74,41 @@ CommandRequest::CommandRequest(const Message* message) : _message(message) {
 
     uassert(28636,
             str::stream() << "Database parsed in OP_COMMAND message must be between"
-                          << kMinDatabaseLength << " and " << kMaxDatabaseLength
-                          << " bytes. Got: " << _database,
+                          << kMinDatabaseLength
+                          << " and "
+                          << kMaxDatabaseLength
+                          << " bytes. Got: "
+                          << _database,
             (_database.size() >= kMinDatabaseLength) && (_database.size() <= kMaxDatabaseLength));
 
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid database name: '" << _database << "'",
-            NamespaceString::validDBName(_database));
+    uassert(
+        ErrorCodes::InvalidNamespace,
+        str::stream() << "Invalid database name: '" << _database << "'",
+        NamespaceString::validDBName(_database, NamespaceString::DollarInDbNameBehavior::Allow));
 
     uassertStatusOK(cur.readAndAdvance<>(&str));
     _commandName = std::move(str.value);
 
     uassert(28637,
             str::stream() << "Command name parsed in OP_COMMAND message must be between"
-                          << kMinCommandNameLength << " and " << kMaxCommandNameLength
-                          << " bytes. Got: " << _database,
+                          << kMinCommandNameLength
+                          << " and "
+                          << kMaxCommandNameLength
+                          << " bytes. Got: "
+                          << _database,
             (_commandName.size() >= kMinCommandNameLength) &&
                 (_commandName.size() <= kMaxCommandNameLength));
 
     Validated<BSONObj> obj;
     uassertStatusOK(cur.readAndAdvance<>(&obj));
     _commandArgs = std::move(obj.val);
+    uassert(39950,
+            str::stream() << "Command name parsed in OP_COMMAND message '" << _commandName
+                          << "' doesn't match command name from object '"
+                          << _commandArgs.firstElementFieldName()
+                          << '\'',
+            _commandArgs.firstElementFieldName() == _commandName);
+
     uassertStatusOK(cur.readAndAdvance<>(&obj));
     _metadata = std::move(obj.val);
 

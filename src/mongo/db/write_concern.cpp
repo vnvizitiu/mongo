@@ -36,11 +36,11 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
@@ -58,55 +58,39 @@ static ServerStatusMetricField<TimerStats> displayGleLatency("getLastError.wtime
 static Counter64 gleWtimeouts;
 static ServerStatusMetricField<Counter64> gleWtimeoutsDisplay("getLastError.wtimeouts",
                                                               &gleWtimeouts);
-
-void setupSynchronousCommit(OperationContext* txn) {
-    const WriteConcernOptions& writeConcern = txn->getWriteConcern();
-
-    if (writeConcern.syncMode == WriteConcernOptions::SyncMode::JOURNAL ||
-        writeConcern.syncMode == WriteConcernOptions::SyncMode::FSYNC) {
-        txn->recoveryUnit()->goingToWaitUntilDurable();
-    }
-}
-
 namespace {
 const std::string kLocalDB = "local";
 }  // namespace
 
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
                                                     const BSONObj& cmdObj,
-                                                    const std::string& dbName) {
+                                                    const std::string& dbName,
+                                                    const bool supportsWriteConcern) {
     // The default write concern if empty is w : 1
     // Specifying w : 0 is/was allowed, but is interpreted identically to w : 1
     WriteConcernOptions writeConcern =
         repl::getGlobalReplicationCoordinator()->getGetLastErrorDefault();
-    if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
-        writeConcern.wNumNodes = 1;
-    }
 
-    BSONElement writeConcernElement;
-    Status wcStatus = bsonExtractTypedField(cmdObj, "writeConcern", Object, &writeConcernElement);
-    if (!wcStatus.isOK()) {
-        if (wcStatus == ErrorCodes::NoSuchKey) {
-            // Return default write concern if no write concern is given.
-            return writeConcern;
+    auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj, dbName, writeConcern);
+    if (!wcResult.isOK()) {
+        return wcResult.getStatus();
+    }
+    writeConcern = wcResult.getValue();
+
+    // We didn't use the default, so the user supplied their own writeConcern.
+    if (!wcResult.getValue().usedDefault) {
+        // If it supports writeConcern and does not use the default, validate the writeConcern.
+        if (supportsWriteConcern) {
+            Status wcStatus = validateWriteConcern(txn, writeConcern, dbName);
+            if (!wcStatus.isOK()) {
+                return wcStatus;
+            }
+        } else {
+            // This command doesn't do writes so it should not be passed a writeConcern.
+            // If we did not use the default writeConcern, one was provided when it shouldn't have
+            // been by the user.
+            return Status(ErrorCodes::InvalidOptions, "Command does not support writeConcern");
         }
-        return wcStatus;
-    }
-
-    BSONObj writeConcernObj = writeConcernElement.Obj();
-    // Empty write concern is interpreted to default.
-    if (writeConcernObj.isEmpty()) {
-        return writeConcern;
-    }
-
-    wcStatus = writeConcern.parse(writeConcernObj);
-    if (!wcStatus.isOK()) {
-        return wcStatus;
-    }
-
-    wcStatus = validateWriteConcern(txn, writeConcern, dbName);
-    if (!wcStatus.isOK()) {
-        return wcStatus;
     }
 
     return writeConcern;
@@ -122,37 +106,35 @@ Status validateWriteConcern(OperationContext* txn,
                       "cannot use 'j' option when a host does not have journaling enabled");
     }
 
-    const bool isConfigServer = serverGlobalParams.configsvr;
+    const bool isConfigServer = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
     const bool isLocalDb(dbName == kLocalDB);
     const repl::ReplicationCoordinator::Mode replMode =
         repl::getGlobalReplicationCoordinator()->getReplicationMode();
 
     if (isConfigServer) {
-        auto protocol = rpc::getOperationProtocol(txn);
-        // This here only for v3.0 backwards compatibility.
-        if (serverGlobalParams.configsvrMode != CatalogManager::ConfigServerMode::CSRS &&
-            replMode != repl::ReplicationCoordinator::modeReplSet &&
-            protocol == rpc::Protocol::kOpQuery && writeConcern.wNumNodes == 0 &&
-            writeConcern.wMode.empty()) {
-            return Status::OK();
-        }
-
         if (!writeConcern.validForConfigServers()) {
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
                     << "w:1 and w:'majority' are the only valid write concerns when writing to "
-                       "config servers, got: " << writeConcern.toBSON().toString());
+                       "config servers, got: "
+                    << writeConcern.toBSON().toString());
         }
-        if (serverGlobalParams.configsvrMode == CatalogManager::ConfigServerMode::CSRS &&
-            replMode == repl::ReplicationCoordinator::modeReplSet && !isLocalDb &&
-            writeConcern.wMode.empty()) {
+
+        if (replMode == repl::ReplicationCoordinator::modeReplSet &&
+            // Allow writes performed within the server to have a write concern of { w: 1 }.
+            // This is so commands have the option to skip waiting for replication if they are
+            // holding locks (ex. addShardToZone). This also allows commands that perform
+            // multiple writes to batch the wait at the end.
+            !txn->getClient()->isInDirectClient() &&
+            !isLocalDb && writeConcern.wMode.empty()) {
             invariant(writeConcern.wNumNodes == 1);
             return Status(
                 ErrorCodes::BadValue,
                 str::stream()
                     << "w: 'majority' is the only valid write concern when writing to config "
-                       "server replica sets, got: " << writeConcern.toBSON().toString());
+                       "server replica sets, got: "
+                    << writeConcern.toBSON().toString());
         }
     }
 
@@ -215,7 +197,8 @@ void WriteConcernResult::appendTo(const WriteConcernOptions& writeConcern,
             result->appendNumber("waited", syncMillis);
         }
 
-        dassert(result->asTempObj()["fsyncFiles"].numberInt() > 0 ||
+        // For ephemeral storage engines, 0 files may be fsynced.
+        dassert(result->asTempObj()["fsyncFiles"].numberLong() >= 0 ||
                 !result->asTempObj()["waited"].eoo());
     }
 }

@@ -34,14 +34,19 @@
 
 #include "mongo/util/net/listen.h"
 
-
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/service_context.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/asio_message_port.h"
 #include "mongo/util/net/message_port.h"
+#include "mongo/util/net/message_port_startup_param.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/scopeguard.h"
 
 #ifndef _WIN32
@@ -52,14 +57,14 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
 #ifdef __OpenBSD__
 #include <sys/uio.h>
 #endif
@@ -74,14 +79,16 @@
 
 namespace mongo {
 
+namespace {
+const auto getListener = ServiceContext::declareDecoration<Listener*>();
+}  // namespace
+
 using std::shared_ptr;
 using std::endl;
 using std::string;
 using std::vector;
 
 // ----- Listener -------
-
-const Listener* Listener::_timeTracker;
 
 vector<SockAddr> ipToAddrs(const char* ips, int port, bool useUnixSockets) {
     vector<SockAddr> out;
@@ -92,7 +99,7 @@ vector<SockAddr> ipToAddrs(const char* ips, int port, bool useUnixSockets) {
             out.push_back(SockAddr("::", port));  // IPv6 all
 #ifndef _WIN32
         if (useUnixSockets)
-            out.push_back(SockAddr(makeUnixSockPath(port).c_str(), port));  // Unix socket
+            out.push_back(SockAddr(makeUnixSockPath(port), port));  // Unix socket
 #endif
         return out;
     }
@@ -114,28 +121,45 @@ vector<SockAddr> ipToAddrs(const char* ips, int port, bool useUnixSockets) {
 #ifndef _WIN32
         if (sa.isValid() && useUnixSockets &&
             (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0"))  // only IPv4
-            out.push_back(SockAddr(makeUnixSockPath(port).c_str(), port));
+            out.push_back(SockAddr(makeUnixSockPath(port), port));
 #endif
     }
     return out;
 }
 
-Listener::Listener(const string& name, const string& ip, int port, bool logConnect)
+Listener* Listener::get(ServiceContext* ctx) {
+    return getListener(ctx);
+}
+
+Listener::Listener(const string& name,
+                   const string& ip,
+                   int port,
+                   ServiceContext* ctx,
+                   bool setAsServiceCtxDecoration,
+                   bool logConnect)
     : _port(port),
       _name(name),
       _ip(ip),
       _setupSocketsSuccessful(false),
       _logConnect(logConnect),
-      _elapsedTime(0),
-      _ready(false) {
+      _ready(false),
+      _ctx(ctx),
+      _setAsServiceCtxDecoration(setAsServiceCtxDecoration) {
 #ifdef MONGO_CONFIG_SSL
     _ssl = getSSLManager();
 #endif
+    if (setAsServiceCtxDecoration) {
+        auto& listener = getListener(ctx);
+        invariant(!listener);
+        listener = this;
+    }
 }
 
 Listener::~Listener() {
-    if (_timeTracker == this)
-        _timeTracker = 0;
+    if (_setAsServiceCtxDecoration) {
+        auto& listener = getListener(_ctx);
+        listener = nullptr;
+    }
 }
 
 bool Listener::setupSockets() {
@@ -265,19 +289,12 @@ void Listener::initAndListen() {
         }
 
         maxSelectTime.tv_sec = 0;
-        maxSelectTime.tv_usec = 10000;
-        const int ret = select(maxfd + 1, fds, NULL, NULL, &maxSelectTime);
+        maxSelectTime.tv_usec = 250000;
+        const int ret = select(maxfd + 1, fds, nullptr, nullptr, &maxSelectTime);
 
         if (ret == 0) {
-#if defined(__linux__)
-            _elapsedTime += (10000 - maxSelectTime.tv_usec) / 1000;
-#else
-            _elapsedTime += 10;
-#endif
             continue;
-        }
-
-        if (ret < 0) {
+        } else if (ret < 0) {
             int x = errno;
 #ifdef EINTR
             if (x == EINTR) {
@@ -289,12 +306,6 @@ void Listener::initAndListen() {
                 log() << "select() failure: ret=" << ret << " " << errnoWithDescription(x) << endl;
             return;
         }
-
-#if defined(__linux__)
-        _elapsedTime += std::max(ret, (int)((10000 - maxSelectTime.tv_usec) / 1000));
-#else
-        _elapsedTime += ret;  // assume 1ms to grab connection. very rough
-#endif
 
         for (vector<SOCKET>::iterator it = _socks.begin(), end = _socks.end(); it != end; ++it) {
             if (!(FD_ISSET(*it, fds)))
@@ -319,7 +330,8 @@ void Listener::initAndListen() {
                     if (x == EMFILE || x == ENFILE) {
                         // Connection still in listen queue but we can't accept it yet
                         error() << "Out of file descriptors. Waiting one second before trying to "
-                                   "accept more connections." << warnings;
+                                   "accept more connections."
+                                << warnings;
                         sleepsecs(1);
                     }
                 }
@@ -350,7 +362,7 @@ void Listener::initAndListen() {
                 pnewSock->secureAccepted(_ssl);
             }
 #endif
-            accepted(pnewSock, myConnectionNumber);
+            _accepted(pnewSock, myConnectionNumber);
         }
     }
 }
@@ -452,15 +464,15 @@ void Listener::initAndListen() {
             if (status == SOCKET_ERROR) {
                 const int mongo_errno = WSAGetLastError();
 
-                // During shutdown, we may fail to listen on the socket if it has already
-                // been closed
-                if (inShutdown()) {
-                    return;
+                // We may fail to listen on the socket if it has
+                // already been closed. If we are not in shutdown,
+                // that is possibly interesting, so log an error.
+                if (!inShutdown()) {
+                    error() << "Windows WSAEventSelect returned "
+                            << errnoWithDescription(mongo_errno) << endl;
                 }
 
-                error() << "Windows WSAEventSelect returned " << errnoWithDescription(mongo_errno)
-                        << endl;
-                fassertFailed(16727);
+                return;
             }
         }
 
@@ -468,20 +480,17 @@ void Listener::initAndListen() {
         DWORD result = WSAWaitForMultipleEvents(_socks.size(),
                                                 events.get(),
                                                 FALSE,   // don't wait for all the events
-                                                10,      // timeout, in ms
+                                                250,     // timeout, in ms
                                                 FALSE);  // do not allow I/O interruptions
-        if (result == WSA_WAIT_FAILED) {
+
+        if (result == WSA_WAIT_TIMEOUT) {
+            continue;
+        } else if (result == WSA_WAIT_FAILED) {
             const int mongo_errno = WSAGetLastError();
             error() << "Windows WSAWaitForMultipleEvents returned "
                     << errnoWithDescription(mongo_errno) << endl;
             fassertFailed(16723);
         }
-
-        if (result == WSA_WAIT_TIMEOUT) {
-            _elapsedTime += 10;
-            continue;
-        }
-        _elapsedTime += 1;  // assume 1ms to grab connection. very rough
 
         // Determine which socket is ready
         DWORD eventIndex = result - WSA_WAIT_EVENT_0;
@@ -541,7 +550,8 @@ void Listener::initAndListen() {
                 if (x == EMFILE || x == ENFILE) {
                     // Connection still in listen queue but we can't accept it yet
                     error() << "Out of file descriptors. Waiting one second before"
-                               " trying to accept more connections." << warnings;
+                               " trying to accept more connections."
+                            << warnings;
                     sleepsecs(1);
                 }
             }
@@ -566,7 +576,7 @@ void Listener::initAndListen() {
             pnewSock->secureAccepted(_ssl);
         }
 #endif
-        accepted(pnewSock, myConnectionNumber);
+        _accepted(pnewSock, myConnectionNumber);
     }
 }
 #endif
@@ -583,14 +593,15 @@ void Listener::waitUntilListening() const {
     }
 }
 
-void Listener::accepted(std::shared_ptr<Socket> psocket, long long connectionId) {
-    MessagingPort* port = new MessagingPort(psocket);
+void Listener::_accepted(const std::shared_ptr<Socket>& psocket, long long connectionId) {
+    std::unique_ptr<AbstractMessagingPort> port;
+    if (isMessagePortImplASIO()) {
+        port = stdx::make_unique<ASIOMessagingPort>(psocket->stealSD(), psocket->remoteAddr());
+    } else {
+        port = stdx::make_unique<MessagingPort>(psocket);
+    }
     port->setConnectionId(connectionId);
-    acceptedMP(port);
-}
-
-void Listener::acceptedMP(MessagingPort* mp) {
-    verify(!"You must overwrite one of the accepted methods");
+    accepted(port.release());
 }
 
 // ----- ListeningSockets -------
@@ -637,6 +648,10 @@ void Listener::checkTicketNumbers() {
     globalTicketHolder.resize(want);
 }
 
+void Listener::closeMessagingPorts(AbstractMessagingPort::Tag skipMask) {
+    ASIOMessagingPort::closeSockets(skipMask);
+    MessagingPort::closeSockets(skipMask);
+}
 
 TicketHolder Listener::globalTicketHolder(DEFAULT_MAX_CONN);
 AtomicInt64 Listener::globalConnectionNumber;

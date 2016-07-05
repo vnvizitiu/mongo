@@ -41,10 +41,10 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/replica_set_monitor.h"
-#include "mongo/client/syncclusterconnection.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/socket_exception.h"
 
 namespace mongo {
 
@@ -474,10 +474,9 @@ void ScopedDbConnection::done() {
 void ScopedDbConnection::_setSocketTimeout() {
     if (!_conn)
         return;
+
     if (_conn->type() == ConnectionString::MASTER)
-        ((DBClientConnection*)_conn)->setSoTimeout(_socketTimeout);
-    else if (_conn->type() == ConnectionString::SYNC)
-        ((SyncClusterConnection*)_conn)->setAllSoTimeouts(_socketTimeout);
+        static_cast<DBClientConnection*>(_conn)->setSoTimeout(_socketTimeout);
 }
 
 ScopedDbConnection::~ScopedDbConnection() {

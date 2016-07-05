@@ -72,15 +72,12 @@ public:
     /// Create a new Document deep-converted from the given BSONObj.
     explicit Document(const BSONObj& bson);
 
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MVSC++ <= 2013 can't generate default move operations
-    Document(const Document& other) = default;
-    Document& operator=(const Document& other) = default;
-    Document(Document&& other) : _storage(std::move(other._storage)) {}
-    Document& operator=(Document&& other) {
-        _storage = std::move(other._storage);
-        return *this;
-    }
-#endif
+    /**
+     * Create a new document from key, value pairs. Enables constructing a document using this
+     * syntax:
+     * auto document = Document{{"hello", "world"}, {"number": 1}};
+     */
+    Document(std::initializer_list<std::pair<StringData, ImplicitValue>> initializerList);
 
     void swap(Document& rhs) {
         _storage.swap(rhs._storage);
@@ -102,7 +99,7 @@ public:
         return storage().getField(pos).val;
     }
 
-    /** Similar to BSONObj::getFieldDotted, but using FieldPath rather than a dotted string.
+    /** Similar to extractAllElementsAlongPath(), but using FieldPath rather than a dotted string.
      *  If you pass a non-NULL positions vector, you get back a path suitable
      *  to pass to MutableDocument::setNestedField.
      *

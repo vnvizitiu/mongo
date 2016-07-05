@@ -28,8 +28,9 @@
 
 #pragma once
 
-#include <string>
+#include <iosfwd>
 #include <memory>
+#include <string>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/util/net/message.h"
@@ -50,27 +51,48 @@ namespace executor {
 struct RemoteCommandResponse {
     RemoteCommandResponse() = default;
 
-    RemoteCommandResponse(BSONObj dataObj, BSONObj metadataObj, Milliseconds millis)
-        : data(std::move(dataObj)), metadata(std::move(metadataObj)), elapsedMillis(millis) {}
+    RemoteCommandResponse(BSONObj dataObj, BSONObj metadataObj)
+        : RemoteCommandResponse(dataObj, metadataObj, Milliseconds(0)) {}
 
-    RemoteCommandResponse(Message message,
+    RemoteCommandResponse(BSONObj dataObj, BSONObj metadataObj, Milliseconds millis)
+        : data(std::move(dataObj)), metadata(std::move(metadataObj)), elapsedMillis(millis) {
+        // The buffer backing the default empty BSONObj has static duration so it is effectively
+        // owned.
+        invariant(data.isOwned() || data.objdata() == BSONObj().objdata());
+        invariant(metadata.isOwned() || metadata.objdata() == BSONObj().objdata());
+    }
+
+    RemoteCommandResponse(Message messageArg,
                           BSONObj dataObj,
                           BSONObj metadataObj,
                           Milliseconds millis)
-        : message(std::make_shared<const Message>(std::move(message))),
+        : message(std::make_shared<const Message>(std::move(messageArg))),
           data(std::move(dataObj)),
           metadata(std::move(metadataObj)),
-          elapsedMillis(millis) {}
+          elapsedMillis(millis) {
+        if (!data.isOwned()) {
+            data.shareOwnershipWith(message->sharedBuffer());
+        }
+        if (!metadata.isOwned()) {
+            metadata.shareOwnershipWith(message->sharedBuffer());
+        }
+    }
 
     RemoteCommandResponse(const rpc::ReplyInterface& rpcReply, Milliseconds millis);
 
     std::string toString() const;
 
+    bool operator==(const RemoteCommandResponse& rhs) const;
+    bool operator!=(const RemoteCommandResponse& rhs) const;
+
     std::shared_ptr<const Message> message;  // May be null.
-    BSONObj data;                            // Either owned or points into message.
-    BSONObj metadata;                        // Either owned or points into message.
+    BSONObj data;                            // Always owned. May point into message.
+    BSONObj metadata;                        // Always owned. May point into message.
     Milliseconds elapsedMillis = {};
 };
 
 }  // namespace executor
+
+std::ostream& operator<<(std::ostream& os, const executor::RemoteCommandResponse& request);
+
 }  // namespace mongo

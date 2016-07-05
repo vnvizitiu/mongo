@@ -54,7 +54,7 @@ namespace auth {
 
 void redactPasswordData(mutablebson::Element parent) {
     namespace mmb = mutablebson;
-    const StringData pwdFieldName("pwd", StringData::LiteralTag());
+    const auto pwdFieldName = "pwd"_sd;
     for (mmb::Element pwdElement = mmb::findFirstChildNamed(parent, pwdFieldName); pwdElement.ok();
          pwdElement = mmb::findElementNamed(pwdElement.rightSibling(), pwdFieldName)) {
         pwdElement.setValueString("xxx");
@@ -66,8 +66,8 @@ Status checkAuthorizedToGrantRoles(AuthorizationSession* authzSession,
     for (size_t i = 0; i < roles.size(); ++i) {
         if (!authzSession->isAuthorizedToGrantRole(roles[i])) {
             return Status(ErrorCodes::Unauthorized,
-                          str::stream()
-                              << "Not authorized to grant role: " << roles[i].getFullName());
+                          str::stream() << "Not authorized to grant role: "
+                                        << roles[i].getFullName());
         }
     }
 
@@ -91,8 +91,8 @@ Status checkAuthorizedToRevokeRoles(AuthorizationSession* authzSession,
     for (size_t i = 0; i < roles.size(); ++i) {
         if (!authzSession->isAuthorizedToRevokeRole(roles[i])) {
             return Status(ErrorCodes::Unauthorized,
-                          str::stream()
-                              << "Not authorized to revoke role: " << roles[i].getFullName());
+                          str::stream() << "Not authorized to revoke role: "
+                                        << roles[i].getFullName());
         }
     }
     return Status::OK();
@@ -123,8 +123,8 @@ Status checkAuthForCreateUserCommand(ClientBasic* client,
     if (!authzSession->isAuthorizedForActionsOnResource(
             ResourcePattern::forDatabaseName(args.userName.getDB()), ActionType::createUser)) {
         return Status(ErrorCodes::Unauthorized,
-                      str::stream()
-                          << "Not authorized to create users on db: " << args.userName.getDB());
+                      str::stream() << "Not authorized to create users on db: "
+                                    << args.userName.getDB());
     }
 
     return checkAuthorizedToGrantRoles(authzSession, args.roles);
@@ -184,9 +184,8 @@ Status checkAuthForGrantRolesToUserCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     std::vector<RoleName> roles;
     std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
     Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "grantRolesToUser", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
+        cmdObj, "grantRolesToUser", dbname, &unusedUserNameString, &roles);
     if (!status.isOK()) {
         return status;
     }
@@ -204,11 +203,10 @@ Status checkAuthForCreateRoleCommand(ClientBasic* client,
         return status;
     }
 
-    if (!authzSession->isAuthorizedForActionsOnResource(
-            ResourcePattern::forDatabaseName(args.roleName.getDB()), ActionType::createRole)) {
+    if (!authzSession->isAuthorizedToCreateRole(args)) {
         return Status(ErrorCodes::Unauthorized,
-                      str::stream()
-                          << "Not authorized to create roles on db: " << args.roleName.getDB());
+                      str::stream() << "Not authorized to create roles on db: "
+                                    << args.roleName.getDB());
     }
 
     status = checkAuthorizedToGrantRoles(authzSession, args.roles);
@@ -252,9 +250,8 @@ Status checkAuthForGrantRolesToRoleCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     std::vector<RoleName> roles;
     std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
     Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "grantRolesToRole", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
+        cmdObj, "grantRolesToRole", dbname, &unusedUserNameString, &roles);
     if (!status.isOK()) {
         return status;
     }
@@ -268,9 +265,8 @@ Status checkAuthForGrantPrivilegesToRoleCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     PrivilegeVector privileges;
     RoleName unusedRoleName;
-    BSONObj unusedWriteConcern;
     Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
-        cmdObj, "grantPrivilegesToRole", dbname, &unusedRoleName, &privileges, &unusedWriteConcern);
+        cmdObj, "grantPrivilegesToRole", dbname, &unusedRoleName, &privileges);
     if (!status.isOK()) {
         return status;
     }
@@ -283,9 +279,7 @@ Status checkAuthForDropUserCommand(ClientBasic* client,
                                    const BSONObj& cmdObj) {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     UserName userName;
-    BSONObj unusedWriteConcern;
-    Status status =
-        auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName, &unusedWriteConcern);
+    Status status = auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName);
     if (!status.isOK()) {
         return status;
     }
@@ -304,8 +298,7 @@ Status checkAuthForDropRoleCommand(ClientBasic* client,
                                    const BSONObj& cmdObj) {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     RoleName roleName;
-    BSONObj unusedWriteConcern;
-    Status status = auth::parseDropRoleCommand(cmdObj, dbname, &roleName, &unusedWriteConcern);
+    Status status = auth::parseDropRoleCommand(cmdObj, dbname, &roleName);
     if (!status.isOK()) {
         return status;
     }
@@ -336,9 +329,8 @@ Status checkAuthForRevokeRolesFromUserCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     std::vector<RoleName> roles;
     std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
     Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "revokeRolesFromUser", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
+        cmdObj, "revokeRolesFromUser", dbname, &unusedUserNameString, &roles);
     if (!status.isOK()) {
         return status;
     }
@@ -352,9 +344,8 @@ Status checkAuthForRevokeRolesFromRoleCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     std::vector<RoleName> roles;
     std::string unusedUserNameString;
-    BSONObj unusedWriteConcern;
     Status status = auth::parseRolePossessionManipulationCommands(
-        cmdObj, "revokeRolesFromRole", dbname, &unusedUserNameString, &roles, &unusedWriteConcern);
+        cmdObj, "revokeRolesFromRole", dbname, &unusedUserNameString, &roles);
     if (!status.isOK()) {
         return status;
     }
@@ -402,14 +393,8 @@ Status checkAuthForRevokePrivilegesFromRoleCommand(ClientBasic* client,
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
     PrivilegeVector privileges;
     RoleName unusedRoleName;
-    BSONObj unusedWriteConcern;
-    Status status =
-        auth::parseAndValidateRolePrivilegeManipulationCommands(cmdObj,
-                                                                "revokePrivilegesFromRole",
-                                                                dbname,
-                                                                &unusedRoleName,
-                                                                &privileges,
-                                                                &unusedWriteConcern);
+    Status status = auth::parseAndValidateRolePrivilegeManipulationCommands(
+        cmdObj, "revokePrivilegesFromRole", dbname, &unusedRoleName, &privileges);
     if (!status.isOK()) {
         return status;
     }
@@ -456,7 +441,8 @@ Status checkAuthForRolesInfoCommand(ClientBasic* client,
                     ActionType::viewRole)) {
                 return Status(ErrorCodes::Unauthorized,
                               str::stream() << "Not authorized to view roles from the "
-                                            << args.roleNames[i].getDB() << " database");
+                                            << args.roleNames[i].getDB()
+                                            << " database");
             }
         }
     }

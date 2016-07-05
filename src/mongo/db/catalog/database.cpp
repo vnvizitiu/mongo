@@ -40,27 +40,28 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/background.h"
-#include "mongo/db/clientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -406,7 +407,10 @@ Status Database::dropCollection(OperationContext* txn, StringData fullns) {
         }
     }
 
-    getGlobalServiceContext()->getOpObserver()->onDropCollection(txn, nss);
+    auto opObserver = getGlobalServiceContext()->getOpObserver();
+    if (opObserver)
+        opObserver->onDropCollection(txn, nss);
+
     return Status::OK();
 }
 
@@ -486,7 +490,7 @@ Collection* Database::createCollection(OperationContext* txn,
     massertNamespaceNotIndex(ns, "createCollection");
     invariant(txn->lockState()->isDbLockedForMode(name(), MODE_X));
 
-    if (serverGlobalParams.configsvr &&
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         !(ns.startsWith("config.") || ns.startsWith("local.") || ns.startsWith("admin."))) {
         uasserted(14037, "can't create user databases on a --configsvr instance");
     }
@@ -495,7 +499,9 @@ Collection* Database::createCollection(OperationContext* txn,
         // This check only applies for actual collections, not indexes or other types of ns.
         uassert(17381,
                 str::stream() << "fully qualified namespace " << ns << " is too long "
-                              << "(max is " << NamespaceString::MaxNsCollectionLen << " bytes)",
+                              << "(max is "
+                              << NamespaceString::MaxNsCollectionLen
+                              << " bytes)",
                 ns.size() <= NamespaceString::MaxNsCollectionLen);
     }
 
@@ -529,7 +535,9 @@ Collection* Database::createCollection(OperationContext* txn,
         }
     }
 
-    getGlobalServiceContext()->getOpObserver()->onCreateCollection(txn, nss, options);
+    auto opObserver = getGlobalServiceContext()->getOpObserver();
+    if (opObserver)
+        opObserver->onCreateCollection(txn, nss, options);
 
     return collection;
 }
@@ -560,7 +568,7 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
                 if (db == nullptr) {
                     log() << "database disappeared after listDatabases but before drop: " << *i;
                 } else {
-                    dropDatabase(txn, db);
+                    Database::dropDatabase(txn, db);
                 }
             }
             MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "dropAllDatabasesExceptLocal", *i);
@@ -568,18 +576,18 @@ void dropAllDatabasesExceptLocal(OperationContext* txn) {
     }
 }
 
-void dropDatabase(OperationContext* txn, Database* db) {
+void Database::dropDatabase(OperationContext* txn, Database* db) {
     invariant(db);
 
     // Store the name so we have if for after the db object is deleted
     const string name = db->name();
-    LOG(1) << "dropDatabase " << name << endl;
+    LOG(1) << "dropDatabase " << name;
 
     invariant(txn->lockState()->isDbLockedForMode(name, MODE_X));
 
-    BackgroundOperation::assertNoBgOpInProgForDb(name.c_str());
+    BackgroundOperation::assertNoBgOpInProgForDb(name);
 
-    audit::logDropDatabase(&cc(), name);
+    audit::logDropDatabase(txn->getClient(), name);
 
     dbHolder().close(txn, name);
     db = NULL;  // d is now deleted
@@ -612,6 +620,26 @@ Status userCreateNS(OperationContext* txn,
     Status status = collectionOptions.parse(options);
     if (!status.isOK())
         return status;
+
+    // Validate the collation, if there is one.
+    if (!collectionOptions.collation.isEmpty()) {
+        auto collator = CollatorFactoryInterface::get(txn->getServiceContext())
+                            ->makeFromBSON(collectionOptions.collation);
+        if (!collator.isOK()) {
+            return collator.getStatus();
+        }
+
+        // If the collator factory returned a non-null collator, set the collation option to the
+        // result of serializing the collator's spec back into BSON. We do this in order to fill in
+        // all options that the user omitted.
+        //
+        // If the collator factory returned a null collator (representing the "simple" collation),
+        // we simply unset the "collation" from the collection options. This ensures that
+        // collections created on versions which do not support the collation feature have the same
+        // format for representing the simple collation as collections created on this version.
+        collectionOptions.collation =
+            collator.getValue() ? collator.getValue()->getSpec().toBSON() : BSONObj();
+    }
 
     status =
         validateStorageOptions(collectionOptions.storageEngine,

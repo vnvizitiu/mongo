@@ -9,10 +9,10 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/s/catalog/catalog_types',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_interface',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/util/fail_point'
     ],
 )
@@ -30,7 +30,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/rpc/command_status',
-        '$BUILD_DIR/mongo/s/catalog/catalog_types',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_interface',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
@@ -45,28 +44,32 @@ env.CppUnitTest(
         'replset_dist_lock_manager_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
+        'dist_lock_catalog_impl',
+        'replset_dist_lock_manager',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/executor/network_test_env',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
-        '$BUILD_DIR/mongo/s/catalog/catalog_manager_mock',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_mock',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_mock',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/mongoscore',
-        '$BUILD_DIR/mongo/util/tick_source_mock',
-        'dist_lock_catalog_impl',
+        '$BUILD_DIR/mongo/s/sharding_test_fixture',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
     ]
 )
 
 env.Library(
-    target='catalog_manager_replica_set',
+    target='sharding_catalog_client_impl',
     source=[
-        'catalog_manager_replica_set.cpp',
+        'sharding_catalog_client_impl.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
-        '$BUILD_DIR/mongo/s/catalog/catalog_manager',
+        '$BUILD_DIR/mongo/db/s/type_shard_identity',
+        '$BUILD_DIR/mongo/executor/network_interface',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
         '$BUILD_DIR/mongo/s/client/sharding_client',
     ],
     LIBDEPS_TAGS=[
@@ -75,21 +78,59 @@ env.Library(
     ],
 )
 
-env.CppUnitTest(
-    target='catalog_manager_replica_set_test',
+env.Library(
+    target='sharding_catalog_manager_impl',
     source=[
-        'catalog_manager_replica_set_add_shard_test.cpp',
-        'catalog_manager_replica_set_append_db_stats_test.cpp',
-        'catalog_manager_replica_set_drop_coll_test.cpp',
-        'catalog_manager_replica_set_log_change_test.cpp',
-        'catalog_manager_replica_set_remove_shard_test.cpp',
-        'catalog_manager_replica_set_shard_collection_test.cpp',
-        'catalog_manager_replica_set_test.cpp',
-        'catalog_manager_replica_set_test_fixture.cpp',
-        'catalog_manager_replica_set_upgrade_test.cpp',
-        'catalog_manager_replica_set_write_retry_test.cpp',
+        'sharding_catalog_manager_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/repl/read_concern_args',
+        '$BUILD_DIR/mongo/executor/network_interface',
+        '$BUILD_DIR/mongo/s/client/sharding_client',
+    ],
+    LIBDEPS_TAGS=[
+        # Depends on coreshard, but that would be circular
+        'incomplete',
+    ],
+)
+
+env.Library(
+    target='sharding_catalog_test_fixture',
+    source=[
+        'sharding_catalog_test_fixture.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/sharding_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
+    target='config_server_catalog_test',
+    source=[
+        'sharding_catalog_add_shard_to_zone_test.cpp',
+        'sharding_catalog_remove_shard_from_zone_test.cpp',
+        'sharding_catalog_config_initialization_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/s/config_server_test_fixture',
+    ]
+)
+
+env.CppUnitTest(
+    target='sharding_catalog_test',
+    source=[
+        'sharding_catalog_add_shard_test.cpp',
+        'sharding_catalog_append_db_stats_test.cpp',
+        'sharding_catalog_drop_coll_test.cpp',
+        'sharding_catalog_log_change_test.cpp',
+        'sharding_catalog_remove_shard_test.cpp',
+        'sharding_catalog_shard_collection_test.cpp',
+        'sharding_catalog_test.cpp',
+        'sharding_catalog_write_retry_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/s/sharding_test_fixture',
+        '$BUILD_DIR/mongo/s/catalog/replset/sharding_catalog_test_fixture',
     ]
 )

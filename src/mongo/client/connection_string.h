@@ -47,10 +47,6 @@ class DBClientBase;
  *    server
  *    server:port
  *    foo/server:port,server:port   SET
- *    server,server,server          SYNC
- *                                    Warning - you usually don't want "SYNC", it's used
- *                                    for some special things such as sharding config servers.
- *                                    See syncclusterconnection.h for more info.
  *
  * Typical use:
  *
@@ -60,7 +56,7 @@ class DBClientBase;
  */
 class ConnectionString {
 public:
-    enum ConnectionType { INVALID, MASTER, SET, SYNC, CUSTOM };
+    enum ConnectionType { INVALID, MASTER, SET, CUSTOM, LOCAL };
 
     ConnectionString() = default;
 
@@ -68,6 +64,11 @@ public:
      * Constructs a connection string representing a replica set.
      */
     static ConnectionString forReplicaSet(StringData setName, std::vector<HostAndPort> servers);
+
+    /**
+     * Constructs a local connection string.
+     */
+    static ConnectionString forLocal();
 
     /**
      * Creates a MASTER connection string with the specified server.
@@ -86,7 +87,7 @@ public:
                      std::vector<HostAndPort> servers,
                      const std::string& setName);
 
-    ConnectionString(const std::string& s, ConnectionType favoredMultipleType);
+    ConnectionString(const std::string& s, ConnectionType connType);
 
     bool isValid() const {
         return _type != INVALID;
@@ -109,12 +110,11 @@ public:
     }
 
     /**
-     * This returns true if this and other point to the same logical entity.
-     * For single nodes, thats the same address.
-     * For replica sets, thats just the same replica set name.
-     * For pair (deprecated) or sync cluster connections, that's the same hosts in any ordering.
+     * Returns true if two connection strings match in terms of their type and the exact order of
+     * their hosts.
      */
-    bool sameLogicalEndpoint(const ConnectionString& other) const;
+    bool operator==(const ConnectionString& other) const;
+    bool operator!=(const ConnectionString& other) const;
 
     DBClientBase* connect(std::string& errmsg, double socketTimeout = 0) const;
 
@@ -159,6 +159,10 @@ private:
      */
     ConnectionString(StringData setName, std::vector<HostAndPort> servers);
 
+    /**
+     * Creates a connection string with the specified type. Used for creating LOCAL strings.
+     */
+    explicit ConnectionString(ConnectionType connType);
 
     void _fillServers(std::string s);
     void _finishInit();

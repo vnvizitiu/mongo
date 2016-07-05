@@ -81,8 +81,9 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/mmap_v1/aligned_builder.h"
+#include "mongo/db/storage/mmap_v1/commit_notifier.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/dur_journal_writer.h"
@@ -94,7 +95,7 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -121,12 +122,12 @@ stdx::condition_variable flushRequested;
 // This is waited on for getlasterror acknowledgements. It means that data has been written to
 // the journal, but not necessarily applied to the shared view, so it is all right to
 // acknowledge the user operation, but NOT all right to delete the journal files for example.
-NotifyAll commitNotify;
+CommitNotifier commitNotify;
 
 // This is waited on for complete flush. It means that data has been both written to journal
 // and applied to the shared view, so it is allowed to delete the journal files. Used for
 // fsync:true, close DB, shutdown acknowledgements.
-NotifyAll applyToDataFilesNotify;
+CommitNotifier applyToDataFilesNotify;
 
 // When set, the flush thread will exit
 AtomicUInt32 shutdownRequested(0);
@@ -228,7 +229,7 @@ public:
     virtual void closingFileNotification();
     virtual void commitAndStopDurThread();
 
-    void start();
+    void start(ClockSource* cs, int64_t serverStartMs);
 
 private:
     stdx::thread _durThreadHandle;
@@ -409,14 +410,17 @@ static stdx::mutex journalListenerMutex;
 
 
 // Declared in dur_preplogbuffer.cpp
-void PREPLOGBUFFER(JSectHeader& outHeader, AlignedBuilder& outBuffer);
+void PREPLOGBUFFER(JSectHeader& outHeader,
+                   AlignedBuilder& outBuffer,
+                   ClockSource* cs,
+                   int64_t serverStartMs);
 
 // Declared in dur_journal.cpp
 boost::filesystem::path getJournalDir();
 void preallocateFiles();
 
 // Forward declaration
-static void durThread();
+static void durThread(ClockSource* cs, int64_t serverStartMs);
 
 // Durability activity statistics
 Stats stats;
@@ -484,10 +488,15 @@ void Stats::S::_asObj(BSONObjBuilder* builder) const {
       << _journaledBytes / (_uncompressedBytes + 1.0) << "commitsInWriteLock" << _commitsInWriteLock
       << "earlyCommits" << 0 << "timeMs"
       << BSON("dt" << _durationMillis << "prepLogBuffer" << (unsigned)(_prepLogBufferMicros / 1000)
-                   << "writeToJournal" << (unsigned)(_writeToJournalMicros / 1000)
-                   << "writeToDataFiles" << (unsigned)(_writeToDataFilesMicros / 1000)
-                   << "remapPrivateView" << (unsigned)(_remapPrivateViewMicros / 1000) << "commits"
-                   << (unsigned)(_commitsMicros / 1000) << "commitsInWriteLock"
+                   << "writeToJournal"
+                   << (unsigned)(_writeToJournalMicros / 1000)
+                   << "writeToDataFiles"
+                   << (unsigned)(_writeToDataFilesMicros / 1000)
+                   << "remapPrivateView"
+                   << (unsigned)(_remapPrivateViewMicros / 1000)
+                   << "commits"
+                   << (unsigned)(_commitsMicros / 1000)
+                   << "commitsInWriteLock"
                    << (unsigned)(_commitsInWriteLockMicros / 1000));
 
     if (storageGlobalParams.journalCommitIntervalMs != 0) {
@@ -510,7 +519,7 @@ DurableInterface::~DurableInterface() {}
 //
 
 bool DurableImpl::commitNow(OperationContext* txn) {
-    NotifyAll::When when = commitNotify.now();
+    CommitNotifier::When when = commitNotify.now();
 
     AutoYieldFlushLockForMMAPV1Commit flushLockYield(txn->lockState());
 
@@ -581,7 +590,7 @@ void DurableImpl::closingFileNotification() {
 }
 
 void DurableImpl::commitAndStopDurThread() {
-    NotifyAll::When when = commitNotify.now();
+    CommitNotifier::When when = commitNotify.now();
 
     // There is always just one waiting anyways
     flushRequested.notify_one();
@@ -607,9 +616,9 @@ void DurableImpl::commitAndStopDurThread() {
     _durThreadHandle.join();
 }
 
-void DurableImpl::start() {
+void DurableImpl::start(ClockSource* cs, int64_t serverStartMs) {
     // Start the durability thread
-    stdx::thread t(durThread);
+    stdx::thread t(durThread, cs, serverStartMs);
     _durThreadHandle.swap(t);
 }
 
@@ -655,7 +664,7 @@ static void remapPrivateView(double fraction) {
 /**
  * The main durability thread loop. There is a single instance of this function running.
  */
-static void durThread() {
+static void durThread(ClockSource* cs, int64_t serverStartMs) {
     Client::initThread("durability");
 
     log() << "Durability thread started";
@@ -683,7 +692,7 @@ static void durThread() {
         }
 
         // +1 so it never goes down to zero
-        const unsigned oneThird = (ms / 3) + 1;
+        const int64_t oneThird = (ms / 3) + 1;
 
         // Reset the stats based on the reset interval
         if (stats.curr()->getCurrentDurationMillis() > DurStatsResetIntervalMillis) {
@@ -695,7 +704,7 @@ static void durThread() {
 
             for (unsigned i = 0; i <= 2; i++) {
                 if (stdx::cv_status::no_timeout ==
-                    flushRequested.wait_for(lock, Milliseconds(oneThird))) {
+                    flushRequested.wait_for(lock, Milliseconds(oneThird).toSystemDuration())) {
                     // Someone forced a flush
                     break;
                 }
@@ -716,12 +725,13 @@ static void durThread() {
 
             Timer t;
 
-            OperationContextImpl txn;
+            const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+            OperationContext& txn = *txnPtr;
             AutoAcquireFlushLockForMMAPV1Commit autoFlushLock(txn.lockState());
 
             // We need to snapshot the commitNumber after the flush lock has been obtained,
             // because at this point we know that we have a stable snapshot of the data.
-            const NotifyAll::When commitNumber(commitNotify.now());
+            const CommitNotifier::When commitNumber(commitNotify.now());
 
             LOG(4) << "Processing commit number " << commitNumber;
 
@@ -741,7 +751,7 @@ static void durThread() {
             } else {
                 // This copies all the in-memory changes into the journal writer's buffer.
                 JournalWriter::Buffer* const buffer = journalWriter.newBuffer();
-                PREPLOGBUFFER(buffer->getHeader(), buffer->getBuilder());
+                PREPLOGBUFFER(buffer->getHeader(), buffer->getBuilder(), cs, serverStartMs);
 
                 estimatedPrivateMapSize += commitJob.bytes();
                 commitCounter++;
@@ -867,12 +877,12 @@ static void durThread() {
  * Invoked at server startup. Recovers the database by replaying journal files and then
  * starts the durability thread.
  */
-void startup() {
+void startup(ClockSource* cs, int64_t serverStartMs) {
     if (!storageGlobalParams.dur) {
         return;
     }
 
-    journalMakeDir();
+    journalMakeDir(cs, serverStartMs);
 
     try {
         replayJournalFilesAtStartup();
@@ -889,7 +899,7 @@ void startup() {
 
     preallocateFiles();
 
-    durableImpl.start();
+    durableImpl.start(cs, serverStartMs);
     DurableInterface::_impl = &durableImpl;
 }
 

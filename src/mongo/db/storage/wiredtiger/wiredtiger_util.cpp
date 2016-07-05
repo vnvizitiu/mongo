@@ -45,6 +45,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -69,6 +70,8 @@ Status wtRCToStatus_slow(int retCode, const char* prefix) {
     if (retCode == EINVAL) {
         return Status(ErrorCodes::BadValue, s);
     }
+
+    uassert(ErrorCodes::ExceededMemoryLimit, s, retCode != WT_CACHE_FULL);
 
     // TODO convert specific codes rather than just using UNKNOWN_ERROR for everything.
     return Status(ErrorCodes::UnknownError, s);
@@ -151,7 +154,9 @@ Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
         if (keysSeen.count(key)) {
             return Status(ErrorCodes::DuplicateKey,
                           str::stream() << "app_metadata must not contain duplicate keys. "
-                                        << "Found multiple instances of key '" << key << "'.");
+                                        << "Found multiple instances of key '"
+                                        << key
+                                        << "'.");
         }
         keysSeen.insert(key);
 
@@ -184,10 +189,10 @@ StatusWith<BSONObj> WiredTigerUtil::getApplicationMetadata(OperationContext* opC
     return StatusWith<BSONObj>(bob.obj());
 }
 
-Status WiredTigerUtil::checkApplicationMetadataFormatVersion(OperationContext* opCtx,
-                                                             StringData uri,
-                                                             int64_t minimumVersion,
-                                                             int64_t maximumVersion) {
+StatusWith<int64_t> WiredTigerUtil::checkApplicationMetadataFormatVersion(OperationContext* opCtx,
+                                                                          StringData uri,
+                                                                          int64_t minimumVersion,
+                                                                          int64_t maximumVersion) {
     StatusWith<std::string> result = getMetadata(opCtx, uri);
     if (result.getStatus().code() == ErrorCodes::NoSuchKey) {
         return result.getStatus();
@@ -199,6 +204,13 @@ Status WiredTigerUtil::checkApplicationMetadataFormatVersion(OperationContext* o
     if (topParser.get("app_metadata", &metadata) != 0)
         return Status(ErrorCodes::UnsupportedFormat,
                       str::stream() << "application metadata for " << uri << " is missing ");
+
+    if (metadata.type != WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRUCT) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "application metadata must be enclosed in parentheses. Actual value: "
+                          << StringData(metadata.str, metadata.len));
+    }
 
     WiredTigerConfigParser parser(metadata);
 
@@ -220,14 +232,16 @@ Status WiredTigerUtil::checkApplicationMetadataFormatVersion(OperationContext* o
     if (version < minimumVersion || version > maximumVersion) {
         return Status(ErrorCodes::UnsupportedFormat,
                       str::stream() << "Application metadata for " << uri
-                                    << " has unsupported format version " << version);
+                                    << " has unsupported format version: "
+                                    << version
+                                    << ".");
     }
 
     LOG(2) << "WiredTigerUtil::checkApplicationMetadataFormatVersion "
            << " uri: " << uri << " ok range " << minimumVersion << " -> " << maximumVersion
            << " current: " << version;
 
-    return Status::OK();
+    return version;
 }
 
 // static
@@ -268,7 +282,8 @@ StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
     if (ret != 0) {
         return StatusWith<uint64_t>(ErrorCodes::CursorNotFound,
                                     str::stream() << "unable to open cursor at URI " << uri
-                                                  << ". reason: " << wiredtiger_strerror(ret));
+                                                  << ". reason: "
+                                                  << wiredtiger_strerror(ret));
     }
     invariant(cursor);
     ON_BLOCK_EXIT(cursor->close, cursor);
@@ -276,19 +291,21 @@ StatusWith<uint64_t> WiredTigerUtil::getStatisticsValue(WT_SESSION* session,
     cursor->set_key(cursor, statisticsKey);
     ret = cursor->search(cursor);
     if (ret != 0) {
-        return StatusWith<uint64_t>(ErrorCodes::NoSuchKey,
-                                    str::stream() << "unable to find key " << statisticsKey
-                                                  << " at URI " << uri
-                                                  << ". reason: " << wiredtiger_strerror(ret));
+        return StatusWith<uint64_t>(
+            ErrorCodes::NoSuchKey,
+            str::stream() << "unable to find key " << statisticsKey << " at URI " << uri
+                          << ". reason: "
+                          << wiredtiger_strerror(ret));
     }
 
     uint64_t value;
     ret = cursor->get_value(cursor, NULL, NULL, &value);
     if (ret != 0) {
-        return StatusWith<uint64_t>(ErrorCodes::BadValue,
-                                    str::stream() << "unable to get value for key " << statisticsKey
-                                                  << " at URI " << uri
-                                                  << ". reason: " << wiredtiger_strerror(ret));
+        return StatusWith<uint64_t>(
+            ErrorCodes::BadValue,
+            str::stream() << "unable to get value for key " << statisticsKey << " at URI " << uri
+                          << ". reason: "
+                          << wiredtiger_strerror(ret));
     }
 
     return StatusWith<uint64_t>(value);
@@ -306,6 +323,26 @@ int64_t WiredTigerUtil::getIdentSize(WT_SESSION* s, const std::string& uri) {
         uassertStatusOK(status);
     }
     return result.getValue();
+}
+
+size_t WiredTigerUtil::getCacheSizeMB(double requestedCacheSizeGB) {
+    double cacheSizeMB;
+    const double kMaxSizeCacheMB = 10 * 1000 * 1000;
+    if (requestedCacheSizeGB == 0) {
+        // Choose a reasonable amount of cache when not explicitly specified by user.
+        // Set a minimum of 256MB, otherwise use 50% of available memory over 1GB.
+        ProcessInfo pi;
+        double memSizeMB = pi.getMemSizeMB();
+        cacheSizeMB = std::max((memSizeMB - 1024) * 0.5, 256.0);
+    } else {
+        cacheSizeMB = 1024 * requestedCacheSizeGB;
+    }
+    if (cacheSizeMB > kMaxSizeCacheMB) {
+        log() << "Requested cache size: " << cacheSizeMB << "MB exceeds max; setting to "
+              << kMaxSizeCacheMB << "MB";
+        cacheSizeMB = kMaxSizeCacheMB;
+    }
+    return static_cast<size_t>(cacheSizeMB);
 }
 
 namespace {
@@ -407,8 +444,8 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
     int ret = session->open_cursor(session, uri.c_str(), NULL, cursorConfig, &c);
     if (ret != 0) {
         return Status(ErrorCodes::CursorNotFound,
-                      str::stream() << "unable to open cursor at URI " << uri
-                                    << ". reason: " << wiredtiger_strerror(ret));
+                      str::stream() << "unable to open cursor at URI " << uri << ". reason: "
+                                    << wiredtiger_strerror(ret));
     }
     bob->append("uri", uri);
     invariant(c);

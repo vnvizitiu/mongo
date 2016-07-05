@@ -28,18 +28,20 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include <cstdint>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace IndexUpdateTests {
@@ -115,7 +117,8 @@ protected:
         return false;
     }
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     OldClientWriteContext _ctx;
     DBDirectClient _client;
 };
@@ -348,13 +351,16 @@ public:
             db->dropCollection(&_txn, _ns);
             coll = db->createCollection(&_txn, _ns);
 
+            OpDebug* const nullOpDebug = nullptr;
             coll->insertDocument(&_txn,
                                  BSON("_id" << 1 << "a"
                                             << "dup"),
+                                 nullOpDebug,
                                  true);
             coll->insertDocument(&_txn,
                                  BSON("_id" << 2 << "a"
                                             << "dup"),
+                                 nullOpDebug,
                                  true);
             wunit.commit();
         }
@@ -366,8 +372,14 @@ public:
 
         const BSONObj spec = BSON("name"
                                   << "a"
-                                  << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "unique"
-                                  << true << "background" << background);
+                                  << "ns"
+                                  << coll->ns().ns()
+                                  << "key"
+                                  << BSON("a" << 1)
+                                  << "unique"
+                                  << true
+                                  << "background"
+                                  << background);
 
         ASSERT_OK(indexer.init(spec));
         ASSERT_OK(indexer.insertAllDocumentsInCollection());
@@ -391,13 +403,16 @@ public:
             db->dropCollection(&_txn, _ns);
             coll = db->createCollection(&_txn, _ns);
 
+            OpDebug* const nullOpDebug = nullptr;
             coll->insertDocument(&_txn,
                                  BSON("_id" << 1 << "a"
                                             << "dup"),
+                                 nullOpDebug,
                                  true);
             coll->insertDocument(&_txn,
                                  BSON("_id" << 2 << "a"
                                             << "dup"),
+                                 nullOpDebug,
                                  true);
             wunit.commit();
         }
@@ -409,8 +424,14 @@ public:
 
         const BSONObj spec = BSON("name"
                                   << "a"
-                                  << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "unique"
-                                  << true << "background" << background);
+                                  << "ns"
+                                  << coll->ns().ns()
+                                  << "key"
+                                  << BSON("a" << 1)
+                                  << "unique"
+                                  << true
+                                  << "background"
+                                  << background);
 
         ASSERT_OK(indexer.init(spec));
         const Status status = indexer.insertAllDocumentsInCollection();
@@ -433,13 +454,16 @@ public:
             db->dropCollection(&_txn, _ns);
             coll = db->createCollection(&_txn, _ns);
 
+            OpDebug* const nullOpDebug = nullptr;
             ASSERT_OK(coll->insertDocument(&_txn,
                                            BSON("_id" << 1 << "a"
                                                       << "dup"),
+                                           nullOpDebug,
                                            true));
             ASSERT_OK(coll->insertDocument(&_txn,
                                            BSON("_id" << 2 << "a"
                                                       << "dup"),
+                                           nullOpDebug,
                                            true));
             wunit.commit();
         }
@@ -451,8 +475,14 @@ public:
 
         const BSONObj spec = BSON("name"
                                   << "a"
-                                  << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "unique"
-                                  << true << "background" << background);
+                                  << "ns"
+                                  << coll->ns().ns()
+                                  << "key"
+                                  << BSON("a" << 1)
+                                  << "unique"
+                                  << true
+                                  << "background"
+                                  << background);
 
         ASSERT_OK(indexer.init(spec));
 
@@ -485,8 +515,9 @@ public:
             coll->getIndexCatalog()->dropAllIndexes(&_txn, true);
             // Insert some documents with enforceQuota=true.
             int32_t nDocs = 1000;
+            OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_txn, BSON("a" << i), true);
+                coll->insertDocument(&_txn, BSON("a" << i), nullOpDebug, true);
             }
             wunit.commit();
         }
@@ -517,8 +548,9 @@ public:
             coll->getIndexCatalog()->dropAllIndexes(&_txn, true);
             // Insert some documents.
             int32_t nDocs = 1000;
+            OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_txn, BSON("a" << i), true);
+                coll->insertDocument(&_txn, BSON("a" << i), nullOpDebug, true);
             }
             wunit.commit();
         }
@@ -552,8 +584,9 @@ public:
             coll->getIndexCatalog()->dropAllIndexes(&_txn, true);
             // Insert some documents.
             int32_t nDocs = 1000;
+            OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_txn, BSON("_id" << i), true);
+                coll->insertDocument(&_txn, BSON("_id" << i), nullOpDebug, true);
             }
             wunit.commit();
         }
@@ -587,8 +620,9 @@ public:
             coll->getIndexCatalog()->dropAllIndexes(&_txn, true);
             // Insert some documents.
             int32_t nDocs = 1000;
+            OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_txn, BSON("_id" << i), true);
+                coll->insertDocument(&_txn, BSON("_id" << i), nullOpDebug, true);
             }
             wunit.commit();
         }
@@ -713,7 +747,10 @@ public:
         ASSERT_OK(createIndex("unittest",
                               BSON("name"
                                    << "x"
-                                   << "ns" << _ns << "key" << BSON("x" << 1 << "y" << 1))));
+                                   << "ns"
+                                   << _ns
+                                   << "key"
+                                   << BSON("x" << 1 << "y" << 1))));
     }
 };
 
@@ -725,7 +762,11 @@ public:
                       createIndex("unittest",
                                   BSON("name"
                                        << "x"
-                                       << "ns" << _ns << "unique" << true << "key"
+                                       << "ns"
+                                       << _ns
+                                       << "unique"
+                                       << true
+                                       << "key"
                                        << BSON("x" << 1 << "y" << 1))));
     }
 };
@@ -736,7 +777,10 @@ public:
         ASSERT_OK(createIndex("unittest",
                               BSON("name"
                                    << "x"
-                                   << "ns" << _ns << "key" << BSON("x" << 1 << "y" << 1))));
+                                   << "ns"
+                                   << _ns
+                                   << "key"
+                                   << BSON("x" << 1 << "y" << 1))));
     }
 };
 
@@ -748,7 +792,10 @@ public:
                       createIndex("unittest",
                                   BSON("name"
                                        << "x"
-                                       << "ns" << _ns << "key" << BSON("y" << 1 << "x" << 1))));
+                                       << "ns"
+                                       << _ns
+                                       << "key"
+                                       << BSON("y" << 1 << "x" << 1))));
     }
 };
 
@@ -761,9 +808,17 @@ public:
         ASSERT_OK(createIndex("unittests",
                               BSON("name"
                                    << "super"
-                                   << "ns" << _ns << "unique" << 1 << "sparse" << true
-                                   << "expireAfterSeconds" << 3600 << "key" << BSON("superIdx"
-                                                                                    << "2d"))));
+                                   << "ns"
+                                   << _ns
+                                   << "unique"
+                                   << 1
+                                   << "sparse"
+                                   << true
+                                   << "expireAfterSeconds"
+                                   << 3600
+                                   << "key"
+                                   << BSON("superIdx"
+                                           << "2d"))));
     }
 };
 
@@ -775,9 +830,17 @@ public:
         ASSERT_OK(createIndex("unittests",
                               BSON("name"
                                    << "super2"
-                                   << "ns" << _ns << "expireAfterSeconds" << 3600 << "sparse"
-                                   << true << "unique" << 1 << "key" << BSON("superIdx"
-                                                                             << "2d"))));
+                                   << "ns"
+                                   << _ns
+                                   << "expireAfterSeconds"
+                                   << 3600
+                                   << "sparse"
+                                   << true
+                                   << "unique"
+                                   << 1
+                                   << "key"
+                                   << BSON("superIdx"
+                                           << "2d"))));
     }
 };
 
@@ -791,23 +854,40 @@ public:
                       createIndex("unittest",
                                   BSON("name"
                                        << "super2"
-                                       << "ns" << _ns << "unique" << false << "sparse" << true
-                                       << "expireAfterSeconds" << 3600 << "key" << BSON("superIdx"
-                                                                                        << "2d"))));
+                                       << "ns"
+                                       << _ns
+                                       << "unique"
+                                       << false
+                                       << "sparse"
+                                       << true
+                                       << "expireAfterSeconds"
+                                       << 3600
+                                       << "key"
+                                       << BSON("superIdx"
+                                               << "2d"))));
     }
 };
 
 class SameSpecDifferentSparse : public ComplexIndex {
 public:
     void run() {
-        ASSERT_EQUALS(
-            ErrorCodes::IndexOptionsConflict,
-            createIndex("unittest",
-                        BSON("name"
-                             << "super2"
-                             << "ns" << _ns << "unique" << 1 << "sparse" << false << "background"
-                             << true << "expireAfterSeconds" << 3600 << "key" << BSON("superIdx"
-                                                                                      << "2d"))));
+        ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
+                      createIndex("unittest",
+                                  BSON("name"
+                                       << "super2"
+                                       << "ns"
+                                       << _ns
+                                       << "unique"
+                                       << 1
+                                       << "sparse"
+                                       << false
+                                       << "background"
+                                       << true
+                                       << "expireAfterSeconds"
+                                       << 3600
+                                       << "key"
+                                       << BSON("superIdx"
+                                               << "2d"))));
     }
 };
 
@@ -818,9 +898,17 @@ public:
                       createIndex("unittest",
                                   BSON("name"
                                        << "super2"
-                                       << "ns" << _ns << "unique" << 1 << "sparse" << true
-                                       << "expireAfterSeconds" << 2400 << "key" << BSON("superIdx"
-                                                                                        << "2d"))));
+                                       << "ns"
+                                       << _ns
+                                       << "unique"
+                                       << 1
+                                       << "sparse"
+                                       << true
+                                       << "expireAfterSeconds"
+                                       << 2400
+                                       << "key"
+                                       << BSON("superIdx"
+                                               << "2d"))));
     }
 };
 
@@ -867,7 +955,11 @@ protected:
     BSONObj _createSpec(T storageEngineValue) {
         return BSON("name"
                     << "super2"
-                    << "ns" << _ns << "key" << BSON("a" << 1) << "storageEngine"
+                    << "ns"
+                    << _ns
+                    << "key"
+                    << BSON("a" << 1)
+                    << "storageEngine"
                     << storageEngineValue);
     }
 };

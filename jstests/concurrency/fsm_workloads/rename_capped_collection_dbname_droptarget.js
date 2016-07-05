@@ -7,7 +7,7 @@
  * command against it, specifying a different database name in the namespace.
  * Inserts documents into the "to" namespace and specifies dropTarget=true.
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropDatabases
+load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropDatabases
 
 var $config = (function() {
 
@@ -19,10 +19,7 @@ var $config = (function() {
 
     var states = (function() {
 
-        var options = {
-            capped: true,
-            size: 4096
-        };
+        var options = {capped: true, size: 4096};
 
         function uniqueDBName(prefix, tid, num) {
             return prefix + tid + '_' + num;
@@ -80,17 +77,11 @@ var $config = (function() {
             this.toDBName = temp;
         }
 
-        return {
-            init: init,
-            rename: rename
-        };
+        return {init: init, rename: rename};
 
     })();
 
-    var transitions = {
-        init: { rename: 1 },
-        rename: { rename: 1 }
-    };
+    var transitions = {init: {rename: 1}, rename: {rename: 1}};
 
     function teardown(db, collName, cluster) {
         var pattern = new RegExp('^' + db.getName() + this.prefix + '\\d+_\\d+$');

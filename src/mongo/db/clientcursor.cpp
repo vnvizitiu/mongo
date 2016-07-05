@@ -46,7 +46,6 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
@@ -92,9 +91,6 @@ ClientCursor::ClientCursor(CursorManager* cursorManager,
     _exec.reset(exec);
     _query = query;
     _queryOptions = qopts;
-    if (exec->collection()) {
-        invariant(cursorManager == exec->collection()->getCursorManager());
-    }
     init();
 }
 
@@ -115,7 +111,7 @@ void ClientCursor::init() {
     _isNoTimeout = false;
 
     _idleAgeMillis = 0;
-    _leftoverMaxTimeMicros = 0;
+    _leftoverMaxTimeMicros = Microseconds::max();
     _pos = 0;
 
     if (_queryOptions & QueryOption_NoCursorTimeout) {
@@ -270,7 +266,8 @@ public:
         const int Secs = 4;
         while (!inShutdown()) {
             {
-                OperationContextImpl txn;
+                const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+                OperationContext& txn = *txnPtr;
                 cursorStatsTimedOut.increment(
                     CursorManager::timeoutCursorsGlobal(&txn, t.millisReset()));
             }

@@ -5,8 +5,8 @@
  *
  * Intersperse geo $near queries with updates and deletes of documents they may match.
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/yield.js'); // for $config
+load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
+load('jstests/concurrency/fsm_workloads/yield.js');       // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
 
@@ -20,15 +20,15 @@ var $config = extendWorkload($config, function($config, $super) {
         // every 1m^2 and the area scanned by a 5m radius is PI*(5m)^2 ~ 79.
         var maxDistance = 5;
 
-        var res = db.runCommand({ geoNear: collName, near: [0, 0], maxDistance: maxDistance });
+        var res = db.runCommand({geoNear: collName, near: [0, 0], maxDistance: maxDistance});
         assertWhenOwnColl.commandWorked(res);  // Could fail if more than 1 2d index.
         assertWhenOwnColl(function verifyResults() {
             var results = res.results;
-            var prevDoc = { dis: 0 }; // distance should never be less than 0
+            var prevDoc = {dis: 0};  // distance should never be less than 0
             for (var i = 0; i < results.length; i++) {
                 var doc = results[i];
                 assertAlways.lte(NumberInt(doc.dis), maxDistance);  // satisfies query
-                assertAlways.lte(prevDoc.dis, doc.dis);  // returned in the correct order
+                assertAlways.lte(prevDoc.dis, doc.dis);             // returned in the correct order
                 prevDoc = doc;
             }
         });
@@ -38,17 +38,17 @@ var $config = extendWorkload($config, function($config, $super) {
         var P = Math.floor(Math.sqrt(this.nDocs));
 
         // Move the point to another location within the PxP grid.
-        var newX = Random.randInt(P) - P/2;
-        var newY = Random.randInt(P) - P/2;
-        return { $set: { geo: [newX, newY] } };
+        var newX = Random.randInt(P) - P / 2;
+        var newY = Random.randInt(P) - P / 2;
+        return {$set: {geo: [newX, newY]}};
     };
 
     $config.data.getIndexSpec = function getIndexSpec() {
-        return { geo: '2d' };
+        return {geo: '2d'};
     };
 
     $config.data.getReplaceSpec = function getReplaceSpec(i, coords) {
-        return { _id: i, geo: coords };
+        return {_id: i, geo: coords};
     };
 
     /*
@@ -63,8 +63,8 @@ var $config = extendWorkload($config, function($config, $super) {
         var bulk = db[collName].initializeUnorderedBulkOp();
         for (var x = 0; x < P; x++) {
             for (var y = 0; y < P; y++) {
-                var coords = [x - P/2, y - P/2];
-                bulk.find({ _id: i }).upsert().replaceOne(this.getReplaceSpec(i, coords));
+                var coords = [x - P / 2, y - P / 2];
+                bulk.find({_id: i}).upsert().replaceOne(this.getReplaceSpec(i, coords));
                 i++;
             }
         }

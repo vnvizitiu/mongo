@@ -30,6 +30,7 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/client.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/commands.h"
@@ -40,10 +41,9 @@
 #include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/dbclient_multi_command.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_explain.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/cluster_write.h"
-#include "mongo/s/dbclient_shard_resolver.h"
+#include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batch_upconvert.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -73,8 +73,9 @@ public:
         return false;
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     virtual Status checkAuthForCommand(ClientBasic* client,
@@ -258,7 +259,6 @@ private:
                 return status;
         }
 
-        DBClientShardResolver resolver;
         DBClientMultiCommand dispatcher;
 
         // Assemble requests
@@ -266,11 +266,18 @@ private:
              ++it) {
             const ShardEndpoint* endpoint = *it;
 
-            ConnectionString host;
-            Status status = resolver.chooseWriteHost(txn, endpoint->shardName, &host);
-            if (!status.isOK())
-                return status;
+            const ReadPreferenceSetting readPref(ReadPreference::PrimaryOnly, TagSet());
+            auto shard = grid.shardRegistry()->getShard(txn, endpoint->shardName);
+            if (!shard) {
+                return Status(ErrorCodes::ShardNotFound,
+                              "Could not find shard with id " + endpoint->shardName.toString());
+            }
+            auto swHostAndPort = shard->getTargeter()->findHost(readPref);
+            if (!swHostAndPort.isOK()) {
+                return swHostAndPort.getStatus();
+            }
 
+            ConnectionString host(swHostAndPort.getValue());
             dispatcher.addCommand(host, dbName, command);
         }
 

@@ -48,10 +48,9 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/operation_context_impl.h"
-#include "mongo/db/ops/insert.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
@@ -121,7 +120,8 @@ public:
 private:
     void doTTLPass() {
         // Count it as active from the moment the TTL thread wakes up
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
 
         // if part of replSet but not in a readable state (e.g. during initial sync), skip.
         if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
@@ -288,8 +288,10 @@ private:
         const char* keyFieldName = key.firstElement().fieldName();
         BSONObj query =
             BSON(keyFieldName << BSON("$gte" << kDawnOfTime << "$lte" << expirationTime));
-        auto canonicalQuery =
-            CanonicalQuery::canonicalize(nss, query, ExtensionsCallbackDisallowExtensions());
+        auto qr = stdx::make_unique<QueryRequest>(nss);
+        qr->setFilter(query);
+        auto canonicalQuery = CanonicalQuery::canonicalize(
+            txn, std::move(qr), ExtensionsCallbackDisallowExtensions());
         invariantOK(canonicalQuery.getStatus());
 
         DeleteStageParams params;

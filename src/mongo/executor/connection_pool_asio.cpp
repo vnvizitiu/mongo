@@ -52,12 +52,14 @@ ASIOTimer::~ASIOTimer() {
     ++_callbackSharedState->id;
 }
 
+const auto kMaxTimerDuration = duration_cast<Milliseconds>(ASIOTimer::clock_type::duration::max());
+
 void ASIOTimer::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
     _strand->dispatch([this, timeout, cb] {
         _cb = std::move(cb);
 
         cancelTimeout();
-        _impl.expires_after(timeout);
+        _impl.expires_after(std::min(kMaxTimerDuration, timeout).toSystemDuration());
 
         decltype(_callbackSharedState->id) id;
         decltype(_callbackSharedState) sharedState;
@@ -183,7 +185,26 @@ void ASIOConnection::cancelTimeout() {
 
 void ASIOConnection::setup(Milliseconds timeout, SetupCallback cb) {
     _impl->strand().dispatch([this, timeout, cb] {
-        _setupCallback = std::move(cb);
+        _setupCallback = [this, cb](ConnectionInterface* ptr, Status status) {
+            cancelTimeout();
+            cb(ptr, status);
+        };
+
+        std::size_t generation;
+        {
+            stdx::lock_guard<stdx::mutex> lk(_impl->_access->mutex);
+            generation = _impl->_access->id;
+        }
+
+        // Actually timeout setup
+        setTimeout(timeout, [this, generation] {
+            stdx::lock_guard<stdx::mutex> lk(_impl->_access->mutex);
+            if (generation != _impl->_access->id) {
+                // The operation has been cleaned up, do not access.
+                return;
+            }
+            _impl->timeOut_inlock();
+        });
 
         _global->_impl->_connect(_impl.get());
     });
@@ -200,7 +221,7 @@ void ASIOConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
         _refreshCallback = std::move(cb);
 
         // Actually timeout refreshes
-        setTimeout(timeout, [this]() { _impl->connection().stream().cancel(); });
+        setTimeout(timeout, [this] { _impl->connection().stream().cancel(); });
 
         // Our pings are isMaster's
         auto beginStatus = op->beginCommand(makeIsMasterRequest(this),
@@ -223,18 +244,16 @@ void ASIOConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
             cb(this, failedResponse.getStatus());
         });
 
-        _global->_impl->_asyncRunCommand(
-            op,
-            [this, op](std::error_code ec, size_t bytes) {
-                cancelTimeout();
+        _global->_impl->_asyncRunCommand(op, [this, op](std::error_code ec, size_t bytes) {
+            cancelTimeout();
 
-                auto cb = std::move(_refreshCallback);
+            auto cb = std::move(_refreshCallback);
 
-                if (ec)
-                    return cb(this, Status(ErrorCodes::HostUnreachable, ec.message()));
+            if (ec)
+                return cb(this, Status(ErrorCodes::HostUnreachable, ec.message()));
 
-                cb(this, Status::OK());
-            });
+            cb(this, Status::OK());
+        });
     });
 }
 

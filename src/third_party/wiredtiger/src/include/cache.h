@@ -26,6 +26,19 @@ struct __wt_evict_entry {
 	WT_REF	 *ref;			/* Page to flush/evict */
 };
 
+#define	WT_EVICT_QUEUE_MAX	2
+/*
+ * WT_EVICT_QUEUE --
+ *	Encapsulation of an eviction candidate queue.
+ */
+struct __wt_evict_queue {
+	WT_SPINLOCK evict_lock;		/* Eviction LRU queue */
+	WT_EVICT_ENTRY *evict_queue;	/* LRU pages being tracked */
+	uint32_t evict_candidates;	/* LRU list pages to evict */
+	uint32_t evict_entries;		/* LRU entries in the queue */
+	volatile uint32_t evict_max;	/* LRU maximum eviction slot used */
+};
+
 /*
  * WT_EVICT_WORKER --
  *	Encapsulation of an eviction worker thread.
@@ -63,27 +76,32 @@ struct __wt_cache {
 	uint64_t bytes_overflow;	/* Bytes of overflow pages */
 	uint64_t bytes_evict;		/* Bytes/pages discarded by eviction */
 	uint64_t pages_evict;
+	uint64_t pages_evicted;		/* Pages evicted during a pass */
 	uint64_t bytes_dirty;		/* Bytes/pages currently dirty */
 	uint64_t pages_dirty;
 	uint64_t bytes_read;		/* Bytes read into memory */
 
-	uint64_t app_evicts;		/* Pages evicted by user threads */
 	uint64_t app_waits;		/* User threads waited for cache */
+	uint64_t app_evicts;		/* Pages evicted by user threads */
+	uint64_t server_evicts;		/* Pages evicted by server thread */
+	uint64_t worker_evicts;		/* Pages evicted by worker threads */
 
 	uint64_t evict_max_page_size;	/* Largest page seen at eviction */
+#ifdef	HAVE_DIAGNOSTIC
+	struct timespec stuck_ts;	/* Stuck timestamp */
+#endif
 
 	/*
 	 * Read information.
 	 */
-	uint64_t   read_gen;		/* Page read generation (LRU) */
-	uint64_t   read_gen_oldest;	/* The oldest read generation that
-					   eviction knows about */
+	uint64_t read_gen;		/* Current page read generation */
+	uint64_t read_gen_oldest;	/* Oldest read generation the eviction
+					 * server saw in its last queue load */
 
 	/*
 	 * Eviction thread information.
 	 */
 	WT_CONDVAR *evict_cond;		/* Eviction server condition */
-	WT_SPINLOCK evict_lock;		/* Eviction LRU queue */
 	WT_SPINLOCK evict_walk_lock;	/* Eviction walk location */
 	/* Condition signalled when the eviction server populates the queue */
 	WT_CONDVAR *evict_waiter_cond;
@@ -98,11 +116,13 @@ struct __wt_cache {
 	/*
 	 * LRU eviction list information.
 	 */
-	WT_EVICT_ENTRY *evict_queue;	/* LRU pages being tracked */
+	WT_SPINLOCK evict_pass_lock;	/* Eviction pass lock */
+	WT_SESSION_IMPL *walk_session;	/* Eviction pass session */
+	WT_SPINLOCK evict_queue_lock;	/* Eviction current queue lock */
+	WT_EVICT_QUEUE evict_queues[WT_EVICT_QUEUE_MAX];
+	WT_EVICT_QUEUE *evict_current_queue;/* LRU current queue in use */
 	WT_EVICT_ENTRY *evict_current;	/* LRU current page to be evicted */
-	uint32_t evict_candidates;	/* LRU list pages to evict */
-	uint32_t evict_entries;		/* LRU entries in the queue */
-	volatile uint32_t evict_max;	/* LRU maximum eviction slot used */
+	uint32_t evict_queue_fill;	/* LRU eviction queue index to fill */
 	uint32_t evict_slots;		/* LRU list eviction slots */
 	WT_DATA_HANDLE
 		*evict_file_next;	/* LRU next file to search */
@@ -130,18 +150,27 @@ struct __wt_cache {
 #define	WT_EVICT_PASS_DIRTY		0x04
 #define	WT_EVICT_PASS_WOULD_BLOCK	0x08
 	uint32_t state;
+	/*
+	 * Pass interrupt counter.
+	 */
+	uint32_t pass_intr;		/* Interrupt eviction pass. */
 
 	/*
 	 * Flags.
 	 */
 #define	WT_CACHE_POOL_MANAGER	0x01	/* The active cache pool manager */
 #define	WT_CACHE_POOL_RUN	0x02	/* Cache pool thread running */
-#define	WT_CACHE_CLEAR_WALKS	0x04	/* Clear eviction walks */
-#define	WT_CACHE_STUCK		0x08	/* Eviction server is stuck */
-#define	WT_CACHE_WALK_REVERSE	0x10	/* Scan backwards for candidates */
-#define	WT_CACHE_WOULD_BLOCK	0x20	/* Pages that would block apps */
+#define	WT_CACHE_STUCK		0x04	/* Eviction server is stuck */
+#define	WT_CACHE_WALK_REVERSE	0x08	/* Scan backwards for candidates */
+#define	WT_CACHE_WOULD_BLOCK	0x10	/* Pages that would block apps */
 	uint32_t flags;
 };
+
+#define	WT_WITH_PASS_LOCK(session, ret, op) do {			\
+	WT_ASSERT(session, !F_ISSET(session, WT_SESSION_LOCKED_PASS));	\
+	WT_WITH_LOCK(session, ret,					\
+	    &cache->evict_pass_lock, WT_SESSION_LOCKED_PASS, op);	\
+} while (0)
 
 /*
  * WT_CACHE_POOL --

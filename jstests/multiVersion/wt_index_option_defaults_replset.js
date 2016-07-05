@@ -36,17 +36,17 @@
     assert.commandWorked(primary32.runCommand({create: 'coll', indexOptionDefaults: indexOptions}));
 
     // Verify that the "indexOptionDefaults" field is present in the corresponding oplog entry.
-    var entry = primary32.getSiblingDB('local').oplog.rs.find()
-                                                        .sort({$natural: -1})
-                                                        .limit(1)
-                                                        .next();
-    assert.docEq(indexOptions, entry.o.indexOptionDefaults,
+    var entry =
+        primary32.getSiblingDB('local').oplog.rs.find().sort({$natural: -1}).limit(1).next();
+    assert.docEq(indexOptions,
+                 entry.o.indexOptionDefaults,
                  'indexOptionDefaults were not replicated: ' + tojson(entry));
 
     rst.awaitReplication();
 
     var collectionInfos = secondary30.getCollectionInfos({name: 'coll'});
-    assert.eq(1, collectionInfos.length,
+    assert.eq(1,
+              collectionInfos.length,
               'collection "coll" was not created on the secondary: ' + tojson(collectionInfos));
 
     assert(!collectionInfos[0].options.hasOwnProperty('indexOptionDefaults'),
@@ -92,20 +92,21 @@
     assert.commandWorked(primary30.runCommand({create: 'coll', indexOptionDefaults: indexOptions}));
 
     // Verify that the "indexOptionDefaults" field is present in the corresponding oplog entry.
-    var entry = primary30.getSiblingDB('local').oplog.rs.find()
-                                                        .sort({$natural: -1})
-                                                        .limit(1)
-                                                        .next();
-    assert.docEq(indexOptions, entry.o.indexOptionDefaults,
+    var entry =
+        primary30.getSiblingDB('local').oplog.rs.find().sort({$natural: -1}).limit(1).next();
+    assert.docEq(indexOptions,
+                 entry.o.indexOptionDefaults,
                  'indexOptionDefaults were not replicated: ' + tojson(entry));
 
     rst.awaitReplication();
 
     var collectionInfos = secondary32.getCollectionInfos({name: 'coll'});
-    assert.eq(1, collectionInfos.length,
+    assert.eq(1,
+              collectionInfos.length,
               'collection "coll" was not created on the secondary: ' + tojson(collectionInfos));
 
-    assert.docEq(indexOptions, collectionInfos[0].options.indexOptionDefaults,
+    assert.docEq(indexOptions,
+                 collectionInfos[0].options.indexOptionDefaults,
                  'indexOptionDefaults were not applied: ' + tojson(collectionInfos));
 
     rst.stopSet();

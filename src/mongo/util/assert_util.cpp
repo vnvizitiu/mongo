@@ -147,7 +147,7 @@ NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned lin
     throw e;
 }
 
-NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) {
+NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned line) noexcept {
     log() << "Invariant failure " << expr << ' ' << file << ' ' << dec << line << endl;
     breakpoint();
     log() << "\n\n***aborting after invariant() failure\n\n" << endl;
@@ -157,7 +157,7 @@ NOINLINE_DECL void invariantFailed(const char* expr, const char* file, unsigned 
 NOINLINE_DECL void invariantOKFailed(const char* expr,
                                      const Status& status,
                                      const char* file,
-                                     unsigned line) {
+                                     unsigned line) noexcept {
     log() << "Invariant failure: " << expr << " resulted in status " << status << " at " << file
           << ' ' << dec << line;
     breakpoint();
@@ -165,28 +165,29 @@ NOINLINE_DECL void invariantOKFailed(const char* expr,
     std::abort();
 }
 
-NOINLINE_DECL void fassertFailed(int msgid) {
+NOINLINE_DECL void fassertFailed(int msgid) noexcept {
     log() << "Fatal Assertion " << msgid << endl;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
     std::abort();
 }
 
-NOINLINE_DECL void fassertFailedNoTrace(int msgid) {
+NOINLINE_DECL void fassertFailedNoTrace(int msgid) noexcept {
     log() << "Fatal Assertion " << msgid << endl;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
     quickExit(EXIT_ABRUPT);
 }
 
-MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) {
+MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) noexcept {
     log() << "Fatal assertion " << msgid << " " << status;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
     std::abort();
 }
 
-MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTrace(int msgid, const Status& status) {
+MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTrace(int msgid,
+                                                            const Status& status) noexcept {
     log() << "Fatal assertion " << msgid << " " << status;
     breakpoint();
     log() << "\n\n***aborting after fassert() failure\n\n" << endl;
@@ -229,6 +230,10 @@ NOINLINE_DECL void msgassertedNoTrace(int msgid, const char* msg) {
 
 void msgassertedNoTrace(int msgid, const std::string& msg) {
     msgassertedNoTrace(msgid, msg.c_str());
+}
+
+void msgassertedNoTraceWithStatus(int msgid, const Status& status) {
+    msgassertedNoTrace(msgid, status.toString());
 }
 
 std::string causedBy(const char* e) {
@@ -276,7 +281,7 @@ string demangleName(const type_info& typeinfo) {
 #endif
 }
 
-Status exceptionToStatus() {
+Status exceptionToStatus() noexcept {
     try {
         throw;
     } catch (const DBException& ex) {
@@ -284,12 +289,13 @@ Status exceptionToStatus() {
     } catch (const std::exception& ex) {
         return Status(ErrorCodes::UnknownError,
                       str::stream() << "Caught std::exception of type " << demangleName(typeid(ex))
-                                    << ": " << ex.what());
+                                    << ": "
+                                    << ex.what());
     } catch (const boost::exception& ex) {
-        return Status(ErrorCodes::UnknownError,
-                      str::stream() << "Caught boost::exception of type "
-                                    << demangleName(typeid(ex)) << ": "
-                                    << boost::diagnostic_information(ex));
+        return Status(
+            ErrorCodes::UnknownError,
+            str::stream() << "Caught boost::exception of type " << demangleName(typeid(ex)) << ": "
+                          << boost::diagnostic_information(ex));
 
     } catch (...) {
         severe() << "Caught unknown exception in exceptionToStatus()";

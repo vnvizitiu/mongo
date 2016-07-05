@@ -31,6 +31,7 @@
 #pragma once
 
 #include <algorithm>
+#include <iosfwd>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -96,6 +97,16 @@ public:
         MaxNsCollectionLen = MaxNsLen - 7 /*strlen(".$extra")*/,
     };
 
+    /**
+     * DollarInDbNameBehavior::allow is deprecated.
+     * Please use DollarInDbNameBehavior::disallow and check explicitly for any DB names that must
+     * contain a $.
+     */
+    enum class DollarInDbNameBehavior {
+        Disallow,
+        Allow,  // Deprecated
+    };
+
     StringData db() const;
     StringData coll() const;
 
@@ -124,6 +135,9 @@ public:
     bool isSystem() const {
         return coll().startsWith("system.");
     }
+    bool isLocal() const {
+        return db() == "local";
+    }
     bool isSystemDotIndexes() const {
         return coll() == "system.indexes";
     }
@@ -151,6 +165,12 @@ public:
     bool isNormal() const {
         return normal(_ns);
     }
+
+    // Check if the NamespaceString references a special collection that cannot
+    // be used for generic data storage.
+    bool isVirtualized() const {
+        return virtualized(_ns);
+    }
     bool isListCollectionsCursorNS() const;
     bool isListIndexesCursorNS() const;
 
@@ -165,7 +185,7 @@ public:
      * valid.
      */
     bool isValid() const {
-        return validDBName(db()) && !coll().empty();
+        return validDBName(db(), DollarInDbNameBehavior::Allow) && !coll().empty();
     }
 
     bool operator==(const std::string& nsIn) const {
@@ -217,15 +237,19 @@ public:
 
     static bool special(StringData ns);
 
+    // Check if `ns` references a special collection that cannot be used for
+    // generic data storage.
+    static bool virtualized(StringData ns);
+
     /**
      * Returns true for DBs with special meaning to mongodb.
      */
-    static bool internalDb(StringData ns) {
-        if (ns == "admin")
+    static bool internalDb(StringData db) {
+        if (db == "admin")
             return true;
-        if (ns == "local")
+        if (db == "local")
             return true;
-        if (ns == "config")
+        if (db == "config")
             return true;
         return false;
     }
@@ -242,9 +266,12 @@ public:
      *      foo"bar
      *
      * @param db - a possible database name
+     * @param DollarInDbNameBehavior - please do not change the default value. DB names that must
+     *                                 contain a $ should be checked explicitly.
      * @return if db is an allowed database name
      */
-    static bool validDBName(StringData dbin);
+    static bool validDBName(StringData db,
+                            DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Disallow);
 
     /**
      * Takes a fully qualified namespace (ie dbname.collectionName), and returns true if
@@ -277,6 +304,8 @@ private:
     std::string _ns;
     size_t _dotIndex;
 };
+
+std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
 
 // "database.a.b.c" -> "database"
 inline StringData nsToDatabaseSubstring(StringData ns) {

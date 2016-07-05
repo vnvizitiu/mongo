@@ -36,10 +36,9 @@
 #include <memory>
 
 #include "mongo/db/client.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -83,8 +82,8 @@ static void logCursorsWaiting(RangeDeleteEntry* entry) {
     // We always log the first cursors waiting message (so we have cursor ids in the logs).
     // After 15 minutes (the cursor timeout period), we start logging additional messages at
     // a 1 minute interval.
-    static const auto kLogCursorsThreshold = stdx::chrono::minutes{15};
-    static const auto kLogCursorsInterval = stdx::chrono::minutes{1};
+    static const auto kLogCursorsThreshold = Minutes{15};
+    static const auto kLogCursorsInterval = Minutes{1};
 
     Date_t currentTime = jsTime();
     Milliseconds elapsedMillisSinceQueued{0};
@@ -203,7 +202,7 @@ void RangeDeleter::stopWorkers() {
 
 bool RangeDeleter::queueDelete(OperationContext* txn,
                                const RangeDeleterOptions& options,
-                               Notification* notifyDone,
+                               Notification<void>* doneSignal,
                                std::string* errMsg) {
     string dummy;
     if (errMsg == NULL)
@@ -214,7 +213,7 @@ bool RangeDeleter::queueDelete(OperationContext* txn,
     const BSONObj& max(options.range.maxKey);
 
     unique_ptr<RangeDeleteEntry> toDelete(new RangeDeleteEntry(options));
-    toDelete->notifyDone = notifyDone;
+    toDelete->doneSignal = doneSignal;
 
     {
         stdx::lock_guard<stdx::mutex> sl(_queueMutex);
@@ -306,30 +305,30 @@ bool RangeDeleter::deleteNow(OperationContext* txn,
         _deletesInProgress++;
     }
 
-    set<CursorId> cursorsToWait;
+    RangeDeleteEntry taskDetails(options);
     if (options.waitForOpenCursors) {
-        _env->getCursorIds(txn, ns, &cursorsToWait);
+        _env->getCursorIds(txn, ns, &taskDetails.cursorsToWait);
     }
 
     long long checkIntervalMillis = 5;
 
-    RangeDeleteEntry taskDetails(options);
+
     taskDetails.stats.queueStartTS = jsTime();
 
-    for (; !cursorsToWait.empty(); sleepmillis(checkIntervalMillis)) {
+    for (; !taskDetails.cursorsToWait.empty(); sleepmillis(checkIntervalMillis)) {
         logCursorsWaiting(&taskDetails);
 
         set<CursorId> cursorsNow;
         _env->getCursorIds(txn, ns, &cursorsNow);
 
         set<CursorId> cursorsLeft;
-        std::set_intersection(cursorsToWait.begin(),
-                              cursorsToWait.end(),
+        std::set_intersection(taskDetails.cursorsToWait.begin(),
+                              taskDetails.cursorsToWait.end(),
                               cursorsNow.begin(),
                               cursorsNow.end(),
                               std::inserter(cursorsLeft, cursorsLeft.end()));
 
-        cursorsToWait.swap(cursorsLeft);
+        taskDetails.cursorsToWait.swap(cursorsLeft);
 
         if (stopRequested()) {
             *errMsg = "deleter was stopped.";
@@ -423,8 +422,8 @@ void RangeDeleter::doWork() {
         {
             stdx::unique_lock<stdx::mutex> sl(_queueMutex);
             while (_taskQueue.empty()) {
-                _taskQueueNotEmptyCV.wait_for(sl,
-                                              stdx::chrono::milliseconds(kNotEmptyTimeoutMillis));
+                _taskQueueNotEmptyCV.wait_for(
+                    sl, Milliseconds(kNotEmptyTimeoutMillis).toSystemDuration());
 
                 if (stopRequested()) {
                     log() << "stopping range deleter worker" << endl;
@@ -507,8 +506,8 @@ void RangeDeleter::doWork() {
             deletePtrElement(&_deleteSet, &setEntry);
             _deletesInProgress--;
 
-            if (nextTask->notifyDone) {
-                nextTask->notifyDone->notifyOne();
+            if (nextTask->doneSignal) {
+                nextTask->doneSignal->set();
             }
         }
 
@@ -563,7 +562,7 @@ void RangeDeleter::recordDelStats(DeleteJobStats* newStat) {
 }
 
 RangeDeleteEntry::RangeDeleteEntry(const RangeDeleterOptions& options)
-    : options(options), notifyDone(NULL) {}
+    : options(options), doneSignal(nullptr) {}
 
 BSONObj RangeDeleteEntry::toBSON() const {
     BSONObjBuilder builder;

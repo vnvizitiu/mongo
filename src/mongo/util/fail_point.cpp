@@ -103,11 +103,6 @@ void FailPoint::setMode(Mode mode, ValType val, const BSONObj& extra) {
         sleepmillis(50);
     }
 
-    // Step 3
-    uassert(16442,
-            str::stream() << "mode not supported " << static_cast<int>(mode),
-            mode >= off && mode < numModes);
-
     _mode = mode;
     _timesOrPeriod.store(val);
 
@@ -190,20 +185,5 @@ BSONObj FailPoint::toBSON() const {
     builder.append("data", _data);
 
     return builder.obj();
-}
-
-ScopedFailPoint::ScopedFailPoint(FailPoint* failPoint)
-    : _failPoint(failPoint), _once(false), _shouldClose(false) {}
-
-ScopedFailPoint::~ScopedFailPoint() {
-    if (_shouldClose) {
-        _failPoint->shouldFailCloseBlock();
-    }
-}
-
-const BSONObj& ScopedFailPoint::getData() const {
-    // Assert when attempting to get data without incrementing ref counter.
-    fassert(16445, _shouldClose);
-    return _failPoint->getData();
 }
 }

@@ -42,6 +42,8 @@ TEST(NamespaceStringTest, Normal) {
 
     ASSERT(!NamespaceString::normal("a.b.$c"));
     ASSERT(!NamespaceString::normal("a.b.$.c"));
+    ASSERT(!NamespaceString::normal("a.b$.c"));
+    ASSERT(!NamespaceString::normal("a$.b.c"));
 
     ASSERT(NamespaceString::normal("local.oplog.$main"));
     ASSERT(NamespaceString::normal("local.oplog.rs"));
@@ -65,15 +67,58 @@ TEST(NamespaceStringTest, Special) {
     ASSERT(!NamespaceString::special("a.systemfoo"));
 }
 
+TEST(NamespaceStringTest, Virtualized) {
+    ASSERT(!NamespaceString::virtualized("a"));
+    ASSERT(!NamespaceString::virtualized("a.b"));
+    ASSERT(!NamespaceString::virtualized("a.b.c"));
+
+    ASSERT(NamespaceString::virtualized("a.b.$c"));
+    ASSERT(NamespaceString::virtualized("a.b.$.c"));
+    ASSERT(NamespaceString::virtualized("a.b$.c"));
+    ASSERT(NamespaceString::virtualized("a$.b.c"));
+
+    ASSERT(!NamespaceString::virtualized("local.oplog.$main"));
+    ASSERT(!NamespaceString::virtualized("local.oplog.rs"));
+}
+
 TEST(NamespaceStringTest, DatabaseValidNames) {
+    ASSERT(NamespaceString::validDBName("foo", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(NamespaceString::validDBName("foo$bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo/bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo.bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo\\bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo\"bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("a\0b"_sd, NamespaceString::DollarInDbNameBehavior::Allow));
+#ifdef _WIN32
+    ASSERT(
+        !NamespaceString::validDBName("foo*bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo<bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo>bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo:bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo|bar", NamespaceString::DollarInDbNameBehavior::Allow));
+    ASSERT(
+        !NamespaceString::validDBName("foo?bar", NamespaceString::DollarInDbNameBehavior::Allow));
+#endif
+
     ASSERT(NamespaceString::validDBName("foo"));
+    ASSERT(!NamespaceString::validDBName("foo$bar"));
     ASSERT(!NamespaceString::validDBName("foo/bar"));
     ASSERT(!NamespaceString::validDBName("foo bar"));
     ASSERT(!NamespaceString::validDBName("foo.bar"));
-    ASSERT(!NamespaceString::validDBName("foo.bar"));
     ASSERT(!NamespaceString::validDBName("foo\\bar"));
     ASSERT(!NamespaceString::validDBName("foo\"bar"));
-    ASSERT(!NamespaceString::validDBName(StringData("a\0b", StringData::LiteralTag())));
+    ASSERT(!NamespaceString::validDBName("a\0b"_sd));
 #ifdef _WIN32
     ASSERT(!NamespaceString::validDBName("foo*bar"));
     ASSERT(!NamespaceString::validDBName("foo<bar"));
@@ -140,7 +185,7 @@ TEST(NamespaceStringTest, CollectionValidNames) {
     ASSERT(!NamespaceString::validCollectionName("$a"));
     ASSERT(!NamespaceString::validCollectionName("a$b"));
     ASSERT(!NamespaceString::validCollectionName(""));
-    ASSERT(!NamespaceString::validCollectionName(StringData("a\0b", StringData::LiteralTag())));
+    ASSERT(!NamespaceString::validCollectionName("a\0b"_sd));
 }
 
 TEST(NamespaceStringTest, DBHash) {

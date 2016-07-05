@@ -28,16 +28,21 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
-#include "mongo/client/fetcher.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/queue.h"
 
 namespace mongo {
 
@@ -46,28 +51,8 @@ class OperationContext;
 
 namespace repl {
 
-class Member;
 class ReplicationCoordinator;
-
-// This interface exists to facilitate easier testing;
-// the test infrastructure implements these functions with stubs.
-class BackgroundSyncInterface {
-public:
-    virtual ~BackgroundSyncInterface();
-
-    // Gets the head of the buffer, but does not remove it.
-    // Returns true if an element was present at the head;
-    // false if the queue was empty.
-    virtual bool peek(BSONObj* op) = 0;
-
-    // Deletes objects in the queue;
-    // called by sync thread after it has applied an op
-    virtual void consume() = 0;
-
-    // wait up to 1 second for more ops to appear
-    virtual void waitForMore() = 0;
-};
-
+class ReplicationCoordinatorExternalState;
 
 /**
  * Lock order:
@@ -75,99 +60,84 @@ public:
  * 2. rwlock
  * 3. BackgroundSync::_mutex
  */
-class BackgroundSync : public BackgroundSyncInterface {
+class BackgroundSync {
 public:
-    // Allow index prefetching to be turned on/off
-    enum IndexPrefetchConfig {
-        UNINITIALIZED = 0,
-        PREFETCH_NONE = 1,
-        PREFETCH_ID_ONLY = 2,
-        PREFETCH_ALL = 3
-    };
-
-    static BackgroundSync* get();
+    BackgroundSync(ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
+                   std::unique_ptr<OplogBuffer> oplogBuffer);
+    MONGO_DISALLOW_COPYING(BackgroundSync);
 
     // stop syncing (when this node becomes a primary, e.g.)
     void stop();
 
+    /**
+     * Starts oplog buffer, task executor and producer thread, in that order.
+     */
+    void startup(OperationContext* txn);
 
-    void shutdown();
+    /**
+     * Signals producer thread to stop.
+     */
+    void shutdown(OperationContext* txn);
+
+    /**
+     * Waits for producer thread to stop before shutting down the task executor and oplog buffer.
+     */
+    void join(OperationContext* txn);
+
+    /**
+     * Returns true if shutdown() has been called.
+     */
+    bool inShutdown() const;
 
     bool isStopped() const;
 
-    virtual ~BackgroundSync() {}
-
-    // starts the producer thread
-    void producerThread();
     // starts the sync target notifying thread
     void notifierThread();
 
-    HostAndPort getSyncTarget();
+    HostAndPort getSyncTarget() const;
 
     // Interface implementation
 
-    virtual bool peek(BSONObj* op);
-    virtual void consume();
-    virtual void clearSyncTarget();
-    virtual void waitForMore();
+    bool peek(OperationContext* txn, BSONObj* op);
+    void consume(OperationContext* txn);
+    void clearSyncTarget();
+    void waitForMore(OperationContext* txn);
 
     // For monitoring
     BSONObj getCounters();
 
     // Clears any fetched and buffered oplog entries.
-    void clearBuffer();
+    void clearBuffer(OperationContext* txn);
 
     /**
      * Cancel existing find/getMore commands on the sync source's oplog collection.
      */
     void cancelFetcher();
 
-    bool getInitialSyncRequestedFlag();
-    void setInitialSyncRequestedFlag(bool value);
-
-    void setIndexPrefetchConfig(const IndexPrefetchConfig cfg) {
-        _indexPrefetchConfig = cfg;
-    }
-
-    IndexPrefetchConfig getIndexPrefetchConfig() {
-        return _indexPrefetchConfig;
-    }
-
+    /**
+     * Returns true if any of the following is true:
+     * 1) We are shutting down;
+     * 2) We are primary;
+     * 3) We are in drain mode; or
+     * 4) We are stopped.
+     */
+    bool shouldStopFetching() const;
 
     // Testing related stuff
-    void pushTestOpToBuffer(const BSONObj& op);
+    void pushTestOpToBuffer(OperationContext* txn, const BSONObj& op);
 
 private:
-    static BackgroundSync* s_instance;
-    // protects creation of s_instance
-    static stdx::mutex s_mutex;
+    bool _inShutdown_inlock() const;
 
-    // Production thread
-    BlockingQueue<BSONObj> _buffer;
-
-    // Task executor used to run find/getMore commands on sync source.
-    executor::ThreadPoolTaskExecutor _threadPoolTaskExecutor;
-
-    // _mutex protects all of the class variables except _buffer
-    mutable stdx::mutex _mutex;
-
-    OpTime _lastOpTimeFetched;
-
-    // lastFetchedHash is used to match ops to determine if we need to rollback, when
-    // a secondary.
-    long long _lastFetchedHash;
-
-    // if producer thread should not be running
-    bool _stopped;
-
-    HostAndPort _syncSourceHost;
-
-    BackgroundSync();
-    BackgroundSync(const BackgroundSync& s);
-    BackgroundSync operator=(const BackgroundSync& s);
-
-    // Production thread
-    void _producerThread();
+    /**
+     * Starts the producer thread which runs until shutdown. Upon resolving the current sync source
+     * the producer thread uses the OplogFetcher (which requires the replication coordinator
+     * external state at construction) to fetch oplog entries from the source's oplog via a long
+     * running find query.
+     */
+    void _run();
+    // Production thread inner loop.
+    void _runProducer();
     void _produce(OperationContext* txn);
 
     /**
@@ -176,18 +146,21 @@ private:
      *
      * NOTE: Used after rollback and during draining to transition to Primary role;
      */
-    void _signalNoNewDataForApplier();
+    void _signalNoNewDataForApplier(OperationContext* txn);
 
     /**
-     * Processes query responses from fetcher.
+     * Record metrics.
      */
-    void _fetcherCallback(const StatusWith<Fetcher::QueryResponse>& result,
-                          BSONObjBuilder* bob,
-                          const HostAndPort& source,
-                          OpTime lastOpTimeFetched,
-                          long long lastFetchedHash,
-                          Milliseconds fetcherMaxTimeMS,
-                          Status* returnStatus);
+    void _recordStats(const OplogFetcher::DocumentsInfo& info, Milliseconds getMoreElapsedTime);
+
+    /**
+     * Checks current background sync state before pushing operations into blocking queue and
+     * updating metrics. If the queue is full, might block.
+     */
+    void _enqueueDocuments(Fetcher::Documents::const_iterator begin,
+                           Fetcher::Documents::const_iterator end,
+                           const OplogFetcher::DocumentsInfo& info,
+                           Milliseconds elapsed);
 
     /**
      * Executes a rollback.
@@ -202,16 +175,42 @@ private:
 
     long long _readLastAppliedHash(OperationContext* txn);
 
+    // Production thread
+    std::unique_ptr<OplogBuffer> _oplogBuffer;
+
     // A pointer to the replication coordinator running the show.
     ReplicationCoordinator* _replCoord;
 
-    // bool for indicating resync need on this node and the mutex that protects it
-    // The resync command sets this flag; the Applier thread observes and clears it.
-    bool _initialSyncRequestedFlag;
-    stdx::mutex _initialSyncMutex;
+    // A pointer to the replication coordinator external state.
+    ReplicationCoordinatorExternalState* _replicationCoordinatorExternalState;
 
-    // This setting affects the Applier prefetcher behavior.
-    IndexPrefetchConfig _indexPrefetchConfig;
+    // Used to determine sync source.
+    // TODO(dannenberg) move into DataReplicator.
+    SyncSourceResolver _syncSourceResolver;
+
+    // _mutex protects all of the class variables declared below.
+    mutable stdx::mutex _mutex;
+
+    OpTime _lastOpTimeFetched;
+
+    // lastFetchedHash is used to match ops to determine if we need to rollback, when
+    // a secondary.
+    long long _lastFetchedHash = 0LL;
+
+    // Thread running producerThread().
+    std::unique_ptr<stdx::thread> _producerThread;
+
+    // Set to true if shutdown() has been called.
+    bool _inShutdown = false;
+
+    // if producer thread should not be running
+    bool _stopped = true;
+
+    HostAndPort _syncSourceHost;
+
+    // Current oplog fetcher tailing the oplog on the sync source.
+    // Owned by us.
+    std::unique_ptr<OplogFetcher> _oplogFetcher;
 };
 
 

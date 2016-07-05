@@ -109,8 +109,7 @@ __wt_schema_open_colgroups(WT_SESSION_IMPL *session, WT_TABLE *table)
 
 err:	__wt_scr_free(session, &buf);
 	__wt_schema_destroy_colgroup(session, &colgroup);
-	if (cgconfig != NULL)
-		__wt_free(session, cgconfig);
+	__wt_free(session, cgconfig);
 	return (ret);
 }
 
@@ -428,6 +427,8 @@ __schema_open_table(WT_SESSION_IMPL *session,
 	const char *tconfig;
 	char *tablename;
 
+	*tablep = NULL;
+
 	cursor = NULL;
 	table = NULL;
 	tablename = NULL;
@@ -528,6 +529,8 @@ __wt_schema_get_colgroup(WT_SESSION_IMPL *session,
 	const char *tablename, *tend;
 	u_int i;
 
+	if (tablep != NULL)
+		*tablep = NULL;
 	*colgroupp = NULL;
 
 	tablename = uri;
@@ -572,6 +575,8 @@ __wt_schema_get_index(WT_SESSION_IMPL *session,
 	const char *tablename, *tend;
 	u_int i;
 
+	if (tablep != NULL)
+		*tablep = NULL;
 	*indexp = NULL;
 
 	tablename = uri;

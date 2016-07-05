@@ -34,16 +34,16 @@ class CustomBehavior(object):
     """
 
     @staticmethod
-    def start_dynamic_test(test_case, test_report):
+    def start_dynamic_test(hook_test_case, test_report):
         """
         If a CustomBehavior wants to add a test case that will show up
         in the test report, it should use this method to add it to the
         report, since we will need to count it as a dynamic test to get
         the stats in the summary information right.
         """
-        test_report.startTest(test_case, dynamic=True)
+        test_report.startTest(hook_test_case, dynamic=True)
 
-    def __init__(self, logger, fixture):
+    def __init__(self, logger, fixture, description):
         """
         Initializes the CustomBehavior with the specified fixture.
         """
@@ -53,6 +53,10 @@ class CustomBehavior(object):
 
         self.logger = logger
         self.fixture = fixture
+        self.hook_test_case = None
+        self.logger_name = self.__class__.__name__
+        self.description = description
+
 
     def before_suite(self, test_report):
         """
@@ -69,7 +73,7 @@ class CustomBehavior(object):
         """
         pass
 
-    def before_test(self, test_report):
+    def before_test(self, test, test_report):
         """
         Each test will call this before it executes.
 
@@ -79,7 +83,7 @@ class CustomBehavior(object):
         """
         pass
 
-    def after_test(self, test_report):
+    def after_test(self, test, test_report):
         """
         Each test will call this after it executes.
 
@@ -99,7 +103,8 @@ class CleanEveryN(CustomBehavior):
     DEFAULT_N = 20
 
     def __init__(self, logger, fixture, n=DEFAULT_N):
-        CustomBehavior.__init__(self, logger, fixture)
+        description = "CleanEveryN (restarts the fixture after running `n` tests)"
+        CustomBehavior.__init__(self, logger, fixture, description)
 
         # Try to isolate what test triggers the leak by restarting the fixture each time.
         if "detect_leaks=1" in os.getenv("ASAN_OPTIONS", ""):
@@ -110,7 +115,7 @@ class CleanEveryN(CustomBehavior):
         self.n = n
         self.tests_run = 0
 
-    def after_test(self, test_report):
+    def after_test(self, test, test_report):
         self.tests_run += 1
         if self.tests_run >= self.n:
             self.logger.info("%d tests have been run against the fixture, stopping it...",
@@ -127,7 +132,59 @@ class CleanEveryN(CustomBehavior):
                 raise errors.TestFailure("%s did not exit cleanly" % (self.fixture))
 
 
-class CheckReplDBHash(CustomBehavior):
+class JsCustomBehavior(CustomBehavior):
+    def __init__(self, logger, fixture, js_filename, description, shell_options=None):
+        CustomBehavior.__init__(self, logger, fixture, description)
+        self.hook_test_case = testcases.JSTestCase(logger,
+                                              js_filename,
+                                              shell_options=shell_options,
+                                              test_kind="Hook")
+
+    def before_suite(self, test_report):
+        # Configure the test case after the fixture has been set up.
+        self.hook_test_case.configure(self.fixture)
+
+    def after_test(self, test, test_report):
+        description = "{0} after running '{1}'".format(self.description, test.short_name())
+        try:
+            # Change test_name and description to be more descriptive.
+            self.hook_test_case.test_name = test.short_name() + ":" + self.logger_name
+            CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
+            self.hook_test_case.run_test()
+            self.hook_test_case.return_code = 0
+            test_report.addSuccess(self.hook_test_case)
+        except self.hook_test_case.failureException as err:
+            self.hook_test_case.logger.exception("{0} failed".format(description))
+            test_report.addFailure(self.hook_test_case, sys.exc_info())
+            raise errors.TestFailure(err.args[0])
+        finally:
+            test_report.stopTest(self.hook_test_case)
+
+
+class ValidateCollections(JsCustomBehavior):
+    """
+    Runs full validation on all collections in all databases on every stand-alone
+    node, primary replica-set node, or primary shard node.
+    """
+    def __init__(self, logger, fixture):
+        description = "Full collection validation"
+        js_filename = os.path.join("jstests", "hooks", "run_validate_collections.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+
+
+class CheckReplDBHash(JsCustomBehavior):
+    """
+    Checks that the dbhashes of all non-local databases and non-replicated system collections
+    match on the primary and secondaries.
+    """
+    def __init__(self, logger, fixture):
+        description = "Check dbhashes of all replica set or master/slave members"
+        js_filename = os.path.join("jstests", "hooks", "run_check_repl_dbhash.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+
+
+# Old version of CheckReplDBHash used to ensure feature parity of new version.
+class CheckReplDBHashDeprecated(CustomBehavior):
     """
     Waits for replication after each test, then checks that the dbhahses
     of all databases other than "local" match on the primary and all of
@@ -142,13 +199,13 @@ class CheckReplDBHash(CustomBehavior):
         if not isinstance(fixture, fixtures.ReplFixture):
             raise TypeError("%s does not support replication" % (fixture.__class__.__name__))
 
-        CustomBehavior.__init__(self, logger, fixture)
-
-        self.test_case = testcases.TestCase(self.logger, "Hook", "#dbhash#")
+        description = "Check that replica-set nodes are consistent by using the dbHash command"
+        CustomBehavior.__init__(self, logger, fixture, description)
 
         self.started = False
+        self.hook_test_case = testcases.TestCase(self.logger, "Hook", self.logger_name)
 
-    def after_test(self, test_report):
+    def after_test(self, test, test_report):
         """
         After each test, check that the dbhash of the test database is
         the same on all nodes in the replica set or master/slave
@@ -157,7 +214,7 @@ class CheckReplDBHash(CustomBehavior):
 
         try:
             if not self.started:
-                CustomBehavior.start_dynamic_test(self.test_case, test_report)
+                CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
                 self.started = True
 
             # Wait until all operations have replicated.
@@ -177,9 +234,9 @@ class CheckReplDBHash(CustomBehavior):
                 if secondary_conn.admin.command("isMaster").get("arbiterOnly", False):
                     continue
 
-                all_matched = CheckReplDBHash._check_all_db_hashes(primary_conn,
-                                                                   secondary_conn,
-                                                                   sb)
+                all_matched = CheckReplDBHashDeprecated._check_all_db_hashes(primary_conn,
+                                                                             secondary_conn,
+                                                                             sb)
                 if not all_matched:
                     sb.insert(0,
                               "One or more databases were different between the primary on port %d"
@@ -189,23 +246,23 @@ class CheckReplDBHash(CustomBehavior):
                 success = all_matched and success
 
             if not success:
-                CheckReplDBHash._dump_oplog(primary_conn, secondary_conn, sb)
+                CheckReplDBHashDeprecated._dump_oplog(primary_conn, secondary_conn, sb)
 
                 # Adding failures to a TestReport requires traceback information, so we raise
-                # a 'self.test_case.failureException' that we will catch ourselves.
-                self.test_case.logger.info("\n    ".join(sb))
-                raise self.test_case.failureException("The dbhashes did not match")
-        except self.test_case.failureException as err:
-            self.test_case.logger.exception("The dbhashes did not match.")
-            self.test_case.return_code = 1
-            test_report.addFailure(self.test_case, sys.exc_info())
-            test_report.stopTest(self.test_case)
+                # a 'self.hook_test_case.failureException' that we will catch ourselves.
+                self.hook_test_case.logger.info("\n    ".join(sb))
+                raise self.hook_test_case.failureException("The dbhashes did not match")
+        except self.hook_test_case.failureException as err:
+            self.hook_test_case.logger.exception("The dbhashes did not match.")
+            self.hook_test_case.return_code = 1
+            test_report.addFailure(self.hook_test_case, sys.exc_info())
+            test_report.stopTest(self.hook_test_case)
             raise errors.ServerFailure(err.args[0])
         except pymongo.errors.WTimeoutError:
-            self.test_case.logger.exception("Awaiting replication timed out.")
-            self.test_case.return_code = 2
-            test_report.addError(self.test_case, sys.exc_info())
-            test_report.stopTest(self.test_case)
+            self.hook_test_case.logger.exception("Awaiting replication timed out.")
+            self.hook_test_case.return_code = 2
+            test_report.addError(self.hook_test_case, sys.exc_info())
+            test_report.stopTest(self.hook_test_case)
             raise errors.StopExecution("Awaiting replication timed out")
 
     def after_suite(self, test_report):
@@ -215,11 +272,11 @@ class CheckReplDBHash(CustomBehavior):
         """
 
         if self.started:
-            self.test_case.logger.info("The dbhashes matched for all tests.")
-            self.test_case.return_code = 0
-            test_report.addSuccess(self.test_case)
+            self.hook_test_case.logger.info("The dbhashes matched for all tests.")
+            self.hook_test_case.return_code = 0
+            test_report.addSuccess(self.hook_test_case)
             # TestReport.stopTest() has already been called if there was a failure.
-            test_report.stopTest(self.test_case)
+            test_report.stopTest(self.hook_test_case)
 
         self.started = False
 
@@ -264,14 +321,15 @@ class CheckReplDBHash(CustomBehavior):
 
         success = True
 
-        if not CheckReplDBHash._check_dbs_present(primary_conn, secondary_conn, sb):
+        if not CheckReplDBHashDeprecated._check_dbs_present(primary_conn, secondary_conn, sb):
             return False
 
         for db_name in primary_conn.database_names():
             if db_name == "local":
                 continue  # We don't expect this to match across different nodes.
 
-            matched = CheckReplDBHash._check_db_hash(primary_conn, secondary_conn, db_name, sb)
+            matched = CheckReplDBHashDeprecated._check_db_hash(
+                primary_conn, secondary_conn, db_name, sb)
             success = matched and success
 
         return success
@@ -295,7 +353,7 @@ class CheckReplDBHash(CustomBehavior):
         # There may be a difference in databases which is not considered an error, when
         # the database only contains system collections. This difference is only logged
         # when others are encountered, i.e., success = False.
-        missing_on_primary, missing_on_secondary = CheckReplDBHash._check_difference(
+        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
             set(primary_dbs), set(secondary_dbs), "database")
 
         for missing_db in missing_on_secondary:
@@ -307,7 +365,7 @@ class CheckReplDBHash(CustomBehavior):
             # otherwise it's not well defined whether they should exist or not.
             if non_system_colls:
                 sb.append("Database %s present on primary but not on secondary." % (missing_db))
-                CheckReplDBHash._dump_all_collections(db, non_system_colls, sb)
+                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
                 success = False
 
         for missing_db in missing_on_primary:
@@ -324,7 +382,7 @@ class CheckReplDBHash(CustomBehavior):
             # otherwise it's not well defined if it should exist or not.
             if non_system_colls:
                 sb.append("Database %s present on secondary but not on primary." % (missing_db))
-                CheckReplDBHash._dump_all_collections(db, non_system_colls, sb)
+                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
                 success = False
 
         return success
@@ -345,7 +403,7 @@ class CheckReplDBHash(CustomBehavior):
         if primary_hash["md5"] == secondary_hash["md5"]:
             return True
 
-        success = CheckReplDBHash._check_dbs_eq(
+        success = CheckReplDBHashDeprecated._check_dbs_eq(
             primary_conn, secondary_conn, primary_hash, secondary_hash, db_name, sb)
 
         if not success:
@@ -377,16 +435,16 @@ class CheckReplDBHash(CustomBehavior):
         primary_coll_names = set(primary_coll_hashes.keys())
         secondary_coll_names = set(secondary_coll_hashes.keys())
 
-        missing_on_primary, missing_on_secondary = CheckReplDBHash._check_difference(
+        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
             primary_coll_names, secondary_coll_names, "collection", sb=sb)
 
         if missing_on_primary or missing_on_secondary:
 
             # 'sb' already describes which collections are missing where.
             for coll_name in missing_on_primary:
-                CheckReplDBHash._dump_all_documents(secondary_db, coll_name, sb)
+                CheckReplDBHashDeprecated._dump_all_documents(secondary_db, coll_name, sb)
             for coll_name in missing_on_secondary:
-                CheckReplDBHash._dump_all_documents(primary_db, coll_name, sb)
+                CheckReplDBHashDeprecated._dump_all_documents(primary_db, coll_name, sb)
             return
 
         for coll_name in primary_coll_names & secondary_coll_names:
@@ -416,7 +474,7 @@ class CheckReplDBHash(CustomBehavior):
             sb.append("Collection %s.%s has a different hash on the primary and the secondary"
                       " ([ %s ] != [ %s ]):"
                       % (db_name, coll_name, primary_coll_hash, secondary_coll_hash))
-            CheckReplDBHash._check_colls_eq(primary_db, secondary_db, coll_name, sb)
+            CheckReplDBHashDeprecated._check_colls_eq(primary_db, secondary_db, coll_name, sb)
 
         if success:
             sb.append("All collections that were expected to match did.")
@@ -435,10 +493,10 @@ class CheckReplDBHash(CustomBehavior):
         primary_coll = primary_db.get_collection(coll_name, codec_options=codec_options)
         secondary_coll = secondary_db.get_collection(coll_name, codec_options=codec_options)
 
-        primary_docs = CheckReplDBHash._extract_documents(primary_coll)
-        secondary_docs = CheckReplDBHash._extract_documents(secondary_coll)
+        primary_docs = CheckReplDBHashDeprecated._extract_documents(primary_coll)
+        secondary_docs = CheckReplDBHashDeprecated._extract_documents(secondary_coll)
 
-        CheckReplDBHash._get_collection_diff(primary_docs, secondary_docs, sb)
+        CheckReplDBHashDeprecated._get_collection_diff(primary_docs, secondary_docs, sb)
 
     @staticmethod
     def _extract_documents(collection):
@@ -511,7 +569,7 @@ class CheckReplDBHash(CustomBehavior):
             s_idx += 1
 
         if not matched:
-            CheckReplDBHash._append_differences(
+            CheckReplDBHashDeprecated._append_differences(
                 missing_on_primary, missing_on_secondary, "document", sb)
         else:
             sb.append("All documents matched.")
@@ -537,7 +595,7 @@ class CheckReplDBHash(CustomBehavior):
             missing_on_primary.add(item)
 
         if sb is not None:
-            CheckReplDBHash._append_differences(
+            CheckReplDBHashDeprecated._append_differences(
                 missing_on_primary, missing_on_secondary, item_type_name, sb)
 
         return (missing_on_primary, missing_on_secondary)
@@ -573,7 +631,7 @@ class CheckReplDBHash(CustomBehavior):
             sb.append("Database %s contains the following collections: %s"
                       % (database.name, coll_names))
             for coll_name in coll_names:
-                CheckReplDBHash._dump_all_documents(database, coll_name, sb)
+                CheckReplDBHashDeprecated._dump_all_documents(database, coll_name, sb)
         else:
             sb.append("No collections in database %s." % (database.name))
 
@@ -583,7 +641,7 @@ class CheckReplDBHash(CustomBehavior):
         Appends the contents of 'coll_name' to 'sb'.
         """
 
-        docs = CheckReplDBHash._extract_documents(database[coll_name])
+        docs = CheckReplDBHashDeprecated._extract_documents(database[coll_name])
         if docs:
             sb.append("Documents in %s.%s:" % (database.name, coll_name))
             for doc in docs:
@@ -618,103 +676,10 @@ class TypeSensitiveSON(bson.SON):
 
         raise TypeError("TypeSensitiveSON objects cannot be compared to other types")
 
-class ValidateCollections(CustomBehavior):
-    """
-    Runs full validation (db.collection.validate(true)) on all collections
-    in all databases on every standalone, or primary mongod. If validation
-    fails (validate.valid), then the validate return object is logged.
-
-    Compatible with all subclasses.
-    """
-    DEFAULT_FULL = True
-    DEFAULT_SCANDATA = True
-
-    def __init__(self, logger, fixture, full=DEFAULT_FULL, scandata=DEFAULT_SCANDATA):
-        CustomBehavior.__init__(self, logger, fixture)
-
-        if not isinstance(full, bool):
-            raise TypeError("Fixture option full is not specified as type bool")
-
-        if not isinstance(scandata, bool):
-            raise TypeError("Fixture option scandata is not specified as type bool")
-
-        self.test_case = testcases.TestCase(self.logger, "Hook", "#validate#")
-        self.started = False
-        self.full = full
-        self.scandata = scandata
-
-    def after_test(self, test_report):
-        """
-        After each test, run a full validation on all collections.
-        """
-
-        try:
-            if not self.started:
-                CustomBehavior.start_dynamic_test(self.test_case, test_report)
-                self.started = True
-
-            sb = []  # String builder.
-
-            # The self.fixture.port can be used for client connection to a
-            # standalone mongod, a replica-set primary, or mongos.
-            # TODO: Run collection validation on all nodes in a replica-set.
-            port = self.fixture.port
-            conn = utils.new_mongo_client(port=port)
-
-            success = ValidateCollections._check_all_collections(
-                conn, sb, self.full, self.scandata)
-
-            if not success:
-                # Adding failures to a TestReport requires traceback information, so we raise
-                # a 'self.test_case.failureException' that we will catch ourselves.
-                self.test_case.logger.info("\n    ".join(sb))
-                raise self.test_case.failureException("Collection validation failed")
-        except self.test_case.failureException as err:
-            self.test_case.logger.exception("Collection validation failed")
-            self.test_case.return_code = 1
-            test_report.addFailure(self.test_case, sys.exc_info())
-            test_report.stopTest(self.test_case)
-            raise errors.ServerFailure(err.args[0])
-
-    def after_suite(self, test_report):
-        """
-        If we get to this point, the #validate# test must have been
-        successful, so add it to the test report.
-        """
-
-        if self.started:
-            self.test_case.logger.info("Collection validation passed for all tests.")
-            self.test_case.return_code = 0
-            test_report.addSuccess(self.test_case)
-            # TestReport.stopTest() has already been called if there was a failure.
-            test_report.stopTest(self.test_case)
-
-        self.started = False
-
-    @staticmethod
-    def _check_all_collections(conn, sb, full, scandata):
-        """
-        Returns true if for all databases and collections validate_collection
-        succeeds. Returns false otherwise.
-
-        Logs a message if any database's collection fails validate_collection.
-        """
-
-        success = True
-
-        for db_name in conn.database_names():
-            for coll_name in conn[db_name].collection_names():
-                try:
-                    conn[db_name].validate_collection(coll_name, full=full, scandata=scandata)
-                except pymongo.errors.CollectionInvalid as err:
-                    sb.append("Database %s, collection %s failed to validate:\n%s"
-                              % (db_name, coll_name, err.args[0]))
-                    success = False
-        return success
-
 
 _CUSTOM_BEHAVIORS = {
     "CleanEveryN": CleanEveryN,
     "CheckReplDBHash": CheckReplDBHash,
+    "CheckReplDBHashDeprecated": CheckReplDBHashDeprecated,
     "ValidateCollections": ValidateCollections,
 }

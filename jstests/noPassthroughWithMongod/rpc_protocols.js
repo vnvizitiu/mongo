@@ -4,10 +4,7 @@
 // startup using the "--rpcProtocols" command line option, or at runtime using the
 // "setClientRPCProtocols" method on the Mongo object.
 
-var RPC_PROTOCOLS  = {
-    OP_QUERY: "opQueryOnly",
-    OP_COMMAND: "opCommandOnly"
-};
+var RPC_PROTOCOLS = {OP_QUERY: "opQueryOnly", OP_COMMAND: "opCommandOnly"};
 
 (function() {
     "use strict";
@@ -19,13 +16,12 @@ var RPC_PROTOCOLS  = {
     assert.commandWorked(db.setProfilingLevel(2));
 
     function runInShell(rpcProtocol, func) {
-        assert (0 == _runMongoProgram("mongo",
-                                      "--rpcProtocols="+rpcProtocol,
-                                      "--readMode=commands", // ensure we use the find command.
-                                      "--eval",
-                                      "(" + func.toString() + ")();",
-                                      db.getMongo().host));
-
+        assert(0 == _runMongoProgram("mongo",
+                                     "--rpcProtocols=" + rpcProtocol,
+                                     "--readMode=commands",  // ensure we use the find command.
+                                     "--eval",
+                                     "(" + func.toString() + ")();",
+                                     db.getMongo().host));
     }
 
     // Test that --rpcProtocols=opQueryOnly forces OP_QUERY commands.

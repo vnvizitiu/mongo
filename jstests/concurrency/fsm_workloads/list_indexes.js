@@ -21,21 +21,17 @@ var $config = (function() {
 
         // List indexes, using a batchSize of 2 to ensure getmores happen.
         function listIndices(db, collName) {
-            var cursor = new DBCommandCursor(db.getMongo(),
-                                             db.runCommand({listIndexes: collName,
-                                                            cursor: {batchSize: 2}}));
+            var cursor = new DBCommandCursor(
+                db.getMongo(), db.runCommand({listIndexes: collName, cursor: {batchSize: 2}}));
             assertWhenOwnColl.gte(cursor.itcount(), 0);
         }
 
-        return {
-            modifyIndices: modifyIndices,
-            listIndices: listIndices
-        };
+        return {modifyIndices: modifyIndices, listIndices: listIndices};
     })();
 
     var transitions = {
-        modifyIndices: { listIndices: 0.75, modifyIndices: 0.25 },
-        listIndices: { listIndices: 0.25, modifyIndices: 0.75 }
+        modifyIndices: {listIndices: 0.75, modifyIndices: 0.25},
+        listIndices: {listIndices: 0.25, modifyIndices: 0.75}
     };
 
     function setup(db, collName) {

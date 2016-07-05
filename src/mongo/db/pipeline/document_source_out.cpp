@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/util/destructor_guard.h"
 
 namespace mongo {
 
@@ -86,7 +87,8 @@ void DocumentSourceOut::prepTempCollection() {
         bool ok = conn->runCommand(_outputNs.db().toString(), cmd.done(), info);
         uassert(16994,
                 str::stream() << "failed to create temporary $out collection '" << _tempNs.ns()
-                              << "': " << info.toString(),
+                              << "': "
+                              << info.toString(),
                 ok);
     }
 
@@ -102,7 +104,10 @@ void DocumentSourceOut::prepTempCollection() {
         BSONObj err = conn->getLastErrorDetailed();
         uassert(16995,
                 str::stream() << "copying index for $out failed."
-                              << " index: " << indexBson << " error: " << err,
+                              << " index: "
+                              << indexBson
+                              << " error: "
+                              << err,
                 DBClientWithCommands::getLastErrorString(err).empty());
     }
 }
@@ -166,7 +171,7 @@ boost::optional<Document> DocumentSourceOut::getNext() {
 
 DocumentSourceOut::DocumentSourceOut(const NamespaceString& outputNs,
                                      const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSource(pExpCtx),
+    : DocumentSourceNeedsMongod(pExpCtx),
       _done(false),
       _tempNs("")  // filled in by prepTempCollection
       ,
@@ -177,6 +182,10 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     uassert(16990,
             str::stream() << "$out only supports a string argument, not " << typeName(elem.type()),
             elem.type() == String);
+
+    uassert(ErrorCodes::InvalidOptions,
+            "$out can only be used with the 'local' read concern level",
+            !pExpCtx->opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
 
     NamespaceString outputNs(pExpCtx->ns.db().toString() + '.' + elem.str());
     uassert(17385, "Can't $out to special collection: " + elem.str(), !outputNs.isSpecial());

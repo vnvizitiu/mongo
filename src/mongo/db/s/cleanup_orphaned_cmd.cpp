@@ -38,16 +38,18 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/util/log.h"
 
@@ -78,8 +80,12 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
                                   string* errMsg) {
     BSONObj startingFromKey = startingFromKeyConst;
 
-    std::shared_ptr<CollectionMetadata> metadata =
-        ShardingState::get(txn)->getCollectionMetadata(ns.toString());
+    std::shared_ptr<CollectionMetadata> metadata;
+    {
+        AutoGetCollection autoColl(txn, ns, MODE_IS);
+        metadata = CollectionShardingState::get(txn, ns.toString())->getMetadata();
+    }
+
     if (!metadata || metadata->getKeyPattern().isEmpty()) {
         warning() << "skipping orphaned data cleanup for " << ns.toString()
                   << ", collection is not sharded";
@@ -188,8 +194,8 @@ public:
         return Status::OK();
     }
 
-    virtual bool isWriteCommandForConfigServer() const {
-        return false;
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
     }
 
     // Input
@@ -228,7 +234,7 @@ public:
         const auto secondaryThrottle =
             uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
         const auto writeConcern = uassertStatusOK(
-            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(secondaryThrottle));
+            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(txn, secondaryThrottle));
 
         ShardingState* const shardingState = ShardingState::get(txn);
 

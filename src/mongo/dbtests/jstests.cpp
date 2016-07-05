@@ -37,9 +37,9 @@
 #include <limits>
 
 #include "mongo/base/parse_number.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/scripting/engine.h"
@@ -396,7 +396,8 @@ public:
                              << "eliot"
                              << "z"
                              << "sara"
-                             << "zz" << BSONObj());
+                             << "zz"
+                             << BSONObj());
         s->setObject("blah", o, true);
 
         BSONObj out;
@@ -986,7 +987,8 @@ public:
         string utf8ObjSpec = "{'_id':'\\u0001\\u007f\\u07ff\\uffff'}";
         BSONObj utf8Obj = fromjson(utf8ObjSpec);
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.insert(ns(), utf8Obj);
@@ -1006,7 +1008,8 @@ private:
     }
 
     void reset() {
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection(ns());
@@ -1029,7 +1032,8 @@ public:
         if (!globalScriptEngine->utf8Ok())
             return;
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.eval("unittest",
@@ -1038,7 +1042,8 @@ public:
 
 private:
     void reset() {
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection(ns());
@@ -1117,7 +1122,8 @@ public:
         // Insert in Javascript -> Find using DBDirectClient
 
         // Drop the collection
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
 
         client.dropCollection("unittest.testroundtrip");
@@ -2225,7 +2231,8 @@ public:
         update.appendCode("value",
                           "function () { db.test.find().forEach(function(obj) { continue; }); }");
 
-        OperationContextImpl txn;
+        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
+        OperationContext& txn = *txnPtr;
         DBDirectClient client(&txn);
         client.update("test.system.js", query.obj(), update.obj(), true /* upsert */);
 
@@ -2238,6 +2245,27 @@ public:
         ASSERT_EQUALS(17, ret.number());
     }
 };
+
+/**
+ * This tests a bug discovered in SERVER-24054, where certain interesting nan patterns crash
+ * spidermonkey by looking like non-double type puns.  This verifies that we put that particular
+ * interesting nan in and that we still get a nan out.
+ */
+class NovelNaN {
+public:
+    void run() {
+        uint8_t bits[] = {
+            16, 0, 0, 0, 0x01, 'a', '\0', 0x61, 0x79, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0,
+        };
+        unique_ptr<Scope> s(globalScriptEngine->newScope());
+
+        s->setObject("val", BSONObj(reinterpret_cast<char*>(bits)).getOwned());
+
+        s->invoke("val[\"a\"];", 0, 0);
+        ASSERT_TRUE(std::isnan(s->getNumber("__returnValue")));
+    }
+};
+
 class NoReturnSpecified {
 public:
     void run() {
@@ -2371,11 +2399,9 @@ public:
         add<NumberLong>();
         add<NumberLong2>();
 
-        if (Decimal128::enabled) {
-            add<NumberDecimal>();
-            add<NumberDecimalGetFromScope>();
-            add<NumberDecimalBigObject>();
-        }
+        add<NumberDecimal>();
+        add<NumberDecimalGetFromScope>();
+        add<NumberDecimalBigObject>();
 
         add<MaxTimestamp>();
         add<RenameTest>();
@@ -2394,6 +2420,8 @@ public:
 
         add<ScopeOut>();
         add<InvalidStoredJS>();
+
+        add<NovelNaN>();
 
         add<NoReturnSpecified>();
 
@@ -2447,19 +2475,17 @@ public:
         add<RoundTripTests::NumberInt>();
         add<RoundTripTests::Number>();
 
-        if (Decimal128::enabled) {
-            add<RoundTripTests::NumberDecimal>();
-            add<RoundTripTests::NumberDecimalNegative>();
-            add<RoundTripTests::NumberDecimalMax>();
-            add<RoundTripTests::NumberDecimalMin>();
-            add<RoundTripTests::NumberDecimalPositiveZero>();
-            add<RoundTripTests::NumberDecimalNegativeZero>();
-            add<RoundTripTests::NumberDecimalPositiveNaN>();
-            add<RoundTripTests::NumberDecimalNegativeNaN>();
-            add<RoundTripTests::NumberDecimalPositiveInfinity>();
-            add<RoundTripTests::NumberDecimalNegativeInfinity>();
-            add<RoundTripTests::NumberDecimalPrecision>();
-        }
+        add<RoundTripTests::NumberDecimal>();
+        add<RoundTripTests::NumberDecimalNegative>();
+        add<RoundTripTests::NumberDecimalMax>();
+        add<RoundTripTests::NumberDecimalMin>();
+        add<RoundTripTests::NumberDecimalPositiveZero>();
+        add<RoundTripTests::NumberDecimalNegativeZero>();
+        add<RoundTripTests::NumberDecimalPositiveNaN>();
+        add<RoundTripTests::NumberDecimalNegativeNaN>();
+        add<RoundTripTests::NumberDecimalPositiveInfinity>();
+        add<RoundTripTests::NumberDecimalNegativeInfinity>();
+        add<RoundTripTests::NumberDecimalPrecision>();
 
         add<RoundTripTests::UUID>();
         add<RoundTripTests::HexData>();

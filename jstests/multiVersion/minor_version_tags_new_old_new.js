@@ -5,11 +5,13 @@
     // 3.2.1 is the final version to use the old style replSetUpdatePosition command.
     var oldVersion = "3.2.1";
     var newVersion = "latest";
-    var nodes = { n1 : { binVersion : newVersion },
-                  n2 : { binVersion : oldVersion },
-                  n3 : { binVersion : newVersion },
-                  n4 : { binVersion : oldVersion },
-                  n5 : { binVersion : newVersion } };
+    var nodes = {
+        n1: {binVersion: newVersion},
+        n2: {binVersion: oldVersion},
+        n3: {binVersion: newVersion},
+        n4: {binVersion: oldVersion},
+        n5: {binVersion: newVersion}
+    };
     var host = getHostName();
     var name = 'tags';
 
@@ -19,63 +21,62 @@
     var port = replTest.ports;
     replTest.initiate({
         _id: name,
-        members : [
+        members: [
             {
-                _id: 0,
-                host: nodes[0],
-                tags: {
-                    server: '0',
-                    dc: 'ny',
-                    ny: '1',
-                    rack: 'ny.rk1',
-                },
+              _id: 0,
+              host: nodes[0],
+              tags: {
+                  server: '0',
+                  dc: 'ny',
+                  ny: '1',
+                  rack: 'ny.rk1',
+              },
             },
             {
-                _id: 1,
-                host: nodes[1],
-                priority: 2,
-                tags: {
-                    server: '1',
-                    dc: 'ny',
-                    ny: '2',
-                    rack: 'ny.rk1',
-                },
+              _id: 1,
+              host: nodes[1],
+              priority: 2,
+              tags: {
+                  server: '1',
+                  dc: 'ny',
+                  ny: '2',
+                  rack: 'ny.rk1',
+              },
             },
             {
-                _id: 2,
-                host: nodes[2],
-                priority: 3,
-                tags: {
-                    server: '2',
-                    dc: 'ny',
-                    ny: '3',
-                    rack: 'ny.rk2',
-                    2: 'this',
-                },
+              _id: 2,
+              host: nodes[2],
+              priority: 3,
+              tags: {
+                  server: '2',
+                  dc: 'ny',
+                  ny: '3',
+                  rack: 'ny.rk2', 2: 'this',
+              },
             },
             {
-                _id: 3,
-                host: nodes[3],
-                tags: {
-                    server: '3',
-                    dc: 'sf',
-                    sf: '1',
-                    rack: 'sf.rk1',
-                },
+              _id: 3,
+              host: nodes[3],
+              tags: {
+                  server: '3',
+                  dc: 'sf',
+                  sf: '1',
+                  rack: 'sf.rk1',
+              },
             },
             {
-                _id: 4,
-                host: nodes[4],
-                tags: {
-                    server: '4',
-                    dc: 'sf',
-                    sf: '2',
-                    rack: 'sf.rk2',
-                },
+              _id: 4,
+              host: nodes[4],
+              tags: {
+                  server: '4',
+                  dc: 'sf',
+                  sf: '2',
+                  rack: 'sf.rk2',
+              },
             },
         ],
-        settings : {
-            getLastErrorModes : {
+        settings: {
+            getLastErrorModes: {
                 '2 dc and 3 server': {
                     dc: 2,
                     server: 3,
@@ -97,6 +98,7 @@
         },
     });
 
+    replTest.waitForState(replTest.nodes[2], ReplSetTest.State.PRIMARY, 60 * 1000);
     replTest.awaitReplication();
 
     // Create collection to guard against timeouts due to file allocation.
@@ -150,7 +152,8 @@
     assert.writeOK(primary.getDB('foo').bar.insert(doc));
     var result = assert.writeError(primary.getDB('foo').bar.insert(doc, options));
     assert.neq(null, result.getWriteConcernError());
-    assert.eq(ErrorCodes.UnknownReplWriteConcern, result.getWriteConcernError().code,
+    assert.eq(ErrorCodes.UnknownReplWriteConcern,
+              result.getWriteConcernError().code,
               tojson(result.getWriteConcernError()));
 
     jsTestLog('Write concern "3 or 4" should fail - 3 and 4 are not connected to the primary.');
@@ -220,7 +223,7 @@
     // Is this necessary when we partition node 2 off from the rest of the nodes?
     replTest.stop(2);
     jsTestLog('partitions: [0-1] [2] [1-3-4] ' +
-    '(all secondaries except down node 2 can replicate from new primary node 1)');
+              '(all secondaries except down node 2 can replicate from new primary node 1)');
 
     // Node 1 with slightly higher priority will take over.
     jsTestLog('1 must become primary here because otherwise the other members will take too ' +

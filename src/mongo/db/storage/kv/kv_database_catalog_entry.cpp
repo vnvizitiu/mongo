@@ -28,9 +28,12 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/kv/kv_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_collection_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
@@ -159,9 +162,9 @@ void KVDatabaseCatalogEntry::appendExtraStats(OperationContext* opCtx,
                                               BSONObjBuilder* out,
                                               double scale) const {}
 
-bool KVDatabaseCatalogEntry::currentFilesCompatible(OperationContext* opCtx) const {
-    // todo
-    return true;
+Status KVDatabaseCatalogEntry::currentFilesCompatible(OperationContext* opCtx) const {
+    // Delegate to the FeatureTracker as to whether the data files are compatible or not.
+    return _engine->getCatalog()->getFeatureTracker()->isCompatibleWithCurrentCode(opCtx);
 }
 
 void KVDatabaseCatalogEntry::getCollectionNamespaces(std::list<std::string>* out) const {
@@ -216,6 +219,15 @@ Status KVDatabaseCatalogEntry::createCollection(OperationContext* txn,
 
     RecordStore* rs = _engine->getEngine()->getRecordStore(txn, ns, ident, options);
     invariant(rs);
+
+    // Mark collation feature as in use if the collection has a non-simple default collation.
+    if (!options.collation.isEmpty()) {
+        const auto feature = KVCatalog::FeatureTracker::NonRepairableFeature::kCollation;
+        if (_engine->getCatalog()->getFeatureTracker()->isNonRepairableFeatureInUse(txn, feature)) {
+            _engine->getCatalog()->getFeatureTracker()->markNonRepairableFeatureAsInUse(txn,
+                                                                                        feature);
+        }
+    }
 
     txn->recoveryUnit()->registerChange(new AddCollectionChange(txn, this, ns, ident, true));
     _collections[ns.toString()] =

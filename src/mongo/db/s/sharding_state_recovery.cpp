@@ -40,9 +40,10 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
-#include "mongo/db/ops/update.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
@@ -62,10 +63,13 @@ const char kShardName[] = "shardName";
 const char kMinOpTime[] = "minOpTime";
 const char kMinOpTimeUpdaters[] = "minOpTimeUpdaters";
 
-const Seconds kWriteTimeout(15);
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
-                                                kWriteTimeout);
+                                                Seconds(15));
+
+const WriteConcernOptions kLocalWriteConcern(1,
+                                             WriteConcernOptions::SyncMode::UNSET,
+                                             Milliseconds(0));
 
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(recoverShardingState, bool, true);
 
@@ -186,20 +190,19 @@ Status modifyRecoveryDocument(OperationContext* txn,
         BSONObj updateObj = RecoveryDocument::createChangeObj(
             grid.shardRegistry()->getConfigServerConnectionString(),
             ShardingState::get(txn)->getShardName(),
-            grid.shardRegistry()->getConfigOpTime(),
+            grid.configOpTime(),
             change);
 
         LOG(1) << "Changing sharding recovery document " << updateObj;
 
-        OpDebug opDebug;
         UpdateRequest updateReq(NamespaceString::kConfigCollectionNamespace);
         updateReq.setQuery(RecoveryDocument::getQuery());
         updateReq.setUpdates(updateObj);
         updateReq.setUpsert();
-        UpdateLifecycleImpl updateLifecycle(true, NamespaceString::kConfigCollectionNamespace);
+        UpdateLifecycleImpl updateLifecycle(NamespaceString::kConfigCollectionNamespace);
         updateReq.setLifecycle(&updateLifecycle);
 
-        UpdateResult result = update(txn, autoGetOrCreateDb->getDb(), updateReq, &opDebug);
+        UpdateResult result = update(txn, autoGetOrCreateDb->getDb(), updateReq);
         invariant(result.numDocsModified == 1 || !result.upserted.isEmpty());
         invariant(result.numMatched <= 1);
 
@@ -219,10 +222,6 @@ Status modifyRecoveryDocument(OperationContext* txn,
 }  // namespace
 
 Status ShardingStateRecovery::startMetadataOp(OperationContext* txn) {
-    if (grid.catalogManager(txn)->getMode() != CatalogManager::ConfigServerMode::CSRS) {
-        return Status::OK();
-    }
-
     Status upsertStatus =
         modifyRecoveryDocument(txn, RecoveryDocument::Increment, kMajorityWriteConcern);
 
@@ -237,10 +236,6 @@ Status ShardingStateRecovery::startMetadataOp(OperationContext* txn) {
 }
 
 void ShardingStateRecovery::endMetadataOp(OperationContext* txn) {
-    if (grid.catalogManager(txn)->getMode() != CatalogManager::ConfigServerMode::CSRS) {
-        return;
-    }
-
     Status status = modifyRecoveryDocument(txn, RecoveryDocument::Decrement, WriteConcernOptions());
     if (!status.isOK()) {
         warning() << "Failed to decrement minOpTimeUpdaters due to " << status;
@@ -248,6 +243,10 @@ void ShardingStateRecovery::endMetadataOp(OperationContext* txn) {
 }
 
 Status ShardingStateRecovery::recover(OperationContext* txn) {
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+        return Status::OK();
+    }
+
     if (!recoverShardingState) {
         warning()
             << "Not checking for ShardingState recovery document because the recoverShardingState "
@@ -278,12 +277,16 @@ Status ShardingStateRecovery::recover(OperationContext* txn) {
     // Make sure the sharding state is initialized
     ShardingState* const shardingState = ShardingState::get(txn);
 
-    shardingState->initialize(txn, recoveryDoc.getConfigsvr().toString());
-    shardingState->setShardName(recoveryDoc.getShardName());
+    // For backwards compatibility. Shards added by v3.4 cluster should have been initialized by
+    // the shard identity document.
+    if (!shardingState->enabled()) {
+        shardingState->initializeFromConfigConnString(txn, recoveryDoc.getConfigsvr().toString());
+        shardingState->setShardName(recoveryDoc.getShardName());
+    }
 
     if (!recoveryDoc.getMinOpTimeUpdaters()) {
         // Treat the minOpTime as up-to-date
-        grid.shardRegistry()->advanceConfigOpTime(recoveryDoc.getMinOpTime());
+        grid.advanceConfigOpTime(recoveryDoc.getMinOpTime());
         return Status::OK();
     }
 
@@ -294,18 +297,17 @@ Status ShardingStateRecovery::recover(OperationContext* txn) {
 
     // Need to fetch the latest uptime from the config server, so do a logging write
     Status status =
-        grid.catalogManager(txn)->logChange(txn,
-                                            "Sharding minOpTime recovery",
-                                            NamespaceString::kConfigCollectionNamespace.ns(),
-                                            recoveryDocBSON);
+        grid.catalogClient(txn)->logChange(txn,
+                                           "Sharding minOpTime recovery",
+                                           NamespaceString::kConfigCollectionNamespace.ns(),
+                                           recoveryDocBSON);
     if (!status.isOK())
         return status;
 
-    log() << "Sharding state recovered. New config server opTime is "
-          << grid.shardRegistry()->getConfigOpTime();
+    log() << "Sharding state recovered. New config server opTime is " << grid.configOpTime();
 
     // Finally, clear the recovery document so next time we don't need to recover
-    status = modifyRecoveryDocument(txn, RecoveryDocument::Clear, kMajorityWriteConcern);
+    status = modifyRecoveryDocument(txn, RecoveryDocument::Clear, kLocalWriteConcern);
     if (!status.isOK()) {
         warning() << "Failed to reset sharding state recovery document due to " << status;
     }

@@ -21,10 +21,12 @@ env.Library(
         LIBDEPS=[
             'expression_params',
             '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/bson/dotted_path_support',
             '$BUILD_DIR/mongo/db/fts/base',
             '$BUILD_DIR/mongo/db/geo/geoparser',
             '$BUILD_DIR/mongo/db/index_names',
             '$BUILD_DIR/mongo/db/mongohasher',
+            '$BUILD_DIR/mongo/db/query/collation/collator_interface',
             '$BUILD_DIR/third_party/s2/s2',
         ],
 )
@@ -53,17 +55,22 @@ env.Library(
             '$BUILD_DIR/mongo/db/geo/geometry',
             '$BUILD_DIR/mongo/db/geo/geoparser',
             '$BUILD_DIR/mongo/db/mongohasher',
+            '$BUILD_DIR/mongo/db/query/collation/collator_interface',
             '$BUILD_DIR/third_party/s2/s2',
         ]
 )
 
 env.CppUnitTest(
-        target='btree_key_generator_test',
+        target='key_generator_test',
         source=[
+            '2d_key_generator_test.cpp',
             'btree_key_generator_test.cpp',
+            'hash_key_generator_test.cpp',
+            's2_key_generator_test.cpp',
         ],
         LIBDEPS=[
             'key_generator',
             '$BUILD_DIR/mongo/db/mongohasher',
+            '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         ],
 )

@@ -60,7 +60,7 @@ static const CONFIG default_cfg = {
 	0,				/* in warmup phase */
 	false,				/* Signal for idle cycle thread */
 	0,				/* total seconds running */
-	0,				/* has truncate */
+	0,				/* flags */
 	{NULL, NULL},			/* the truncate queue */
 	{NULL, NULL},                   /* the config queue */
 
@@ -87,6 +87,7 @@ static int	 start_threads(CONFIG *,
 		    WORKLOAD *, CONFIG_THREAD *, u_int, void *(*)(void *));
 static int	 stop_threads(CONFIG *, u_int, CONFIG_THREAD *);
 static void	*thread_run_wtperf(void *);
+static void	 update_value_delta(CONFIG_THREAD *);
 static void	*worker(void *);
 
 static uint64_t	 wtperf_rand(CONFIG_THREAD *);
@@ -105,24 +106,93 @@ get_next_incr(CONFIG *cfg)
 	return (__wt_atomic_add64(&cfg->insert_key, 1));
 }
 
+/*
+ * Each time this function is called we will overwrite the first and one
+ * other element in the value buffer.
+ */
 static void
 randomize_value(CONFIG_THREAD *thread, char *value_buf)
 {
 	uint8_t *vb;
-	uint32_t i;
+	uint32_t i, max_range, rand_val;
 
 	/*
-	 * Each time we're called overwrite value_buf[0] and one other
-	 * randomly chosen byte (other than the trailing NUL).
-	 * Make sure we don't write a NUL: keep the value the same length.
+	 * Limit how much of the buffer we validate for length, this means
+	 * that only threads that do growing updates will ever make changes to
+	 * values outside of the initial value size, but that's a fair trade
+	 * off for avoiding figuring out how long the value is more accurately
+	 * in this performance sensitive function.
 	 */
-	i = __wt_random(&thread->rnd) % (thread->cfg->value_sz - 1);
+	if (thread->workload == NULL || thread->workload->update_delta == 0)
+		max_range = thread->cfg->value_sz;
+	else if (thread->workload->update_delta > 0)
+		max_range = thread->cfg->value_sz_max;
+	else
+		max_range = thread->cfg->value_sz_min;
+
+	/*
+	 * Generate a single random value and re-use it. We generally only
+	 * have small ranges in this function, so avoiding a bunch of calls
+	 * is worthwhile.
+	 */
+	rand_val = __wt_random(&thread->rnd);
+	i = rand_val % (max_range - 1);
+
+	/*
+	 * Ensure we don't write past the end of a value when configured for
+	 * randomly sized values.
+	 */
 	while (value_buf[i] == '\0' && i > 0)
 		--i;
-	if (i > 0) {
-		vb = (uint8_t *)value_buf;
-		vb[0] = (__wt_random(&thread->rnd) % 255) + 1;
-		vb[i] = (__wt_random(&thread->rnd) % 255) + 1;
+
+	vb = (uint8_t *)value_buf;
+	vb[0] = ((rand_val >> 8) % 255) + 1;
+	/*
+	 * If i happened to be 0, we'll be re-writing the same value
+	 * twice, but that doesn't matter.
+	 */
+	vb[i] = ((rand_val >> 16) % 255) + 1;
+}
+
+/*
+ * Figure out and extend the size of the value string, used for growing
+ * updates. We know that the value to be updated is in the threads value
+ * scratch buffer.
+ */
+static inline void
+update_value_delta(CONFIG_THREAD *thread)
+{
+	CONFIG *cfg;
+	char * value;
+	int64_t delta, len, new_len;
+
+	cfg = thread->cfg;
+	value = thread->value_buf;
+	delta = thread->workload->update_delta;
+	len = (int64_t)strlen(value);
+
+	if (delta == INT64_MAX)
+		delta = __wt_random(&thread->rnd) %
+		    (cfg->value_sz_max - cfg->value_sz);
+
+	/* Ensure we aren't changing across boundaries */
+	if (delta > 0 && len + delta > cfg->value_sz_max)
+		delta = cfg->value_sz_max - len;
+	else if (delta < 0 && len + delta < cfg->value_sz_min)
+		delta = cfg->value_sz_min - len;
+
+	/* Bail if there isn't anything to do */
+	if (delta == 0)
+		return;
+
+	if (delta < 0)
+		value[len + delta] = '\0';
+	else {
+		/* Extend the value by the configured amount. */
+		for (new_len = len;
+		    new_len < cfg->value_sz_max && new_len - len < delta;
+		    new_len++)
+			value[new_len] = 'a';
 	}
 }
 
@@ -624,8 +694,10 @@ worker(void *arg)
 				 * Copy as much of the previous value as is
 				 * safe, and be sure to NUL-terminate.
 				 */
-				strncpy(value_buf, value, cfg->value_sz);
-				value_buf[cfg->value_sz - 1] = '\0';
+				strncpy(value_buf,
+				    value, cfg->value_sz_max - 1);
+				if (thread->workload->update_delta != 0)
+					update_value_delta(thread);
 				if (value_buf[0] == 'a')
 					value_buf[0] = 'b';
 				else
@@ -1161,7 +1233,7 @@ monitor(void *arg)
 		goto err;
 	}
 	/* Set line buffering for monitor file. */
-	(void)setvbuf(fp, NULL, _IOLBF, 0);
+	__wt_stream_set_line_buffer(fp);
 	fprintf(fp,
 	    "#time,"
 	    "totalsec,"
@@ -1559,6 +1631,8 @@ execute_workload(CONFIG *cfg)
 {
 	CONFIG_THREAD *threads;
 	WORKLOAD *workp;
+	WT_CONNECTION *conn;
+	WT_SESSION **sessions;
 	pthread_t idle_table_cycle_thread;
 	uint64_t last_ckpts, last_inserts, last_reads, last_truncates;
 	uint64_t last_updates;
@@ -1574,6 +1648,8 @@ execute_workload(CONFIG *cfg)
 	last_ckpts = last_inserts = last_reads = last_truncates = 0;
 	last_updates = 0;
 	ret = 0;
+
+	sessions = NULL;
 
 	/* Start cycling idle tables. */
 	if ((ret = start_idle_table_cycle(cfg, &idle_table_cycle_thread)) != 0)
@@ -1592,11 +1668,23 @@ execute_workload(CONFIG *cfg)
 	} else
 		pfunc = worker;
 
+	if (cfg->session_count_idle != 0) {
+		sessions = dcalloc((size_t)cfg->session_count_idle,
+		    sizeof(WT_SESSION *));
+		conn = cfg->conn;
+		for (i = 0; i < cfg->session_count_idle; ++i)
+			if ((ret = conn->open_session(
+			    conn, NULL, cfg->sess_config, &sessions[i])) != 0) {
+				lprintf(cfg, ret, 0,
+				    "execute_workload: idle open_session");
+				goto err;
+			}
+	}
 	/* Start each workload. */
 	for (threads = cfg->workers, i = 0,
 	    workp = cfg->workload; i < cfg->workload_cnt; ++i, ++workp) {
 		lprintf(cfg, 0, 1,
-		    "Starting workload #%d: %" PRId64 " threads, inserts=%"
+		    "Starting workload #%u: %" PRId64 " threads, inserts=%"
 		    PRId64 ", reads=%" PRId64 ", updates=%" PRId64
 		    ", truncate=%" PRId64 ", throttle=%" PRId64,
 		    i + 1, workp->threads, workp->insert,
@@ -1686,6 +1774,7 @@ err:	cfg->stop = 1;
 	if (ret == 0 && cfg->drop_tables && (ret = drop_all_tables(cfg)) != 0)
 		lprintf(cfg, ret, 0, "Drop tables failed.");
 
+	free(sessions);
 	/* Report if any worker threads didn't finish. */
 	if (cfg->error != 0) {
 		lprintf(cfg, WT_ERROR, 0,
@@ -2098,15 +2187,15 @@ int
 main(int argc, char *argv[])
 {
 	CONFIG *cfg, _cfg;
-	size_t req_len;
+	size_t req_len, sreq_len;
 	int ch, monitor_set, ret;
 	const char *opts = "C:H:h:m:O:o:T:";
 	const char *config_opts;
-	char *cc_buf, *tc_buf, *user_cconfig, *user_tconfig;
+	char *cc_buf, *sess_cfg, *tc_buf, *user_cconfig, *user_tconfig;
 
 	monitor_set = ret = 0;
 	config_opts = NULL;
-	cc_buf = tc_buf = user_cconfig = user_tconfig = NULL;
+	cc_buf = sess_cfg = tc_buf = user_cconfig = user_tconfig = NULL;
 
 	/* Setup the default configuration values. */
 	cfg = &_cfg;
@@ -2195,7 +2284,7 @@ main(int argc, char *argv[])
 	 * the compact operation, but not for the workloads.
 	 */
 	if (cfg->async_threads > 0) {
-		if (cfg->has_truncate > 0) {
+		if (F_ISSET(cfg, CFG_TRUNCATE)) {
 			lprintf(cfg, 1, 0, "Cannot run truncate and async\n");
 			goto err;
 		}
@@ -2213,20 +2302,20 @@ main(int argc, char *argv[])
 		req_len = strlen(",async=(enabled=true,threads=)") + 4;
 		cfg->async_config = dcalloc(req_len, 1);
 		snprintf(cfg->async_config, req_len,
-		    ",async=(enabled=true,threads=%d)",
+		    ",async=(enabled=true,threads=%" PRIu32 ")",
 		    cfg->async_threads);
 	}
 	if ((ret = config_compress(cfg)) != 0)
 		goto err;
 
 	/* You can't have truncate on a random collection. */
-	if (cfg->has_truncate && cfg->random_range) {
+	if (F_ISSET(cfg, CFG_TRUNCATE) && cfg->random_range) {
 		lprintf(cfg, 1, 0, "Cannot run truncate and random_range\n");
 		goto err;
 	}
 
 	/* We can't run truncate with more than one table. */
-	if (cfg->has_truncate && cfg->table_count > 1) {
+	if (F_ISSET(cfg, CFG_TRUNCATE) && cfg->table_count > 1) {
 		lprintf(cfg, 1, 0, "Cannot truncate more than 1 table\n");
 		goto err;
 	}
@@ -2241,11 +2330,12 @@ main(int argc, char *argv[])
 	    cfg->table_name);
 
 	/* Make stdout line buffered, so verbose output appears quickly. */
-	(void)setvbuf(stdout, NULL, _IOLBF, 32);
+	__wt_stream_set_line_buffer(stdout);
 
 	/* Concatenate non-default configuration strings. */
 	if (cfg->verbose > 1 || user_cconfig != NULL ||
-	    cfg->compress_ext != NULL || cfg->async_config != NULL) {
+	    cfg->session_count_idle > 0 || cfg->compress_ext != NULL ||
+	    cfg->async_config != NULL) {
 		req_len = strlen(cfg->conn_config) + strlen(debug_cconfig) + 3;
 		if (user_cconfig != NULL)
 			req_len += strlen(user_cconfig);
@@ -2253,16 +2343,26 @@ main(int argc, char *argv[])
 			req_len += strlen(cfg->async_config);
 		if (cfg->compress_ext != NULL)
 			req_len += strlen(cfg->compress_ext);
+		if (cfg->session_count_idle > 0) {
+			sreq_len = strlen(",session_max=") + 6;
+			req_len += sreq_len;
+			sess_cfg = dcalloc(sreq_len, 1);
+			snprintf(sess_cfg, sreq_len,
+			    ",session_max=%" PRIu32,
+			    cfg->session_count_idle + cfg->workers_cnt +
+			    cfg->populate_threads + 10);
+		}
 		cc_buf = dcalloc(req_len, 1);
 		/*
 		 * This is getting hard to parse.
 		 */
-		snprintf(cc_buf, req_len, "%s%s%s%s%s%s%s",
+		snprintf(cc_buf, req_len, "%s%s%s%s%s%s%s%s",
 		    cfg->conn_config,
 		    cfg->async_config ? cfg->async_config : "",
 		    cfg->compress_ext ? cfg->compress_ext : "",
 		    cfg->verbose > 1 ? ",": "",
 		    cfg->verbose > 1 ? debug_cconfig : "",
+		    sess_cfg ? sess_cfg : "",
 		    user_cconfig ? ",": "",
 		    user_cconfig ? user_cconfig : "");
 		if ((ret = config_opt_str(cfg, "conn_config", cc_buf)) != 0)
@@ -2338,6 +2438,7 @@ einval:		ret = EINVAL;
 
 err:	config_free(cfg);
 	free(cc_buf);
+	free(sess_cfg);
 	free(tc_buf);
 	free(user_cconfig);
 	free(user_tconfig);
@@ -2374,7 +2475,8 @@ start_threads(CONFIG *cfg,
 		 * strings: trailing NUL is included in the size.
 		 */
 		thread->key_buf = dcalloc(cfg->key_sz, 1);
-		thread->value_buf = dcalloc(cfg->value_sz, 1);
+		thread->value_buf = dcalloc(cfg->value_sz_max, 1);
+
 		/*
 		 * Initialize and then toss in a bit of random values if needed.
 		 */
@@ -2506,7 +2608,7 @@ wtperf_rand(CONFIG_THREAD *thread)
 		S2 = wtperf_value_range(cfg) *
 		    (cfg->pareto / 100.0) * (PARETO_SHAPE - 1);
 		U = 1 - (double)rval / (double)UINT32_MAX;
-		rval = (pow(U, S1) - 1) * S2;
+		rval = (uint64_t)((pow(U, S1) - 1) * S2);
 		/*
 		 * This Pareto calculation chooses out of range values about
 		 * 2% of the time, from my testing. That will lead to the

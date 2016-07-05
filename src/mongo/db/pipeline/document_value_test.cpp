@@ -70,32 +70,36 @@ void assertRoundTrips(const Document& document1) {
     ASSERT_EQUALS(document1, document2);
 }
 
-/** Create a Document. */
-class Create {
-public:
-    void run() {
-        Document document;
-        ASSERT_EQUALS(0U, document.size());
-        assertRoundTrips(document);
-    }
-};
+TEST(DocumentConstruction, Default) {
+    Document document;
+    ASSERT_EQUALS(0U, document.size());
+    assertRoundTrips(document);
+}
 
-/** Create a Document from a BSONObj. */
-class CreateFromBsonObj {
-public:
-    void run() {
-        Document document = fromBson(BSONObj());
-        ASSERT_EQUALS(0U, document.size());
-        document = fromBson(BSON("a" << 1 << "b"
-                                     << "q"));
-        ASSERT_EQUALS(2U, document.size());
-        ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
-        ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
-        ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
-        ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
-        assertRoundTrips(document);
-    }
-};
+TEST(DocumentConstruction, FromEmptyBson) {
+    Document document = fromBson(BSONObj());
+    ASSERT_EQUALS(0U, document.size());
+    assertRoundTrips(document);
+}
+
+TEST(DocumentConstruction, FromNonEmptyBson) {
+    Document document = fromBson(BSON("a" << 1 << "b"
+                                          << "q"));
+    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
+    ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
+    ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
+    ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
+}
+
+TEST(DocumentConstruction, FromInitializerList) {
+    auto document = Document{{"a", 1}, {"b", "q"}};
+    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
+    ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
+    ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
+    ASSERT_EQUALS("q", getNthField(document, 1).second.getString());
+}
 
 /** Add Document fields. */
 class AddField {
@@ -355,8 +359,8 @@ public:
         // EOO not valid in middle of BSONObj
         append("double", 1.0);
         append("c-string", "string\0after NUL");  // after NULL is ignored
-        append("c++", StringData("string\0after NUL", StringData::LiteralTag()).toString());
-        append("StringData", StringData("string\0after NUL", StringData::LiteralTag()));
+        append("c++", "string\0after NUL"_sd);
+        append("StringData", "string\0after NUL"_sd);
         append("emptyObj", BSONObj());
         append("filledObj", BSON("a" << 1));
         append("emptyArray", BSON("" << BSONArray()).firstElement());
@@ -375,9 +379,9 @@ public:
         append("regexEmpty", BSONRegEx("", ""));
         append("dbref", BSONDBRef("foo", OID()));
         append("code", BSONCode("function() {}"));
-        append("codeNul", BSONCode(StringData("var nul = '\0'", StringData::LiteralTag())));
+        append("codeNul", BSONCode("var nul = '\0'"_sd));
         append("symbol", BSONSymbol("foo"));
-        append("symbolNul", BSONSymbol(StringData("f\0o", StringData::LiteralTag())));
+        append("symbolNul", BSONSymbol("f\0o"_sd));
         append("codeWScope", BSONCodeWScope("asdf", BSONObj()));
         append("codeWScopeWScope", BSONCodeWScope("asdf", BSON("one" << 1)));
         append("int", 1);
@@ -1669,8 +1673,6 @@ class All : public Suite {
 public:
     All() : Suite("document") {}
     void setupTests() {
-        add<Document::Create>();
-        add<Document::CreateFromBsonObj>();
         add<Document::AddField>();
         add<Document::GetValue>();
         add<Document::SetField>();

@@ -1,32 +1,30 @@
-// list_collections.cpp
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2014-2016 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
@@ -60,6 +58,7 @@ using std::vector;
 using stdx::make_unique;
 
 namespace {
+
 /**
  * Determines if 'matcher' is an exact match on the "name" field. If so, returns a vector of all the
  * collection names it is matching against. Returns {} if there is no obvious exact match on name.
@@ -85,10 +84,9 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
         }
     } else if (matchType == MatchExpression::MATCH_IN) {
         auto matchIn = checked_cast<const InMatchExpression*>(matcher);
-        const ArrayFilterEntries& entries = matchIn->getData();
-        if (matchIn->path() == "name" && entries.numRegexes() == 0) {
+        if (matchIn->path() == "name" && matchIn->getRegexes().empty()) {
             vector<StringData> exactMatches;
-            for (auto&& elem : entries.equalities()) {
+            for (auto&& elem : matchIn->getEqualities()) {
                 if (elem.type() == String) {
                     exactMatches.push_back(elem.valueStringData());
                 }
@@ -138,7 +136,6 @@ void _addWorkingSetMember(OperationContext* txn,
     member->transitionToOwnedObj();
     root->pushBack(id);
 }
-}  // namespace
 
 class CmdListCollections : public Command {
 public:
@@ -151,7 +148,7 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -193,8 +190,10 @@ public:
                 return appendCommandStatus(
                     result, Status(ErrorCodes::BadValue, "\"filter\" must be an object"));
             }
+            // The collator is null because collection objects are compared using binary comparison.
+            const CollatorInterface* collator = nullptr;
             StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
-                filterElt.Obj(), ExtensionsCallbackDisallowExtensions());
+                filterElt.Obj(), ExtensionsCallbackDisallowExtensions(), collator);
             if (!statusWithMatcher.isOK()) {
                 return appendCommandStatus(result, statusWithMatcher.getStatus());
             }
@@ -230,7 +229,7 @@ public:
             }
         }
 
-        std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name;
+        const std::string cursorNamespace = str::stream() << dbname << ".$cmd." << getName();
         dassert(NamespaceString(cursorNamespace).isValid());
         dassert(NamespaceString(cursorNamespace).isListCollectionsCursorNS());
 
@@ -277,4 +276,6 @@ public:
         return true;
     }
 } cmdListCollections;
-}
+
+}  // namespace
+}  // namespace mongo

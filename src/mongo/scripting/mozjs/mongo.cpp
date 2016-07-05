@@ -37,6 +37,8 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/sasl_client_session.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/mozjs/cursor.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
@@ -61,6 +63,8 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
         getServerRPCProtocols, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(insert, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
+        isReplicaSetConnection, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(logout, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(remove, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(runCommand, MongoLocalInfo, MongoExternalInfo),
@@ -269,29 +273,39 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
         return ValueWriter(cx, value).toBSON();
     };
 
-    if (args.get(1).isObject() && JS_IsArrayObject(cx, args.get(1))) {
-        JS::RootedObject obj(cx, args.get(1).toObjectOrNull());
-        ObjectWrapper array(cx, obj);
+    if (args.get(1).isObject()) {
+        bool isArray;
 
-        std::vector<BSONObj> bos;
+        if (!JS_IsArrayObject(cx, args.get(1), &isArray)) {
+            uasserted(ErrorCodes::BadValue, "Failure to check is object an array");
+        }
 
-        bool foundElement = false;
+        if (isArray) {
+            JS::RootedObject obj(cx, args.get(1).toObjectOrNull());
+            ObjectWrapper array(cx, obj);
 
-        array.enumerate([&](JS::HandleId id) {
-            foundElement = true;
+            std::vector<BSONObj> bos;
 
-            JS::RootedValue value(cx);
-            array.getValue(id, &value);
+            bool foundElement = false;
 
-            bos.push_back(addId(value));
+            array.enumerate([&](JS::HandleId id) {
+                foundElement = true;
 
-            return true;
-        });
+                JS::RootedValue value(cx);
+                array.getValue(id, &value);
 
-        if (!foundElement)
-            uasserted(ErrorCodes::BadValue, "attempted to insert an empty array");
+                bos.push_back(addId(value));
 
-        conn->insert(ns, bos, flags);
+                return true;
+            });
+
+            if (!foundElement)
+                uasserted(ErrorCodes::BadValue, "attempted to insert an empty array");
+
+            conn->insert(ns, bos, flags);
+        } else {
+            conn->insert(ns, addId(args.get(1)));
+        }
     } else {
         conn->insert(ns, addId(args.get(1)));
     }
@@ -364,11 +378,13 @@ void MongoBase::Functions::auth::call(JSContext* cx, JS::CallArgs args) {
             params = ValueWriter(cx, args.get(0)).toBSON();
             break;
         case 3:
-            params = BSON(saslCommandMechanismFieldName
-                          << "MONGODB-CR" << saslCommandUserDBFieldName
-                          << ValueWriter(cx, args[0]).toString() << saslCommandUserFieldName
-                          << ValueWriter(cx, args[1]).toString() << saslCommandPasswordFieldName
-                          << ValueWriter(cx, args[2]).toString());
+            params =
+                BSON(saslCommandMechanismFieldName << "MONGODB-CR" << saslCommandUserDBFieldName
+                                                   << ValueWriter(cx, args[0]).toString()
+                                                   << saslCommandUserFieldName
+                                                   << ValueWriter(cx, args[1]).toString()
+                                                   << saslCommandPasswordFieldName
+                                                   << ValueWriter(cx, args[2]).toString());
             break;
         default:
             uasserted(ErrorCodes::BadValue, "mongoAuth takes 1 object or 3 string arguments");
@@ -475,7 +491,8 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
 
     BSONObj saslFirstCommandPrefix =
         BSON("copydbsaslstart" << 1 << "fromhost" << fromHost << "fromdb" << fromDb
-                               << saslCommandMechanismFieldName << "SCRAM-SHA-1");
+                               << saslCommandMechanismFieldName
+                               << "SCRAM-SHA-1");
 
     BSONObj saslFollowupCommandPrefix =
         BSON("copydb" << 1 << "fromhost" << fromHost << "fromdb" << fromDb << "todb" << toDb);
@@ -578,15 +595,24 @@ void MongoBase::Functions::getServerRPCProtocols::call(JSContext* cx, JS::CallAr
     ValueReader(cx, args.rval()).fromStringData(protoStr);
 }
 
+void MongoBase::Functions::isReplicaSetConnection::call(JSContext* cx, JS::CallArgs args) {
+    auto conn = getConnection(args);
+
+    if (args.length() != 0) {
+        uasserted(ErrorCodes::BadValue, "isReplicaSetConnection takes no args");
+    }
+
+    args.rval().setBoolean(conn->type() == ConnectionString::ConnectionType::SET);
+}
+
 void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
     if (args.length() != 0)
         uasserted(ErrorCodes::BadValue, "local Mongo constructor takes no args");
 
-    std::unique_ptr<DBClientBase> conn;
-
-    conn.reset(createDirectClient(scope->getOpContext()));
+    auto txn = scope->getOpContext();
+    auto conn = DBDirectClientFactory::get(txn).create(txn);
 
     JS::RootedObject thisv(cx);
     scope->getProto<MongoLocalInfo>().newObject(&thisv);

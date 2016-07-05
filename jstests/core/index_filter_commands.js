@@ -1,6 +1,6 @@
 /**
  * Index Filter commands
- * 
+ *
  * Commands:
  * - planCacheListFilters
  *   Displays index filters for all query shapes in a collection.
@@ -20,7 +20,7 @@
  * cache state. We would do this with the planCacheListPlans command
  * on the same query shape with the index filters.
  *
- */ 
+ */
 
 var t = db.jstests_index_filter_commands;
 
@@ -61,7 +61,6 @@ function getFilters(collection) {
     assert.commandWorked(res, 'planCacheListFilters failed');
     assert(res.hasOwnProperty('filters'), 'filters missing from planCacheListFilters result');
     return res.filters;
-    
 }
 
 // If query shape is in plan cache,
@@ -76,8 +75,8 @@ function planCacheContains(shape) {
 function getPlans(shape) {
     var res = t.runCommand('planCacheListPlans', shape);
     assert.commandWorked(res, 'planCacheListPlans(' + tojson(shape, '', true) + ' failed');
-    assert(res.hasOwnProperty('plans'), 'plans missing from planCacheListPlans(' +
-           tojson(shape, '', true) + ') result');
+    assert(res.hasOwnProperty('plans'),
+           'plans missing from planCacheListPlans(' + tojson(shape, '', true) + ') result');
     return res.plans;
 }
 
@@ -85,7 +84,8 @@ function getPlans(shape) {
 // will return empty results.
 var missingCollection = db.jstests_index_filter_commands_missing;
 missingCollection.drop();
-assert.eq(0, getFilters(missingCollection),
+assert.eq(0,
+          getFilters(missingCollection),
           'planCacheListFilters should return empty array on non-existent collection');
 
 // Retrieve index filters from an empty test collection.
@@ -98,17 +98,21 @@ var shape = {query: queryA1, sort: sortA1, projection: projectionA1};
 var planBeforeSetFilter = getPlans(shape)[0];
 print('Winning plan (before setting index filters) = ' + tojson(planBeforeSetFilter));
 // Check filterSet field in plan details
-assert.eq(false, planBeforeSetFilter.filterSet, 'missing or invalid filterSet field in plan details');
+assert.eq(
+    false, planBeforeSetFilter.filterSet, 'missing or invalid filterSet field in plan details');
 
 // Adding index filters to a non-existent collection should be an error.
-assert.commandFailed(missingCollection.runCommand('planCacheSetFilter',
-        {query: queryA1, sort: sortA1, projection: projectionA1, indexes: [indexA1B1, indexA1C1]}));
+assert.commandFailed(missingCollection.runCommand(
+    'planCacheSetFilter',
+    {query: queryA1, sort: sortA1, projection: projectionA1, indexes: [indexA1B1, indexA1C1]}));
 
 // Add index filters for simple query.
-assert.commandWorked(t.runCommand('planCacheSetFilter',
+assert.commandWorked(t.runCommand(
+    'planCacheSetFilter',
     {query: queryA1, sort: sortA1, projection: projectionA1, indexes: [indexA1B1, indexA1C1]}));
 filters = getFilters();
-assert.eq(1, filters.length, 'no change in query settings after successfully setting index filters');
+assert.eq(
+    1, filters.length, 'no change in query settings after successfully setting index filters');
 assert.eq(queryA1, filters[0].query, 'unexpected query in filters');
 assert.eq(sortA1, filters[0].sort, 'unexpected sort in filters');
 assert.eq(projectionA1, filters[0].projection, 'unexpected projection in filters');
@@ -154,23 +158,29 @@ if (db.isMaster().msg !== "isdbgrid") {
     // No filter.
     t.getPlanCache().clear();
     assert.eq(false, t.find({z: 1}).explain('queryPlanner').queryPlanner.indexFilterSet);
-    assert.eq(false, t.find(queryA1, projectionA1).sort(sortA1)
-                                                  .explain('queryPlanner').queryPlanner.indexFilterSet);
+    assert.eq(false,
+              t.find(queryA1, projectionA1)
+                  .sort(sortA1)
+                  .explain('queryPlanner')
+                  .queryPlanner.indexFilterSet);
 
     // With one filter set.
     assert.commandWorked(t.runCommand('planCacheSetFilter', {query: {z: 1}, indexes: [{z: 1}]}));
     assert.eq(true, t.find({z: 1}).explain('queryPlanner').queryPlanner.indexFilterSet);
-    assert.eq(false, t.find(queryA1, projectionA1).sort(sortA1)
-                                                  .explain('queryPlanner').queryPlanner.indexFilterSet);
+    assert.eq(false,
+              t.find(queryA1, projectionA1)
+                  .sort(sortA1)
+                  .explain('queryPlanner')
+                  .queryPlanner.indexFilterSet);
 
     // With two filters set.
-    assert.commandWorked(t.runCommand('planCacheSetFilter', {
-        query: queryA1,
-        projection: projectionA1,
-        sort: sortA1,
-        indexes: [indexA1B1, indexA1C1]
-    }));
+    assert.commandWorked(t.runCommand(
+        'planCacheSetFilter',
+        {query: queryA1, projection: projectionA1, sort: sortA1, indexes: [indexA1B1, indexA1C1]}));
     assert.eq(true, t.find({z: 1}).explain('queryPlanner').queryPlanner.indexFilterSet);
-    assert.eq(true, t.find(queryA1, projectionA1).sort(sortA1)
-                                                 .explain('queryPlanner').queryPlanner.indexFilterSet);
+    assert.eq(true,
+              t.find(queryA1, projectionA1)
+                  .sort(sortA1)
+                  .explain('queryPlanner')
+                  .queryPlanner.indexFilterSet);
 }

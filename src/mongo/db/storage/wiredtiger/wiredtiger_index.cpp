@@ -37,22 +37,22 @@
 #include <set>
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/db/json.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/json.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/hex.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -60,7 +60,7 @@
 
 #if TRACING_ENABLED
 #define TRACE_CURSOR log() << "WT index (" << (const void*)&_idx << ") "
-#define TRACE_INDEX log() << "WT index (" << (const void*) this << ") "
+#define TRACE_INDEX log() << "WT index (" << (const void*)this << ") "
 #else
 #define TRACE_CURSOR \
     if (0)           \
@@ -82,13 +82,11 @@ static const int TempKeyMaxSize = 1024;  // this goes away with SERVER-3372
 
 static const WiredTigerItem emptyItem(NULL, 0);
 
-static const int kMinimumIndexVersion = 6;
-static const int kCurrentIndexVersion = 6;  // New indexes use this by default.
-static const int kMaximumIndexVersion = 6;
-static_assert(kCurrentIndexVersion >= kMinimumIndexVersion,
-              "kCurrentIndexVersion >= kMinimumIndexVersion");
-static_assert(kCurrentIndexVersion <= kMaximumIndexVersion,
-              "kCurrentIndexVersion <= kMaximumIndexVersion");
+// Keystring format 7 was used in 3.3.6 - 3.3.8 development releases.
+static const int kKeyStringV0Version = 6;
+static const int kKeyStringV1Version = 8;
+static const int kMinimumIndexVersion = kKeyStringV0Version;
+static const int kMaximumIndexVersion = kKeyStringV1Version;
 
 bool hasFieldNames(const BSONObj& obj) {
     BSONForEach(e, obj) {
@@ -144,7 +142,8 @@ StatusWith<std::string> WiredTigerIndex::parseIndexOptions(const BSONObj& option
             // Return error on first unrecognized field.
             return StatusWith<std::string>(ErrorCodes::InvalidOptions,
                                            str::stream() << '\'' << elem.fieldNameStringData()
-                                                         << '\'' << " is not a supported option.");
+                                                         << '\''
+                                                         << " is not a supported option.");
         }
     }
     return StatusWith<std::string>(ss.str());
@@ -197,7 +196,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     // Index metadata
     ss << ",app_metadata=("
-       << "formatVersion=" << kCurrentIndexVersion << ','
+       << "formatVersion=" << (enableBSON1_1 ? kKeyStringV1Version : kKeyStringV0Version) << ','
        << "infoObj=" << desc.infoObj().jsonString() << "),";
 
     LOG(3) << "index create string: " << ss.ss.str();
@@ -222,11 +221,21 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
       _tableId(WiredTigerSession::genTableId()),
       _collectionNamespace(desc->parentNS()),
       _indexName(desc->indexName()) {
-    Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
+    auto version = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
-    if (!versionStatus.isOK()) {
-        fassertFailedWithStatusNoTrace(28579, versionStatus);
+    if (!version.isOK()) {
+        str::stream ss;
+        Status versionStatus = version.getStatus();
+        ss << versionStatus.reason() << " Index: {name: " << desc->indexName()
+           << ", ns: " << desc->parentNS() << "} - version too new for this mongod."
+           << " See http://dochub.mongodb.org/core/3.4-index-downgrade for detailed"
+           << " instructions on how to handle this error.";
+        Status indexVersionStatus(
+            ErrorCodes::UnsupportedFormat, ss.ss.str(), versionStatus.location());
+        fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
+    _keyStringVersion =
+        version.getValue() == kKeyStringV1Version ? KeyString::Version::V1 : KeyString::Version::V0;
 }
 
 Status WiredTigerIndex::insert(OperationContext* txn,
@@ -263,38 +272,25 @@ void WiredTigerIndex::unindex(OperationContext* txn,
 }
 
 void WiredTigerIndex::fullValidate(OperationContext* txn,
-                                   bool full,
                                    long long* numKeysOut,
-                                   BSONObjBuilder* output) const {
-    if (!WiredTigerRecoveryUnit::get(txn)->getSessionCache()->isEphemeral()) {
-        std::vector<std::string> errors;
-        int err = WiredTigerUtil::verifyTable(txn, _uri, output ? &errors : NULL);
+                                   ValidateResults* fullResults) const {
+    if (fullResults && !WiredTigerRecoveryUnit::get(txn)->getSessionCache()->isEphemeral()) {
+        int err = WiredTigerUtil::verifyTable(txn, _uri, &(fullResults->errors));
         if (err == EBUSY) {
             const char* msg = "verify() returned EBUSY. Not treating as invalid.";
             warning() << msg;
-            if (output) {
-                if (!errors.empty()) {
-                    *output << "errors" << errors;
-                }
-                *output << "warning" << msg;
-            }
+            fullResults->warnings.push_back(msg);
         } else if (err) {
             std::string msg = str::stream() << "verify() returned " << wiredtiger_strerror(err)
                                             << ". "
                                             << "This indicates structural damage. "
                                             << "Not examining individual index entries.";
             error() << msg;
-            if (output) {
-                errors.push_back(msg);
-                *output << "errors" << errors;
-                *output << "valid" << false;
-            }
+            fullResults->errors.push_back(msg);
+            fullResults->valid = false;
             return;
         }
     }
-
-    if (output)
-        *output << "valid" << true;
 
     auto cursor = newCursor(txn);
     long long count = 0;
@@ -305,17 +301,9 @@ void WiredTigerIndex::fullValidate(OperationContext* txn,
         TRACE_INDEX << "\t" << kv->key << ' ' << kv->loc;
         count++;
     }
-
     if (numKeysOut) {
         *numKeysOut = count;
     }
-
-    // Nothing further to do if 'full' validation is not requested.
-    if (!full) {
-        return;
-    }
-
-    invariant(output);
 }
 
 bool WiredTigerIndex::appendCustomStats(OperationContext* txn,
@@ -391,14 +379,48 @@ Status WiredTigerIndex::touch(OperationContext* txn) const {
 
 
 long long WiredTigerIndex::getSpaceUsedBytes(OperationContext* txn) const {
-    WiredTigerSession* session = WiredTigerRecoveryUnit::get(txn)->getSession(txn);
+    auto ru = WiredTigerRecoveryUnit::get(txn);
+    WiredTigerSession* session = ru->getSession(txn);
+
+    if (ru->getSessionCache()->isEphemeral()) {
+        // For ephemeral case, use cursor statistics
+        const auto statsUri = "statistics:" + uri();
+
+        // Helper function to retrieve stats and check for errors
+        auto getStats = [&](int key) -> int64_t {
+            StatusWith<int64_t> result = WiredTigerUtil::getStatisticsValueAs<int64_t>(
+                session->getSession(), statsUri, "statistics=(fast)", key);
+            if (!result.isOK()) {
+                if (result.getStatus().code() == ErrorCodes::CursorNotFound)
+                    return 0;  // ident gone, so return 0
+
+                uassertStatusOK(result.getStatus());
+            }
+            return result.getValue();
+        };
+
+        auto inserts = getStats(WT_STAT_DSRC_CURSOR_INSERT);
+        auto removes = getStats(WT_STAT_DSRC_CURSOR_REMOVE);
+        auto insertBytes = getStats(WT_STAT_DSRC_CURSOR_INSERT_BYTES);
+
+        if (inserts == 0 || removes >= inserts)
+            return 0;
+
+        // Rough approximation of index size as average entry size times number of entries.
+        // May be off if key sizes change significantly over the life time of the collection,
+        // but is the best we can do currrently with the statistics available.
+        auto bytesPerEntry = (insertBytes + inserts - 1) / inserts;  // round up
+        auto numEntries = inserts - removes;
+        return numEntries * bytesPerEntry;
+    }
+
     return static_cast<long long>(WiredTigerUtil::getIdentSize(session->getSession(), _uri));
 }
 
 bool WiredTigerIndex::isDup(WT_CURSOR* c, const BSONObj& key, const RecordId& id) {
     invariant(unique());
     // First check whether the key exists.
-    KeyString data(key, _ordering);
+    KeyString data(keyStringVersion(), key, _ordering);
     WiredTigerItem item(data.getBuffer(), data.getSize());
     c->set_key(c, item.Get());
     int ret = WT_OP_CHECK(c->search(c));
@@ -416,13 +438,24 @@ bool WiredTigerIndex::isDup(WT_CURSOR* c, const BSONObj& key, const RecordId& id
         if (KeyString::decodeRecordId(&br) == id)
             return false;
 
-        KeyString::TypeBits::fromBuffer(&br);  // Just calling this to advance reader.
+        KeyString::TypeBits::fromBuffer(keyStringVersion(), &br);  // Just advance the reader.
     }
     return true;
 }
 
 Status WiredTigerIndex::initAsEmpty(OperationContext* txn) {
     // No-op
+    return Status::OK();
+}
+
+Status WiredTigerIndex::compact(OperationContext* txn) {
+    WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(txn)->getSessionCache();
+    if (!cache->isEphemeral()) {
+        UniqueWiredTigerSession session = cache->getSession();
+        WT_SESSION* s = session->getSession();
+        int ret = s->compact(s, uri().c_str(), "timeout=0");
+        invariantWTOK(ret);
+    }
     return Status::OK();
 }
 
@@ -486,7 +519,7 @@ public:
                 return s;
         }
 
-        KeyString data(key, _idx->_ordering, id);
+        KeyString data(_idx->keyStringVersion(), key, _idx->_ordering, id);
 
         // Can't use WiredTigerCursor since we aren't using the cache.
         WiredTigerItem item(data.getBuffer(), data.getSize());
@@ -525,7 +558,10 @@ private:
 class WiredTigerIndex::UniqueBulkBuilder : public BulkBuilder {
 public:
     UniqueBulkBuilder(WiredTigerIndex* idx, OperationContext* txn, bool dupsAllowed)
-        : BulkBuilder(idx, txn), _idx(idx), _dupsAllowed(dupsAllowed) {}
+        : BulkBuilder(idx, txn),
+          _idx(idx),
+          _dupsAllowed(dupsAllowed),
+          _keyString(idx->keyStringVersion()) {}
 
     Status addKey(const BSONObj& newKey, const RecordId& id) {
         {
@@ -573,7 +609,7 @@ private:
     void doInsert() {
         invariant(!_records.empty());
 
-        KeyString value;
+        KeyString value(_idx->keyStringVersion());
         for (size_t i = 0; i < _records.size(); i++) {
             value.appendRecordId(_records[i].first);
             // When there is only one record, we can omit AllZeros TypeBits. Otherwise they need
@@ -609,7 +645,12 @@ namespace {
 class WiredTigerIndexCursorBase : public SortedDataInterface::Cursor {
 public:
     WiredTigerIndexCursorBase(const WiredTigerIndex& idx, OperationContext* txn, bool forward)
-        : _txn(txn), _idx(idx), _forward(forward) {
+        : _txn(txn),
+          _idx(idx),
+          _forward(forward),
+          _key(idx.keyStringVersion()),
+          _typeBits(idx.keyStringVersion()),
+          _query(idx.keyStringVersion()) {
         _cursor.emplace(_idx.uri(), _idx.tableId(), false, _txn);
     }
     boost::optional<IndexKeyEntry> next(RequestedInfo parts) override {
@@ -635,7 +676,7 @@ public:
         // end after the key if inclusive and before if exclusive.
         const auto discriminator =
             _forward == inclusive ? KeyString::kExclusiveAfter : KeyString::kExclusiveBefore;
-        _endPosition = stdx::make_unique<KeyString>();
+        _endPosition = stdx::make_unique<KeyString>(_idx.keyStringVersion());
         _endPosition->resetToKey(stripFieldNames(key), _idx.ordering(), discriminator);
     }
 
@@ -963,10 +1004,10 @@ Status WiredTigerIndexUnique::_insert(WT_CURSOR* c,
                                       const BSONObj& key,
                                       const RecordId& id,
                                       bool dupsAllowed) {
-    const KeyString data(key, _ordering);
+    const KeyString data(keyStringVersion(), key, _ordering);
     WiredTigerItem keyItem(data.getBuffer(), data.getSize());
 
-    KeyString value(id);
+    KeyString value(keyStringVersion(), id);
     if (!data.getTypeBits().isAllZeros())
         value.appendTypeBits(data.getTypeBits());
 
@@ -1006,7 +1047,7 @@ Status WiredTigerIndexUnique::_insert(WT_CURSOR* c,
 
         // Copy from old to new value
         value.appendRecordId(idInIndex);
-        value.appendTypeBits(KeyString::TypeBits::fromBuffer(&br));
+        value.appendTypeBits(KeyString::TypeBits::fromBuffer(keyStringVersion(), &br));
     }
 
     if (!dupsAllowed)
@@ -1027,7 +1068,7 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
                                      const BSONObj& key,
                                      const RecordId& id,
                                      bool dupsAllowed) {
-    KeyString data(key, _ordering);
+    KeyString data(keyStringVersion(), key, _ordering);
     WiredTigerItem keyItem(data.getBuffer(), data.getSize());
     c->set_key(c, keyItem.Get());
 
@@ -1044,8 +1085,17 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
     // dups are allowed, so we have to deal with a vector of RecordIds.
 
     int ret = WT_OP_CHECK(c->search(c));
-    if (ret == WT_NOTFOUND)
+    if (ret == WT_NOTFOUND) {
+        // WT_NOTFOUND is only expected during a background index build. Insert a dummy value and
+        // delete it again to trigger a write conflict in case this is being concurrently indexed by
+        // the background indexer.
+        c->set_key(c, keyItem.Get());
+        c->set_value(c, emptyItem.Get());
+        invariantWTOK(WT_OP_CHECK(c->insert(c)));
+        c->set_key(c, keyItem.Get());
+        invariantWTOK(WT_OP_CHECK(c->remove(c)));
         return;
+    }
     invariantWTOK(ret);
 
     WT_ITEM old;
@@ -1057,7 +1107,7 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
     BufReader br(old.data, old.size);
     while (br.remaining()) {
         RecordId idInIndex = KeyString::decodeRecordId(&br);
-        KeyString::TypeBits typeBits = KeyString::TypeBits::fromBuffer(&br);
+        KeyString::TypeBits typeBits = KeyString::TypeBits::fromBuffer(keyStringVersion(), &br);
 
         if (id == idInIndex) {
             if (records.empty() && !br.remaining()) {
@@ -1080,7 +1130,7 @@ void WiredTigerIndexUnique::_unindex(WT_CURSOR* c,
     }
 
     // Put other ids for this key back in the index.
-    KeyString newValue;
+    KeyString newValue(keyStringVersion());
     invariant(!records.empty());
     for (size_t i = 0; i < records.size(); i++) {
         newValue.appendRecordId(records[i].first);
@@ -1123,7 +1173,7 @@ Status WiredTigerIndexStandard::_insert(WT_CURSOR* c,
 
     TRACE_INDEX << " key: " << keyBson << " id: " << id;
 
-    KeyString key(keyBson, _ordering, id);
+    KeyString key(keyStringVersion(), keyBson, _ordering, id);
     WiredTigerItem keyItem(key.getBuffer(), key.getSize());
 
     WiredTigerItem valueItem = key.getTypeBits().isAllZeros()
@@ -1147,12 +1197,21 @@ void WiredTigerIndexStandard::_unindex(WT_CURSOR* c,
                                        const RecordId& id,
                                        bool dupsAllowed) {
     invariant(dupsAllowed);
-    KeyString data(key, _ordering, id);
+    KeyString data(keyStringVersion(), key, _ordering, id);
     WiredTigerItem item(data.getBuffer(), data.getSize());
     c->set_key(c, item.Get());
     int ret = WT_OP_CHECK(c->remove(c));
     if (ret != WT_NOTFOUND) {
         invariantWTOK(ret);
+    } else {
+        // WT_NOTFOUND is only expected during a background index build. Insert a dummy value and
+        // delete it again to trigger a write conflict in case this is being concurrently indexed by
+        // the background indexer.
+        c->set_key(c, item.Get());
+        c->set_value(c, emptyItem.Get());
+        invariantWTOK(WT_OP_CHECK(c->insert(c)));
+        c->set_key(c, item.Get());
+        invariantWTOK(WT_OP_CHECK(c->remove(c)));
     }
 }
 

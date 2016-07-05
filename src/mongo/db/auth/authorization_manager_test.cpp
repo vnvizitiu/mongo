@@ -25,6 +25,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 /**
  * Unit tests of the AuthorizationManager type.
  */
@@ -32,10 +34,10 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authz_session_external_state_mock.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authz_manager_external_state_mock.h"
+#include "mongo/db/auth/authz_session_external_state_mock.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
@@ -157,7 +159,7 @@ public:
             authzManager->invalidateUserCache();
     }
 
-    void setUp() {
+    void setUp() override {
         auto localExternalState = stdx::make_unique<AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
         externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
@@ -173,36 +175,38 @@ public:
 TEST_F(AuthorizationManagerTest, testAcquireV2User) {
     OperationContextNoop txn;
 
-    ASSERT_OK(
-        externalState->insertPrivilegeDocument(&txn,
-                                               BSON("_id"
-                                                    << "admin.v2read"
-                                                    << "user"
-                                                    << "v2read"
-                                                    << "db"
-                                                    << "test"
-                                                    << "credentials" << BSON("MONGODB-CR"
-                                                                             << "password")
-                                                    << "roles" << BSON_ARRAY(BSON("role"
-                                                                                  << "read"
-                                                                                  << "db"
-                                                                                  << "test"))),
-                                               BSONObj()));
-    ASSERT_OK(
-        externalState->insertPrivilegeDocument(&txn,
-                                               BSON("_id"
-                                                    << "admin.v2cluster"
-                                                    << "user"
-                                                    << "v2cluster"
-                                                    << "db"
-                                                    << "admin"
-                                                    << "credentials" << BSON("MONGODB-CR"
-                                                                             << "password")
-                                                    << "roles" << BSON_ARRAY(BSON("role"
-                                                                                  << "clusterAdmin"
-                                                                                  << "db"
-                                                                                  << "admin"))),
-                                               BSONObj()));
+    ASSERT_OK(externalState->insertPrivilegeDocument(&txn,
+                                                     BSON("_id"
+                                                          << "admin.v2read"
+                                                          << "user"
+                                                          << "v2read"
+                                                          << "db"
+                                                          << "test"
+                                                          << "credentials"
+                                                          << BSON("MONGODB-CR"
+                                                                  << "password")
+                                                          << "roles"
+                                                          << BSON_ARRAY(BSON("role"
+                                                                             << "read"
+                                                                             << "db"
+                                                                             << "test"))),
+                                                     BSONObj()));
+    ASSERT_OK(externalState->insertPrivilegeDocument(&txn,
+                                                     BSON("_id"
+                                                          << "admin.v2cluster"
+                                                          << "user"
+                                                          << "v2cluster"
+                                                          << "db"
+                                                          << "admin"
+                                                          << "credentials"
+                                                          << BSON("MONGODB-CR"
+                                                                  << "password")
+                                                          << "roles"
+                                                          << BSON_ARRAY(BSON("role"
+                                                                             << "clusterAdmin"
+                                                                             << "db"
+                                                                             << "admin"))),
+                                                     BSONObj()));
 
     User* v2read;
     ASSERT_OK(authzManager->acquireUser(&txn, UserName("v2read", "test"), &v2read));
@@ -258,13 +262,13 @@ public:
 
 private:
     Status _getUserDocument(OperationContext* txn, const UserName& userName, BSONObj* userDoc) {
-        Status status =
-            findOne(txn,
-                    AuthorizationManager::usersCollectionNamespace,
-                    BSON(AuthorizationManager::USER_NAME_FIELD_NAME
-                         << userName.getUser() << AuthorizationManager::USER_DB_FIELD_NAME
-                         << userName.getDB()),
-                    userDoc);
+        Status status = findOne(txn,
+                                AuthorizationManager::usersCollectionNamespace,
+                                BSON(AuthorizationManager::USER_NAME_FIELD_NAME
+                                     << userName.getUser()
+                                     << AuthorizationManager::USER_DB_FIELD_NAME
+                                     << userName.getDB()),
+                                userDoc);
         if (status == ErrorCodes::NoMatchingDocument) {
             status = Status(ErrorCodes::UserNotFound,
                             mongoutils::str::stream() << "Could not find user "
@@ -281,7 +285,7 @@ public:
             authzManager->invalidateUserCache();
     }
 
-    void setUp() {
+    virtual void setUp() {
         auto localExternalState =
             stdx::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();
         externalState = localExternalState.get();
@@ -299,27 +303,33 @@ public:
 TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
     OperationContextNoop txn;
 
-    ASSERT_OK(externalState->insertPrivilegeDocument(
-        &txn,
-        BSON("_id"
-             << "admin.myUser"
-             << "user"
-             << "myUser"
-             << "db"
-             << "test"
-             << "credentials" << BSON("MONGODB-CR"
-                                      << "password") << "roles" << BSON_ARRAY(BSON("role"
-                                                                                   << "myRole"
-                                                                                   << "db"
-                                                                                   << "test"))
-             << "inheritedPrivileges" << BSON_ARRAY(BSON("resource" << BSON("db"
-                                                                            << "test"
-                                                                            << "collection"
-                                                                            << "") << "actions"
-                                                                    << BSON_ARRAY("find"
-                                                                                  << "fakeAction"
-                                                                                  << "insert")))),
-        BSONObj()));
+    ASSERT_OK(
+        externalState->insertPrivilegeDocument(&txn,
+                                               BSON("_id"
+                                                    << "admin.myUser"
+                                                    << "user"
+                                                    << "myUser"
+                                                    << "db"
+                                                    << "test"
+                                                    << "credentials"
+                                                    << BSON("MONGODB-CR"
+                                                            << "password")
+                                                    << "roles"
+                                                    << BSON_ARRAY(BSON("role"
+                                                                       << "myRole"
+                                                                       << "db"
+                                                                       << "test"))
+                                                    << "inheritedPrivileges"
+                                                    << BSON_ARRAY(BSON(
+                                                           "resource" << BSON("db"
+                                                                              << "test"
+                                                                              << "collection"
+                                                                              << "")
+                                                                      << "actions"
+                                                                      << BSON_ARRAY("find"
+                                                                                    << "fakeAction"
+                                                                                    << "insert")))),
+                                               BSONObj()));
 
     User* myUser;
     ASSERT_OK(authzManager->acquireUser(&txn, UserName("myUser", "test"), &myUser));
@@ -340,6 +350,131 @@ TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
 
     // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
     authzManager->releaseUser(myUser);
+}
+
+// These tests ensure that the AuthorizationManager registers a
+// Change on the RecoveryUnit, when an Op is reported that could
+// modify role data. This Change is might recompute
+// the RoleGraph when executed.
+class AuthorizationManagerLogOpTest : public AuthorizationManagerTest {
+public:
+    class MockRecoveryUnit : public RecoveryUnitNoop {
+    public:
+        MockRecoveryUnit(size_t* registeredChanges) : _registeredChanges(registeredChanges) {}
+
+        virtual void registerChange(Change* change) final {
+            // RecoveryUnitNoop takes ownership of the Change
+            RecoveryUnitNoop::registerChange(change);
+            ++(*_registeredChanges);
+        }
+
+    private:
+        size_t* _registeredChanges;
+    };
+
+    virtual void setUp() override {
+        txn.setRecoveryUnit(recoveryUnit, OperationContext::kNotInUnitOfWork);
+        AuthorizationManagerTest::setUp();
+    }
+
+    OperationContextNoop txn;
+    size_t registeredChanges = 0;
+    MockRecoveryUnit* recoveryUnit = new MockRecoveryUnit(&registeredChanges);
+};
+
+TEST_F(AuthorizationManagerLogOpTest, testDropDatabaseAddsRecoveryUnits) {
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("dropDatabase"
+                             << "1"),
+                        nullptr);
+    ASSERT_EQ(size_t(1), registeredChanges);
+}
+
+TEST_F(AuthorizationManagerLogOpTest, testDropAuthCollectionAddsRecoveryUnits) {
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("drop"
+                             << "system.users"),
+                        nullptr);
+    ASSERT_EQ(size_t(1), registeredChanges);
+
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("drop"
+                             << "system.roles"),
+                        nullptr);
+    ASSERT_EQ(size_t(2), registeredChanges);
+
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("drop"
+                             << "system.version"),
+                        nullptr);
+    ASSERT_EQ(size_t(3), registeredChanges);
+
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("drop"
+                             << "system.profile"),
+                        nullptr);
+    ASSERT_EQ(size_t(3), registeredChanges);
+}
+
+TEST_F(AuthorizationManagerLogOpTest, testCreateAnyCollectionAddsNoRecoveryUnits) {
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("create"
+                             << "system.users"),
+                        nullptr);
+
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("create"
+                             << "system.profile"),
+                        nullptr);
+
+    authzManager->logOp(&txn,
+                        "c",
+                        "admin.$cmd",
+                        BSON("create"
+                             << "system.other"),
+                        nullptr);
+
+    ASSERT_EQ(size_t(0), registeredChanges);
+}
+
+TEST_F(AuthorizationManagerLogOpTest, testRawInsertToRolesCollectionAddsRecoveryUnits) {
+    authzManager->logOp(&txn,
+                        "i",
+                        "admin.system.profile",
+                        BSON("_id"
+                             << "admin.user"),
+                        nullptr);
+    ASSERT_EQ(size_t(0), registeredChanges);
+
+    authzManager->logOp(&txn,
+                        "i",
+                        "admin.system.users",
+                        BSON("_id"
+                             << "admin.user"),
+                        nullptr);
+    ASSERT_EQ(size_t(0), registeredChanges);
+
+    authzManager->logOp(&txn,
+                        "i",
+                        "admin.system.roles",
+                        BSON("_id"
+                             << "admin.user"),
+                        nullptr);
+    ASSERT_EQ(size_t(1), registeredChanges);
 }
 
 }  // namespace

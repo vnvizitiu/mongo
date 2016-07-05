@@ -43,9 +43,7 @@
 namespace mongo {
 namespace mozjs {
 
-#ifndef _MSC_EXTENSIONS
 const int ObjectWrapper::kMaxWriteFieldDepth;
-#endif  // _MSC_EXTENSIONS
 
 void ObjectWrapper::Key::get(JSContext* cx, JS::HandleObject o, JS::MutableHandleValue value) {
     switch (_type) {
@@ -326,7 +324,7 @@ void ObjectWrapper::getValue(Key key, JS::MutableHandleValue value) {
 
 void ObjectWrapper::setNumber(Key key, double val) {
     JS::RootedValue jsValue(_context);
-    jsValue.setDouble(val);
+    ValueReader(_context, &jsValue).fromDouble(val);
 
     setValue(key, jsValue);
 }
@@ -526,8 +524,11 @@ BSONObj ObjectWrapper::toBSON() {
     const int sizeWithEOO = b.len() + 1 /*EOO*/ - 4 /*BSONObj::Holder ref count*/;
     uassert(17260,
             str::stream() << "Converting from JavaScript to BSON failed: "
-                          << "Object size " << sizeWithEOO << " exceeds limit of "
-                          << BSONObjMaxInternalSize << " bytes.",
+                          << "Object size "
+                          << sizeWithEOO
+                          << " exceeds limit of "
+                          << BSONObjMaxInternalSize
+                          << " bytes.",
             sizeWithEOO <= BSONObjMaxInternalSize);
 
     return b.obj();
@@ -537,13 +538,19 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
                                                                   JSObject* obj,
                                                                   BSONObjBuilder* parent,
                                                                   StringData sd)
-    : thisv(cx, obj), ids(cx, JS_Enumerate(cx, thisv)) {
+    : thisv(cx, obj), ids(cx, JS::IdVector(cx)) {
     if (parent) {
-        subbob.emplace(JS_IsArrayObject(cx, thisv) ? parent->subarrayStart(sd)
-                                                   : parent->subobjStart(sd));
+        bool isArray;
+
+        if (!JS_IsArrayObject(cx, thisv, &isArray)) {
+            throwCurrentJSException(
+                cx, ErrorCodes::JSInterpreterFailure, "Failure to check object is an array");
+        }
+
+        subbob.emplace(isArray ? parent->subarrayStart(sd) : parent->subobjStart(sd));
     }
 
-    if (!ids) {
+    if (!JS_Enumerate(cx, thisv, &ids)) {
         throwCurrentJSException(
             cx, ErrorCodes::JSInterpreterFailure, "Failure to enumerate object");
     }

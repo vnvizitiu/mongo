@@ -39,6 +39,7 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -125,9 +126,14 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesEmpty) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -142,8 +148,8 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
     vector<BSONObj> shapes = getShapes(planCache);
     ASSERT_EQUALS(shapes.size(), 1U);
     ASSERT_EQUALS(shapes[0].getObjectField("query"), cq->getQueryObj());
-    ASSERT_EQUALS(shapes[0].getObjectField("sort"), cq->getParsed().getSort());
-    ASSERT_EQUALS(shapes[0].getObjectField("projection"), cq->getParsed().getProj());
+    ASSERT_EQUALS(shapes[0].getObjectField("sort"), cq->getQueryRequest().getSort());
+    ASSERT_EQUALS(shapes[0].getObjectField("projection"), cq->getQueryRequest().getProj());
 }
 
 /**
@@ -151,16 +157,20 @@ TEST(PlanCacheCommandsTest, planCacheListQueryShapesOneKey) {
  */
 
 TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // Plan cache with one entry
     PlanCache planCache;
     QuerySolution qs;
-    OperationContextNoop txn;
 
     qs.cacheData.reset(createSolutionCacheData());
     std::vector<QuerySolution*> solns;
@@ -169,7 +179,7 @@ TEST(PlanCacheCommandsTest, planCacheClearAllShapes) {
     ASSERT_EQUALS(getShapes(planCache).size(), 1U);
 
     // Clear cache and confirm number of keys afterwards.
-    ASSERT_OK(PlanCacheClear::clear(&txn, &planCache, nss.ns(), BSONObj()));
+    ASSERT_OK(PlanCacheClear::clear(txn.get(), &planCache, nss.ns(), BSONObj()));
     ASSERT_EQUALS(getShapes(planCache).size(), 0U);
 }
 
@@ -192,8 +202,9 @@ TEST(PlanCacheCommandsTest, Canonicalize) {
     ASSERT_NOT_OK(PlanCacheCommand::canonicalize(&txn, nss.ns(), fromjson("{query: {}, sort: 1}"))
                       .getStatus());
     // Bad query (invalid sort order)
-    ASSERT_NOT_OK(PlanCacheCommand::canonicalize(
-                      &txn, nss.ns(), fromjson("{query: {}, sort: {a: 0}}")).getStatus());
+    ASSERT_NOT_OK(
+        PlanCacheCommand::canonicalize(&txn, nss.ns(), fromjson("{query: {}, sort: {a: 0}}"))
+            .getStatus());
 
     // Valid parameters
     auto statusWithCQ =
@@ -268,13 +279,20 @@ TEST(PlanCacheCommandsTest, planCacheClearUnknownKey) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create 2 canonical queries.
+    auto qrA = stdx::make_unique<QueryRequest>(nss);
+    qrA->setFilter(fromjson("{a: 1}"));
     auto statusWithCQA = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qrA), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQA.getStatus());
+    auto qrB = stdx::make_unique<QueryRequest>(nss);
+    qrB->setFilter(fromjson("{b: 1}"));
     unique_ptr<CanonicalQuery> cqA = std::move(statusWithCQA.getValue());
     auto statusWithCQB = CanonicalQuery::canonicalize(
-        nss, fromjson("{b: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qrB), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQB.getStatus());
     unique_ptr<CanonicalQuery> cqB = std::move(statusWithCQB.getValue());
 
@@ -290,19 +308,20 @@ TEST(PlanCacheCommandsTest, planCacheClearOneKey) {
     // Check keys in cache before dropping {b: 1}
     vector<BSONObj> shapesBefore = getShapes(planCache);
     ASSERT_EQUALS(shapesBefore.size(), 2U);
-    BSONObj shapeA = BSON("query" << cqA->getQueryObj() << "sort" << cqA->getParsed().getSort()
-                                  << "projection" << cqA->getParsed().getProj());
-    BSONObj shapeB = BSON("query" << cqB->getQueryObj() << "sort" << cqB->getParsed().getSort()
-                                  << "projection" << cqB->getParsed().getProj());
+    BSONObj shapeA = BSON(
+        "query" << cqA->getQueryObj() << "sort" << cqA->getQueryRequest().getSort() << "projection"
+                << cqA->getQueryRequest().getProj());
+    BSONObj shapeB = BSON(
+        "query" << cqB->getQueryObj() << "sort" << cqB->getQueryRequest().getSort() << "projection"
+                << cqB->getQueryRequest().getProj());
     ASSERT_TRUE(std::find(shapesBefore.begin(), shapesBefore.end(), shapeA) != shapesBefore.end());
     ASSERT_TRUE(std::find(shapesBefore.begin(), shapesBefore.end(), shapeB) != shapesBefore.end());
 
     // Drop {b: 1} from cache. Make sure {a: 1} is still in cache afterwards.
     BSONObjBuilder bob;
-    OperationContextNoop txn;
 
-    ASSERT_OK(
-        PlanCacheClear::clear(&txn, &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
+    ASSERT_OK(PlanCacheClear::clear(
+        txn.get(), &planCache, nss.ns(), BSON("query" << cqB->getQueryObj())));
     vector<BSONObj> shapesAfter = getShapes(planCache);
     ASSERT_EQUALS(shapesAfter.size(), 1U);
     ASSERT_EQUALS(shapesAfter[0], shapeA);
@@ -392,9 +411,14 @@ TEST(PlanCacheCommandsTest, planCacheListPlansUnknownKey) {
 }
 
 TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -406,15 +430,22 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionTrue) {
     solns.push_back(&qs);
     planCache.add(*cq, solns, createDecision(1U));
 
-    vector<BSONObj> plans = getPlans(
-        planCache, cq->getQueryObj(), cq->getParsed().getSort(), cq->getParsed().getProj());
+    vector<BSONObj> plans = getPlans(planCache,
+                                     cq->getQueryObj(),
+                                     cq->getQueryRequest().getSort(),
+                                     cq->getQueryRequest().getProj());
     ASSERT_EQUALS(plans.size(), 1U);
 }
 
 TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
     // Create a canonical query
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    qr->setFilter(fromjson("{a: 1}"));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        nss, fromjson("{a: 1}"), ExtensionsCallbackDisallowExtensions());
+        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -428,8 +459,10 @@ TEST(PlanCacheCommandsTest, planCacheListPlansOnlyOneSolutionFalse) {
     solns.push_back(&qs);
     planCache.add(*cq, solns, createDecision(2U));
 
-    vector<BSONObj> plans = getPlans(
-        planCache, cq->getQueryObj(), cq->getParsed().getSort(), cq->getParsed().getProj());
+    vector<BSONObj> plans = getPlans(planCache,
+                                     cq->getQueryObj(),
+                                     cq->getQueryRequest().getSort(),
+                                     cq->getQueryRequest().getProj());
     ASSERT_EQUALS(plans.size(), 2U);
 }
 

@@ -11,57 +11,85 @@
  */
 
 (function() {
-"use strict";
+    "use strict";
 
-var testServer = MongoRunner.runMongod({setParameter: 'javascriptProtection=true'});
-var db = testServer.getDB("test");
-var t = db.foo;
-var funcToStore = function(x) { return x + 1; };
+    var testServer = MongoRunner.runMongod({setParameter: "javascriptProtection=true"});
+    assert.neq(
+        null, testServer, "failed to start mongod with --setParameter=javascriptProtection=true");
 
-function assertMongoClientCorrect() {
-    var mongo = runMongoProgram("mongo",
-                                "--port", testServer.port,
-                                "--enableJavaScriptProtection",
-                                "--eval",
-    // stored functions in objects
-        "var x = db.foo.findOne({'_id' : 0});" +
-        "assert.neq(typeof x.foo, 'function');" +
-    // retain db.loadServerScripts() functionality
-        "db.loadServerScripts();" +
-        "assert.eq(stored_func(4), 5);" +
+    var db = testServer.getDB("test");
+    var t = db.js_protection;
 
-        "print(\"completed gracefully\");"
-    );
+    function assertMongoClientCorrect() {
+        var functionToEval = function() {
+            var doc = db.js_protection.findOne({_id: 0});
+            assert.neq(null, doc);
+            assert(doc.hasOwnProperty("myFunc"));
+            assert.neq("function",
+                       typeof doc.myFunc,
+                       "value of BSON type Code shouldn't have been eval()ed automatically");
 
-    var mongoOutput = rawMongoProgramOutput();
-    assert(!mongoOutput.match(/assert failed/));
-    assert(mongoOutput.match(/completed gracefully/));
-}
+            assert.eq("undefined", typeof addOne, "addOne function has already been defined");
+            db.loadServerScripts();
+            assert.neq(
+                "undefined", typeof addOne, "addOne function should have been eval()ed locally");
+            assert.eq(5, addOne(4));
+        };
 
-function assertNoStoredWhere() {
-    t.insertOne({name: 'testdoc', val : 0, y : 0});
-    t.update( { $where : "stored_func(this.val) == 1" },
-              { $set : { y : 100 } } , false , true );
+        var exitCode = runMongoProgram("mongo",
+                                       "--port",
+                                       testServer.port,
+                                       "--enableJavaScriptProtection",
+                                       "--eval",
+                                       "(" + functionToEval.toString() + ")();");
+        assert.eq(0, exitCode);
+    }
 
-    var x = t.findOne({name: 'testdoc'});
-    assert.eq(x.y, 0);
+    function assertNoStoredWhere() {
+        t.insertOne({name: "testdoc", val: 0, y: 0});
 
-    t.update( { $where : function() { return this.val == 0;} } ,
-              { $set : { y : 100 } } , false , true );
+        var res = t.update({$where: "addOne(this.val) === 1"}, {$set: {y: 100}}, false, true);
+        assert.writeError(res);
 
-    x = t.findOne({name: 'testdoc'});
-    assert.eq(x.y, 100);
-}
+        var doc = t.findOne({name: "testdoc"});
+        assert.neq(null, doc);
+        assert.eq(0, doc.y, tojson(doc));
 
-/**
- *  ACTUAL TEST
- */
+        res = t.update({
+            $where: function() {
+                return this.val === 0;
+            }
+        },
+                       {$set: {y: 100}},
+                       false,
+                       true);
+        assert.writeOK(res);
 
-db.system.js.save( { _id : "stored_func" , value : funcToStore } );
-t.insertOne({'_id': 0, 'myFunc': function() { return 'tesval'; } });
+        doc = t.findOne({name: "testdoc"});
+        assert.neq(null, doc);
+        assert.eq(100, doc.y, tojson(doc));
+    }
 
-assertMongoClientCorrect();
-assertNoStoredWhere();
+    /**
+     *  ACTUAL TEST
+     */
 
-MongoRunner.stopMongod(testServer);
+    db.system.js.insertOne({
+        _id: "addOne",
+        value: function(x) {
+            return x + 1;
+        }
+    });
+
+    t.insertOne({
+        _id: 0,
+        myFunc: function() {
+            return "testval";
+        }
+    });
+
+    assertMongoClientCorrect();
+    assertNoStoredWhere();
+
+    MongoRunner.stopMongod(testServer);
 })();

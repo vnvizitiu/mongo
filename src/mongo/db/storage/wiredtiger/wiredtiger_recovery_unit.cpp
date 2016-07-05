@@ -30,10 +30,12 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/base/checked_cast.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/condition_variable.h"
@@ -44,12 +46,18 @@
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
+namespace {
+// SnapshotIds need to be globally unique, as they are used in a WorkingSetMember to
+// determine if documents changed, but a different recovery unit may be used across a getMore,
+// so there is a chance the snapshot ID will be reused.
+AtomicUInt64 nextSnapshotId{1};
+}  // namespace
 
 WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc)
     : _sessionCache(sc),
       _inUnitOfWork(false),
       _active(false),
-      _myTransactionCount(1),
+      _mySnapshotId(nextSnapshotId.fetchAndAdd(1)),
       _everStartedWrite(false) {}
 
 WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
@@ -61,7 +69,7 @@ void WiredTigerRecoveryUnit::reportState(BSONObjBuilder* b) const {
     b->append("wt_inUnitOfWork", _inUnitOfWork);
     b->append("wt_active", _active);
     b->append("wt_everStartedWrite", _everStartedWrite);
-    b->appendNumber("wt_myTransactionCount", static_cast<long long>(_myTransactionCount));
+    b->appendNumber("wt_mySnapshotId", static_cast<long long>(_mySnapshotId));
     if (_active)
         b->append("wt_millisSinceCommit", _timer.millis());
 }
@@ -156,11 +164,6 @@ void WiredTigerRecoveryUnit::registerChange(Change* change) {
     _changes.push_back(change);
 }
 
-WiredTigerRecoveryUnit* WiredTigerRecoveryUnit::get(OperationContext* txn) {
-    invariant(txn);
-    return checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit());
-}
-
 void WiredTigerRecoveryUnit::assertInActiveTxn() const {
     fassert(28575, _active);
 }
@@ -206,12 +209,12 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
         LOG(3) << "WT rollback_transaction";
     }
     _active = false;
-    _myTransactionCount++;
+    _mySnapshotId = nextSnapshotId.fetchAndAdd(1);
 }
 
 SnapshotId WiredTigerRecoveryUnit::getSnapshotId() const {
     // TODO: use actual wiredtiger txn id
-    return SnapshotId(_myTransactionCount);
+    return SnapshotId(_mySnapshotId);
 }
 
 Status WiredTigerRecoveryUnit::setReadFromMajorityCommittedSnapshot() {

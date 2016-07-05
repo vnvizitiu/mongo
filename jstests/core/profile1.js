@@ -2,13 +2,13 @@
     "use strict";
     function profileCursor(query) {
         query = query || {};
-        Object.extend(query, {user:username + "@" + db.getName()});
+        Object.extend(query, {user: username + "@" + db.getName()});
         return db.system.profile.find(query);
     }
 
     function getProfileAString() {
         var s = "\n";
-        profileCursor().forEach(function(z){
+        profileCursor().forEach(function(z) {
             s += tojson(z) + " ,\n";
         });
         return s;
@@ -17,7 +17,7 @@
     function resetProfile(level, slowms) {
         db.setProfilingLevel(0);
         db.system.profile.drop();
-        db.setProfilingLevel(level,slowms);
+        db.setProfilingLevel(level, slowms);
     }
 
     // special db so that it can be run in parallel tests
@@ -29,7 +29,6 @@
     db.dropDatabase();
 
     try {
-
         db.createUser({user: username, pwd: "password", roles: jsTest.basicUserRoles});
         db.auth(username, "password");
 
@@ -63,7 +62,7 @@
         assert.eq(2, profileItems.length, "E2 -- " + msg);
 
         // Make sure we can't drop if profiling is still on
-        assert.throws(function(z){
+        assert.throws(function(z) {
             db.getCollection("system.profile").drop();
         });
 

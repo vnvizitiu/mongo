@@ -21,20 +21,14 @@ var fsm = (function() {
         // See fsm_libs/cluster.js for the format of args.cluster.
         var connCache;
         if (args.passConnectionCache) {
-            connCache = {
-                mongos: [],
-                config: [],
-                shards: {}
-            };
+            connCache = {mongos: [], config: [], shards: {}};
             connCache.mongos = args.cluster.mongos.map(connStr => new Mongo(connStr));
             connCache.config = args.cluster.config.map(connStr => new Mongo(connStr));
 
             var shardNames = Object.keys(args.cluster.shards);
 
-
-            shardNames.forEach(name =>
-                (connCache.shards[name] = args.cluster.shards[name].map(connStr =>
-                    new Mongo(connStr))));
+            shardNames.forEach(name => (connCache.shards[name] = args.cluster.shards[name].map(
+                                            connStr => new Mongo(connStr))));
         }
 
         for (var i = 0; i < args.iterations; ++i) {
@@ -67,7 +61,9 @@ var fsm = (function() {
 
         // weights = [ 0.25, 0.5, 0.25 ]
         // => accumulated = [ 0.25, 0.75, 1 ]
-        var weights = states.map(function(k) { return doc[k]; });
+        var weights = states.map(function(k) {
+            return doc[k];
+        });
 
         var accumulated = [];
         var sum = weights.reduce(function(a, b, i) {
@@ -76,7 +72,7 @@ var fsm = (function() {
         }, 0);
 
         // Scale the random value by the sum of the weights
-        randVal *= sum; // ~ U[0, sum)
+        randVal *= sum;  // ~ U[0, sum)
 
         // Find the state corresponding to randVal
         for (var i = 0; i < accumulated.length; ++i) {
@@ -87,8 +83,5 @@ var fsm = (function() {
         assert(false, 'not reached');
     }
 
-    return {
-        run: runFSM,
-        _getWeightedRandomChoice: getWeightedRandomChoice
-    };
+    return {run: runFSM, _getWeightedRandomChoice: getWeightedRandomChoice};
 })();

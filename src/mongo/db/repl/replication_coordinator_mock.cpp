@@ -32,11 +32,12 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/write_concern_options.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_response.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/storage/snapshot_name.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -48,11 +49,11 @@ ReplicationCoordinatorMock::ReplicationCoordinatorMock(const ReplSettings& setti
     : _settings(settings) {}
 ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-void ReplicationCoordinatorMock::startReplication(OperationContext* txn) {
+void ReplicationCoordinatorMock::startup(OperationContext* txn) {
     // TODO
 }
 
-void ReplicationCoordinatorMock::shutdown() {
+void ReplicationCoordinatorMock::shutdown(OperationContext*) {
     // TODO
 }
 
@@ -217,15 +218,11 @@ Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
 
 void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
 
-bool ReplicationCoordinatorMock::prepareOldReplSetUpdatePositionCommand(
-    BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append("replSetUpdatePosition", 1);
-    return true;
-}
-
-bool ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append("replSetUpdatePosition", 1);
-    return true;
+StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand(
+    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) const {
+    BSONObjBuilder cmdBuilder;
+    cmdBuilder.append("replSetUpdatePosition", 1);
+    return cmdBuilder.obj();
 }
 
 ReplicaSetConfig ReplicationCoordinatorMock::getConfig() const {
@@ -360,9 +357,13 @@ void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* txn
 }
 
 bool ReplicationCoordinatorMock::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                        const OpTime& syncSourceLastOpTime,
-                                                        bool syncSourceHasSyncSource) {
+                                                        const rpc::ReplSetMetadata& metadata) {
     invariant(false);
+}
+
+SyncSourceResolverResponse ReplicationCoordinatorMock::selectSyncSource(
+    OperationContext* txn, const OpTime& lastOpTimeFetched) {
+    return SyncSourceResolverResponse();
 }
 
 OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {
@@ -376,21 +377,15 @@ Status ReplicationCoordinatorMock::processReplSetRequestVotes(
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::processReplSetDeclareElectionWinner(
-    const ReplSetDeclareElectionWinnerArgs& args, long long* responseTerm) {
-    return Status::OK();
-}
-
-void ReplicationCoordinatorMock::prepareReplResponseMetadata(const rpc::RequestInterface& request,
-                                                             const OpTime& lastOpTimeFromClient,
-                                                             BSONObjBuilder* builder) {}
+void ReplicationCoordinatorMock::prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                                     BSONObjBuilder* builder) const {}
 
 Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                                       ReplSetHeartbeatResponse* response) {
     return Status::OK();
 }
 
-bool ReplicationCoordinatorMock::isV1ElectionProtocol() {
+bool ReplicationCoordinatorMock::isV1ElectionProtocol() const {
     return true;
 }
 
@@ -418,7 +413,7 @@ void ReplicationCoordinatorMock::onSnapshotCreate(OpTime timeOfSnapshot, Snapsho
 
 void ReplicationCoordinatorMock::dropAllSnapshots() {}
 
-OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() {
+OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
     return OpTime();
 }
 
@@ -440,6 +435,19 @@ WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptions
     }
     return wc;
 }
+
+bool ReplicationCoordinatorMock::getInitialSyncRequestedFlag() const {
+    return false;
+}
+
+void ReplicationCoordinatorMock::setInitialSyncRequestedFlag(bool value) {}
+
+ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchConfig() const {
+    return ReplSettings::IndexPrefetchConfig();
+}
+
+void ReplicationCoordinatorMock::setIndexPrefetchConfig(
+    const ReplSettings::IndexPrefetchConfig cfg) {}
 
 }  // namespace repl
 }  // namespace mongo

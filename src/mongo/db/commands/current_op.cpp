@@ -53,7 +53,8 @@ class CurrentOpCommand : public Command {
 public:
     CurrentOpCommand() : Command("currentOp") {}
 
-    bool isWriteCommandForConfigServer() const final {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -104,7 +105,8 @@ public:
         // collection, we pass in a fake collection name (and this is okay, because $where parsing
         // only relies on the database part of the namespace).
         const NamespaceString fakeNS(db, "$cmd");
-        const Matcher matcher(filter, ExtensionsCallbackReal(txn, &fakeNS));
+        const CollatorInterface* collator = nullptr;
+        const Matcher matcher(filter, ExtensionsCallbackReal(txn, &fakeNS), collator);
 
         BSONArrayBuilder inprogBuilder(result.subarrayStart("inprog"));
 

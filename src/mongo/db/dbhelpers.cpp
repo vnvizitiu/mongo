@@ -40,7 +40,6 @@
 #include "mongo/db/db.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
@@ -57,16 +56,18 @@
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/data_protector.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -134,7 +135,10 @@ RecordId Helpers::findOne(OperationContext* txn,
 
     const ExtensionsCallbackReal extensionsCallback(txn, &collection->ns());
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(collection->ns(), query, extensionsCallback);
+    auto qr = stdx::make_unique<QueryRequest>(collection->ns());
+    qr->setFilter(query);
+
+    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
     massert(17244, "Could not canonicalize " + query.toString(), statusWithCQ.isOK());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -240,7 +244,6 @@ void Helpers::upsert(OperationContext* txn, const string& ns, const BSONObj& o, 
     verify(e.type());
     BSONObj id = e.wrap();
 
-    OpDebug debug;
     OldClientContext context(txn, ns);
 
     const NamespaceString requestNs(ns);
@@ -250,14 +253,13 @@ void Helpers::upsert(OperationContext* txn, const string& ns, const BSONObj& o, 
     request.setUpdates(o);
     request.setUpsert();
     request.setFromMigration(fromMigrate);
-    UpdateLifecycleImpl updateLifecycle(true, requestNs);
+    UpdateLifecycleImpl updateLifecycle(requestNs);
     request.setLifecycle(&updateLifecycle);
 
-    update(txn, context.db(), request, &debug);
+    update(txn, context.db(), request);
 }
 
 void Helpers::putSingleton(OperationContext* txn, const char* ns, BSONObj obj) {
-    OpDebug debug;
     OldClientContext context(txn, ns);
 
     const NamespaceString requestNs(ns);
@@ -265,10 +267,10 @@ void Helpers::putSingleton(OperationContext* txn, const char* ns, BSONObj obj) {
 
     request.setUpdates(obj);
     request.setUpsert();
-    UpdateLifecycleImpl updateLifecycle(true, requestNs);
+    UpdateLifecycleImpl updateLifecycle(requestNs);
     request.setLifecycle(&updateLifecycle);
 
-    update(txn, context.db(), request, &debug);
+    update(txn, context.db(), request);
 
     CurOp::get(txn)->done();
 }
@@ -373,7 +375,7 @@ long long Helpers::removeRange(OperationContext* txn,
                                            PlanExecutor::YIELD_MANUAL,
                                            InternalPlanner::FORWARD,
                                            InternalPlanner::IXSCAN_FETCH));
-            exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
+            exec->setYieldPolicy(PlanExecutor::YIELD_AUTO, collection);
 
             RecordId rloc;
             BSONObj obj;
@@ -409,8 +411,7 @@ long long Helpers::removeRange(OperationContext* txn,
                 bool docIsOrphan;
 
                 // In write lock, so will be the most up-to-date version
-                std::shared_ptr<CollectionMetadata> metadataNow =
-                    ShardingState::get(txn)->getCollectionMetadata(ns);
+                auto metadataNow = CollectionShardingState::get(txn, ns)->getMetadata();
                 if (metadataNow) {
                     ShardKeyPattern kp(metadataNow->getKeyPattern());
                     BSONObj key = kp.extractShardKeyFromDoc(obj);
@@ -440,7 +441,8 @@ long long Helpers::removeRange(OperationContext* txn,
             if (callback)
                 callback->goingToDelete(obj);
 
-            collection->deleteDocument(txn, rloc, fromMigrate);
+            OpDebug* const nullOpDebug = nullptr;
+            collection->deleteDocument(txn, rloc, nullOpDebug, fromMigrate);
             wuow.commit();
             numDeleted++;
         }
@@ -458,7 +460,7 @@ long long Helpers::removeRange(OperationContext* txn,
                 warning(LogComponent::kSharding) << "replication to secondaries for removeRange at "
                                                     "least 60 seconds behind";
             } else {
-                massertStatusOK(replStatus.status);
+                uassertStatusOK(replStatus.status);
             }
             millisWaitingForReplication += replStatus.duration;
         }

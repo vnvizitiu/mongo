@@ -34,8 +34,8 @@
 #include "mongo/client/constants.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/server_options.h"
+#include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
-#include "mongo/util/net/message_port.h"
 
 namespace mongo {
 
@@ -237,7 +237,7 @@ public:
 
     /* for insert and update msgs */
     bool moreJSObjs() const {
-        return _nextjsobj != 0;
+        return _nextjsobj != 0 && _nextjsobj != _theEnd;
     }
 
     BSONObj nextJsObj();
@@ -313,9 +313,9 @@ public:
  */
 struct DbResponse {
     Message response;
-    MSGID responseTo;
+    int32_t responseToMsgId;
     std::string exhaustNS; /* points to ns if exhaust mode. 0=normal mode*/
-    DbResponse(Message r, MSGID rt) : response(std::move(r)), responseTo(rt) {}
+    DbResponse(Message r, int32_t rtId) : response(std::move(r)), responseToMsgId(rtId) {}
     DbResponse() = default;
 };
 

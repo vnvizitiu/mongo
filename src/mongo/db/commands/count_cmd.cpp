@@ -38,6 +38,7 @@
 #include "mongo/db/exec/count.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
@@ -54,29 +55,41 @@ using std::stringstream;
  */
 class CmdCount : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    CmdCount() : Command("count") {}
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    CmdCount() : Command("count") {}
+
     virtual bool slaveOk() const {
         // ok on --slave setups
         return repl::getGlobalReplicationCoordinator()->getSettings().isSlave();
     }
+
     virtual bool slaveOverrideOk() const {
         return true;
     }
+
     virtual bool maintenanceOk() const {
         return false;
     }
+
     virtual bool adminOnly() const {
         return false;
     }
+
     bool supportsReadConcern() const final {
         return true;
     }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
+    }
+
     virtual void help(stringstream& help) const {
         help << "count objects in collection";
     }
+
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {
@@ -115,7 +128,7 @@ public:
 
         unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
-        Explain::explainStages(exec.get(), verbosity, out);
+        Explain::explainStages(exec.get(), collection, verbosity, out);
         return Status::OK();
     }
 
@@ -149,8 +162,8 @@ public:
         unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
 
         // Store the plan summary string in CurOp.
+        auto curOp = CurOp::get(txn);
         {
-            auto curOp = CurOp::get(txn);
             stdx::lock_guard<Client> lk(*txn->getClient());
             curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
         }
@@ -165,8 +178,13 @@ public:
         if (collection) {
             collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
         }
-        CurOp::get(txn)->debug().fromMultiPlanner = summaryStats.fromMultiPlanner;
-        CurOp::get(txn)->debug().replanned = summaryStats.replanned;
+        curOp->debug().setPlanSummaryMetrics(summaryStats);
+
+        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
+            curOp->debug().execStats = execStatsBob.obj();
+        }
 
         // Plan is done executing. We just need to pull the count out of the root stage.
         invariant(STAGE_COUNT == exec->getRootStage()->stageType());

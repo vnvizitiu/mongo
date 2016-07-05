@@ -30,6 +30,10 @@
 
 #include "mongo/db/query/collation/collator_interface_icu.h"
 
+#include <unicode/coll.h>
+#include <unicode/sortkey.h>
+
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -38,15 +42,59 @@ CollatorInterfaceICU::CollatorInterfaceICU(CollationSpec spec,
                                            std::unique_ptr<icu::Collator> collator)
     : CollatorInterface(std::move(spec)), _collator(std::move(collator)) {}
 
-int CollatorInterfaceICU::compare(StringData left, StringData right) {
-    // TODO: What happens if 'status' is a failure code? In what circumstances could this happen?
-    UErrorCode status = U_ZERO_ERROR;
-    auto compareResult = _collator->compare(icu::UnicodeString(left.rawData(), left.size()),
-                                            icu::UnicodeString(right.rawData(), right.size()),
-                                            status);
-    invariant(U_SUCCESS(status));
+std::unique_ptr<CollatorInterface> CollatorInterfaceICU::clone() const {
+    auto clone = stdx::make_unique<CollatorInterfaceICU>(
+        getSpec(), std::unique_ptr<icu::Collator>(_collator->clone()));
+    return {std::move(clone)};
+}
 
-    return compareResult;
+int CollatorInterfaceICU::compare(StringData left, StringData right) const {
+    UErrorCode status = U_ZERO_ERROR;
+    auto compareResult = _collator->compareUTF8(icu::StringPiece(left.rawData(), left.size()),
+                                                icu::StringPiece(right.rawData(), right.size()),
+                                                status);
+
+    // Any sequence of bytes, even invalid UTF-8, has defined comparison behavior in ICU (invalid
+    // subsequences are weighted as the replacement character, U+FFFD). A non-ok error code is only
+    // expected when a memory allocation fails inside ICU, which we consider fatal to the process.
+    fassert(34438, U_SUCCESS(status));
+
+    switch (compareResult) {
+        case UCOL_EQUAL:
+            return 0;
+        case UCOL_GREATER:
+            return 1;
+        case UCOL_LESS:
+            return -1;
+    }
+
+    MONGO_UNREACHABLE;
+}
+
+CollatorInterface::ComparisonKey CollatorInterfaceICU::getComparisonKey(
+    StringData stringData) const {
+    // A StringPiece is ICU's StringData. They are logically the same abstraction.
+    const icu::StringPiece stringPiece(stringData.rawData(), stringData.size());
+
+    UErrorCode status = U_ZERO_ERROR;
+    icu::CollationKey icuKey;
+    _collator->getCollationKey(icu::UnicodeString::fromUTF8(stringPiece), icuKey, status);
+
+    // Any sequence of bytes, even invalid UTF-8, has defined comparison behavior in ICU (invalid
+    // subsequences are weighted as the replacement character, U+FFFD). A non-ok error code is only
+    // expected when a memory allocation fails inside ICU, which we consider fatal to the process.
+    fassert(34439, U_SUCCESS(status));
+
+    int32_t keyLength;
+    const uint8_t* keyBuffer = icuKey.getByteArray(keyLength);
+    invariant(keyLength > 0);
+    invariant(keyBuffer);
+
+    // The last byte of the sort key should always be null. When we construct the comparison key, we
+    // omit the trailing null byte.
+    invariant(keyBuffer[keyLength - 1u] == '\0');
+    const char* charBuffer = reinterpret_cast<const char*>(keyBuffer);
+    return makeComparisonKey(std::string(charBuffer, keyLength - 1u));
 }
 
 }  // namespace mongo

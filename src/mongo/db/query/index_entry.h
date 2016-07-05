@@ -28,49 +28,44 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-#include <set>
 #include <string>
-#include <vector>
 
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+class CollatorInterface;
 class MatchExpression;
 
 /**
  * This name sucks, but every name involving 'index' is used somewhere.
  */
 struct IndexEntry {
-    // A vector with size equal to the number of elements in the index key pattern. Each element in
-    // the vector is an ordered set of positions (starting at 0) into the corresponding indexed
-    // field that represent what prefixes of the indexed field cause the index to be multikey.
-    //
-    // For example, with the index {'a.b': 1, 'a.c': 1} where the paths "a" and "a.b" cause the
-    // index to be multikey, we'd have a std::vector<std::set<size_t>>{{0U, 1U}, {0U}}.
-    using MultikeyPaths = std::vector<std::set<size_t>>;
-
     /**
      * Use this constructor if you're making an IndexEntry from the catalog.
      */
     IndexEntry(const BSONObj& kp,
                const std::string& accessMethod,
                bool mk,
+               const MultikeyPaths& mkp,
                bool sp,
                bool unq,
                const std::string& n,
                const MatchExpression* fe,
-               const BSONObj& io)
+               const BSONObj& io,
+               const CollatorInterface* ci)
         : keyPattern(kp),
           multikey(mk),
+          multikeyPaths(mkp),
           sparse(sp),
           unique(unq),
           name(n),
           filterExpr(fe),
-          infoObj(io) {
+          infoObj(io),
+          collator(ci) {
         type = IndexNames::nameToType(accessMethod);
     }
 
@@ -108,11 +103,17 @@ struct IndexEntry {
         type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     }
 
+    std::string toString() const;
+
     BSONObj keyPattern;
 
     bool multikey;
 
-    boost::optional<MultikeyPaths> multikeyPaths;
+    // If non-empty, 'multikeyPaths' is a vector with size equal to the number of elements in the
+    // index key pattern. Each element in the vector is an ordered set of positions (starting at 0)
+    // into the corresponding indexed field that represent what prefixes of the indexed field cause
+    // the index to be multikey.
+    MultikeyPaths multikeyPaths;
 
     bool sparse;
 
@@ -129,7 +130,9 @@ struct IndexEntry {
     // by the keyPattern?)
     IndexType type;
 
-    std::string toString() const;
+    // Null if this index orders strings according to the simple binary compare. If non-null,
+    // represents the collator used to generate index keys for indexed strings.
+    const CollatorInterface* collator = nullptr;
 };
 
 }  // namespace mongo

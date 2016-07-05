@@ -8,13 +8,6 @@ flags = {
 ###################################################
 # Internal routine flag declarations
 ###################################################
-    'file_types' : [
-        'FILE_TYPE_CHECKPOINT',
-        'FILE_TYPE_DATA',
-        'FILE_TYPE_DIRECTORY',
-        'FILE_TYPE_LOG',
-        'FILE_TYPE_TURTLE',
-    ],
     'log_scan' : [
         'LOGSCAN_FIRST',
         'LOGSCAN_FROM_CKP',
@@ -57,6 +50,10 @@ flags = {
         'TXN_LOG_CKPT_STOP',
         'TXN_LOG_CKPT_SYNC',
     ],
+    'txn_update_oldest' : [
+        'TXN_OLDEST_STRICT',
+        'TXN_OLDEST_WAIT',
+    ],
     'verbose' : [
         'VERB_API',
         'VERB_BLOCK',
@@ -65,6 +62,7 @@ flags = {
         'VERB_EVICT',
         'VERB_EVICTSERVER',
         'VERB_FILEOPS',
+        'VERB_HANDLEOPS',
         'VERB_LOG',
         'VERB_LSM',
         'VERB_LSM_MANAGER',
@@ -100,6 +98,7 @@ flags = {
         'CONN_LSM_MERGE',
         'CONN_PANIC',
         'CONN_READONLY',
+        'CONN_RECOVERING',
         'CONN_SERVER_ASYNC',
         'CONN_SERVER_CHECKPOINT',
         'CONN_SERVER_LSM',
@@ -110,12 +109,12 @@ flags = {
     ],
     'session' : [
         'SESSION_CAN_WAIT',
-        'SESSION_CLEAR_EVICT_WALK',
         'SESSION_INTERNAL',
         'SESSION_LOCK_NO_WAIT',
         'SESSION_LOCKED_CHECKPOINT',
         'SESSION_LOCKED_HANDLE_LIST',
         'SESSION_LOCKED_METADATA',
+        'SESSION_LOCKED_PASS',
         'SESSION_LOCKED_SCHEMA',
         'SESSION_LOCKED_SLOT',
         'SESSION_LOCKED_TABLE',

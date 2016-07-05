@@ -51,6 +51,12 @@ class StatusWith;
  */
 struct ChunkVersion {
 public:
+    /**
+     * The name for the shard version information field, which shard-aware commands should include
+     * if they want to convey shard version.
+     */
+    static const char kShardVersionField[];
+
     ChunkVersion() : _combined(0), _epoch(OID()) {}
 
     ChunkVersion(int major, int minor, const OID& epoch)
@@ -64,11 +70,33 @@ public:
     static StatusWith<ChunkVersion> parseFromBSONForCommands(const BSONObj& obj);
 
     /**
+     * Parses the BSON formatted by ChunkVersion::appendWithFieldForCommands.
+     *
+     * Interprets the specified BSON content as the format for commands, which is in the form:
+     *  { ..., <field>: [ <combined major/minor>, <OID epoch> ], ... }.
+     */
+    static StatusWith<ChunkVersion> parseFromBSONWithFieldForCommands(const BSONObj& obj,
+                                                                      StringData field);
+
+    /**
+     * Note: if possible, use ChunkVersion::parseFromBSONForCommands or
+     * ChunkVersion::parseFromBSONWithFieldForCommands instead. Phasing out this function.
+     *
      * Interprets the specified BSON content as the format for the setShardVersion command, which
      * is in the form:
      *  { ..., version: [ <combined major/minor> ], versionEpoch: [ <OID epoch> ], ... }
      */
     static StatusWith<ChunkVersion> parseFromBSONForSetShardVersion(const BSONObj& obj);
+
+    /**
+     * Note: if possible, use ChunkVersion::parseFromBSONForCommands or
+     * ChunkVersion::parseFromBSONWithFieldForCommands instead. Phasing out this function.
+     *
+     * Interprets the specified BSON content as the format for chunk persistence, which is in the
+     * form:
+     *  { ..., lastmod: [ <combined major/minor> ], lastmodEpoch: [ <OID epoch> ], ... }
+     */
+    static StatusWith<ChunkVersion> parseFromBSONForChunk(const BSONObj& obj);
 
     /**
      * Indicates a dropped collection. All components are zeroes (OID is zero time, zero
@@ -137,6 +165,10 @@ public:
     // > < operators do not check epoch cases.  Generally if using == we need to handle
     // more complex cases.
     //
+
+    bool operator==(const ChunkVersion& otherVersion) const {
+        return equals(otherVersion);
+    }
 
     bool operator>(const ChunkVersion& otherVersion) const {
         return this->_combined > otherVersion._combined;
@@ -245,12 +277,6 @@ public:
     // { version : <TS>, versionEpoch : <OID> } object format
     //
 
-    static bool canParseBSON(const BSONObj& obj, const std::string& prefix = "") {
-        bool canParse;
-        fromBSON(obj, prefix, &canParse);
-        return canParse;
-    }
-
     static ChunkVersion fromBSON(const BSONObj& obj, const std::string& prefix = "") {
         bool canParse;
         return fromBSON(obj, prefix, &canParse);
@@ -325,6 +351,10 @@ public:
         return b.obj();
     }
 
+    /**
+     * Note: if possible, use ChunkVersion::appendForCommands or
+     * ChunkVersion::appendWithFieldForCommands instead. Phasing out this function.
+     */
     void addToBSON(BSONObjBuilder& b, const std::string& prefix) const {
         b.appendElements(toBSONWithPrefix(prefix));
     }
@@ -336,9 +366,26 @@ public:
     void appendForSetShardVersion(BSONObjBuilder* builder) const;
 
     /**
-     * Appends the contents to the specified builder in the format expected by the write commands.
+     * Appends the contents to the specified builder in the format expected by the sharded commands.
      */
     void appendForCommands(BSONObjBuilder* builder) const;
+
+    /**
+     * Appends the contents as an array to "builder" with the field name "field" in the format
+     * expected by the sharded commands.
+     *
+     * { ..., <field>: [ <combined major/minor>, <OID epoch> ], ... }
+     *
+     * Use ChunkVersion::parseFromBSONWithFieldForCommands to retrieve the ChunkVersion from the
+     * BSON created by this function.
+     */
+    void appendWithFieldForCommands(BSONObjBuilder* builder, StringData field) const;
+
+    /**
+     * Appends the contents to the specified builder in the format expected by the chunk
+     * serialization/deserialization code.
+     */
+    void appendForChunk(BSONObjBuilder* builder) const;
 
     std::string toString() const {
         StringBuilder sb;

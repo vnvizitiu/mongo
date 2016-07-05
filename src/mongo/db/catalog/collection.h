@@ -44,6 +44,7 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
@@ -250,24 +251,28 @@ public:
      * so should be ignored by the user as an internal maintenance operation and not a
      * real delete.
      * 'loc' key to uniquely identify a record in a collection.
+     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
      * 'cappedOK' if true, allows deletes on capped collections (Cloner::copyDB uses this).
      * 'noWarn' if unindexing the record causes an error, if noWarn is true the error
      * will not be logged.
      */
     void deleteDocument(OperationContext* txn,
                         const RecordId& loc,
+                        OpDebug* opDebug,
                         bool fromMigrate = false,
-                        bool cappedOK = false,
                         bool noWarn = false);
 
     /*
      * Inserts all documents inside one WUOW.
      * Caller should ensure vector is appropriately sized for this.
      * If any errors occur (including WCE), caller should retry documents individually.
+     *
+     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
      */
     Status insertDocuments(OperationContext* txn,
                            std::vector<BSONObj>::const_iterator begin,
                            std::vector<BSONObj>::const_iterator end,
+                           OpDebug* opDebug,
                            bool enforceQuota,
                            bool fromMigrate = false);
 
@@ -275,10 +280,12 @@ public:
      * this does NOT modify the doc before inserting
      * i.e. will not add an _id field for documents that are missing it
      *
-     * If enforceQuota is false, quotas will be ignored.
+     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
+     * 'enforceQuota' If false, quotas will be ignored.
      */
     Status insertDocument(OperationContext* txn,
                           const BSONObj& doc,
+                          OpDebug* opDebug,
                           bool enforceQuota,
                           bool fromMigrate = false);
 
@@ -286,11 +293,18 @@ public:
      * Callers must ensure no document validation is performed for this collection when calling
      * this method.
      */
-    Status insertDocument(OperationContext* txn, const DocWriter* doc, bool enforceQuota);
+    Status insertDocumentsForOplog(OperationContext* txn,
+                                   const DocWriter* const* docs,
+                                   size_t nDocs);
 
+    /**
+     * Inserts a document into the record store and adds it to the MultiIndexBlocks passed in.
+     *
+     * NOTE: It is up to caller to commit the indexes.
+     */
     Status insertDocument(OperationContext* txn,
                           const BSONObj& doc,
-                          MultiIndexBlock* indexBlock,
+                          const std::vector<MultiIndexBlock*>& indexBlocks,
                           bool enforceQuota);
 
     /**
@@ -299,6 +313,7 @@ public:
      * If the document fits in the old space, it is put there; if not, it is moved.
      * Sets 'args.updatedDoc' to the updated version of the document with damages applied, on
      * success.
+     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
      * @return the post update location of the doc (may or may not be the same as oldLocation)
      */
     StatusWith<RecordId> updateDocument(OperationContext* txn,
@@ -307,7 +322,7 @@ public:
                                         const BSONObj& newDoc,
                                         bool enforceQuota,
                                         bool indexesAffected,
-                                        OpDebug* debug,
+                                        OpDebug* opDebug,
                                         OplogUpdateEntryArgs* args);
 
     bool updateWithDamagesSupported() const;
@@ -338,15 +353,12 @@ public:
     Status truncate(OperationContext* txn);
 
     /**
-     * @param full - does more checks
-     * @param scanData - scans each document
      * @return OK if the validate run successfully
      *         OK will be returned even if corruption is found
      *         deatils will be in result
      */
     Status validate(OperationContext* txn,
-                    bool full,
-                    bool scanData,
+                    ValidateCmdLevel level,
                     ValidateResults* results,
                     BSONObjBuilder* output);
 
@@ -427,6 +439,12 @@ public:
      */
     void notifyCappedWaitersIfNeeded();
 
+    /**
+     * Get a pointer to the collection's default collator. The pointer must not be used after this
+     * Collection is destroyed.
+     */
+    const CollatorInterface* getDefaultCollator() const;
+
 private:
     /**
      * Returns a non-ok Status if document does not pass this collection's validator.
@@ -437,11 +455,6 @@ private:
      * Returns a non-ok Status if validator is not legal for this collection.
      */
     StatusWithMatchExpression parseValidator(const BSONObj& validator) const;
-
-    Status recordStoreGoingToMove(OperationContext* txn,
-                                  const RecordId& oldLocation,
-                                  const char* oldBuffer,
-                                  size_t oldSize);
 
     Status recordStoreGoingToUpdateInPlace(OperationContext* txn, const RecordId& loc);
 
@@ -457,7 +470,21 @@ private:
     Status _insertDocuments(OperationContext* txn,
                             std::vector<BSONObj>::const_iterator begin,
                             std::vector<BSONObj>::const_iterator end,
-                            bool enforceQuota);
+                            bool enforceQuota,
+                            OpDebug* opDebug);
+
+
+    /**
+     * Perform update when document move will be required.
+     */
+    StatusWith<RecordId> _updateDocumentWithMove(OperationContext* txn,
+                                                 const RecordId& oldLocation,
+                                                 const Snapshotted<BSONObj>& oldDoc,
+                                                 const BSONObj& newDoc,
+                                                 bool enforceQuota,
+                                                 OpDebug* opDebug,
+                                                 OplogUpdateEntryArgs* args,
+                                                 const SnapshotId& sid);
 
     bool _enforceQuota(bool userEnforeQuota) const;
 
@@ -470,6 +497,12 @@ private:
     const bool _needCappedLock;
     CollectionInfoCache _infoCache;
     IndexCatalog _indexCatalog;
+
+    // The default collation which is applied to operations and indices which have no collation of
+    // their own. The collection's validator will respect this collation.
+    //
+    // If null, the default collation is simple binary compare.
+    std::unique_ptr<CollatorInterface> _collator;
 
     // Empty means no filter.
     BSONObj _validatorDoc;

@@ -28,18 +28,45 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+
+#include "mongo/stdx/functional.h"
+
 namespace mongo {
+
+namespace executor {
+class TaskExecutor;
+}  // namespace executor
 
 class ConnectionString;
 class OperationContext;
+class ShardFactory;
 class Status;
+class ShardingCatalogClient;
+class ShardingCatalogManager;
+using ShardingCatalogManagerBuilder = stdx::function<std::unique_ptr<ShardingCatalogManager>(
+    ShardingCatalogClient*, std::unique_ptr<executor::TaskExecutor>)>;
+
+namespace rpc {
+class ShardingEgressMetadataHook;
+using ShardingEgressMetadataHookBuilder =
+    stdx::function<std::unique_ptr<ShardingEgressMetadataHook>()>;
+}  // namespace rpc
 
 /**
  * Takes in the connection string for reaching the config servers and initializes the global
- * CatalogManager, ShardingRegistry, and grid objects.
+ * ShardingCatalogClient, ShardingCatalogManager, ShardRegistry, and Grid objects.
  */
-Status initializeGlobalShardingState(OperationContext* txn,
-                                     const ConnectionString& configCS,
-                                     bool allowNetworking);
+Status initializeGlobalShardingState(const ConnectionString& configCS,
+                                     std::unique_ptr<ShardFactory> shardFactory,
+                                     rpc::ShardingEgressMetadataHookBuilder hookBuilder,
+                                     ShardingCatalogManagerBuilder catalogManagerBuilder);
+
+/**
+ * Tries to contact the config server and reload the shard registry until it succeeds or
+ * is interrupted.
+ */
+Status reloadShardRegistryUntilSuccess(OperationContext* txn);
 
 }  // namespace mongo

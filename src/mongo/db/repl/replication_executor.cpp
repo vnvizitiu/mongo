@@ -34,8 +34,8 @@
 
 #include <limits>
 
+#include "mongo/db/client.h"
 #include "mongo/db/repl/database_task.h"
-#include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -45,26 +45,24 @@ namespace mongo {
 namespace repl {
 
 namespace {
+
+const char kReplicationExecutorThreadName[] = "ReplicationExecutor";
+
 stdx::function<void()> makeNoExcept(const stdx::function<void()>& fn);
+
 }  // namespace
 
 using executor::NetworkInterface;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface,
-                                         StorageInterface* storageInterface,
-                                         int64_t prngSeed)
+ReplicationExecutor::ReplicationExecutor(NetworkInterface* netInterface, int64_t prngSeed)
     : _random(prngSeed),
       _networkInterface(netInterface),
-      _storageInterface(storageInterface),
       _inShutdown(false),
       _dblockWorkers(OldThreadPool::DoNotStartThreadsTag(), 3, "replExecDBWorker-"),
-      _dblockTaskRunner(&_dblockWorkers,
-                        stdx::bind(&StorageInterface::createOperationContext, storageInterface)),
-      _dblockExclusiveLockTaskRunner(
-          &_dblockWorkers,
-          stdx::bind(&StorageInterface::createOperationContext, storageInterface)) {}
+      _dblockTaskRunner(&_dblockWorkers),
+      _dblockExclusiveLockTaskRunner(&_dblockWorkers) {}
 
 ReplicationExecutor::~ReplicationExecutor() {
     // join must have been called
@@ -132,7 +130,8 @@ Date_t ReplicationExecutor::now() {
 }
 
 void ReplicationExecutor::run() {
-    setThreadName("ReplicationExecutor");
+    setThreadName(kReplicationExecutorThreadName);
+    Client::initThread(kReplicationExecutorThreadName);
     _networkInterface->startup();
     _dblockWorkers.startThreads();
     std::pair<WorkItem, CallbackHandle> work;
@@ -274,6 +273,7 @@ StatusWith<ReplicationExecutor::CallbackHandle> ReplicationExecutor::onEvent(
         queue = &event->_waiters;
     } else {
         queue = &_readyQueue;
+        _networkInterface->signalWorkAvailable();
     }
     return enqueueWork_inlock(queue, work);
 }
@@ -316,8 +316,8 @@ void ReplicationExecutor::_finishRemoteCommand(const RemoteCommandRequest& reque
         return;
     }
 
-    LOG(4) << "Received remote response: " << (response.isOK() ? response.getValue().toString()
-                                                               : response.getStatus().toString());
+    LOG(4) << "Received remote response: "
+           << (response.isOK() ? response.getValue().toString() : response.getStatus().toString());
 
     callback->_callbackFn =
         stdx::bind(remoteCommandFinished, stdx::placeholders::_1, cb, request, response);
@@ -382,6 +382,7 @@ StatusWith<ReplicationExecutor::CallbackHandle> ReplicationExecutor::scheduleWor
         ++insertBefore;
     _sleepersQueue.splice(insertBefore, temp, temp.begin());
     ++_counterScheduledWorkAts;
+    _networkInterface->signalWorkAvailable();
     return cbHandle;
 }
 

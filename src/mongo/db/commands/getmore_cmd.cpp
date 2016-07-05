@@ -48,9 +48,10 @@
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/s/operation_shard_version.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/chunk_version.h"
@@ -79,7 +80,8 @@ class GetMoreCmd : public Command {
 public:
     GetMoreCmd() : Command("getMore") {}
 
-    bool isWriteCommandForConfigServer() const override {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -98,6 +100,10 @@ public:
     bool supportsReadConcern() const final {
         // Uses the readConcern setting from whatever created the cursor.
         return false;
+    }
+
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
     }
 
     void help(std::stringstream& help) const override {
@@ -135,8 +141,8 @@ public:
         }
         const GetMoreRequest& request = parseStatus.getValue();
 
-        return AuthorizationSession::get(client)
-            ->checkAuthForGetMore(request.nss, request.cursorid, request.term.is_initialized());
+        return AuthorizationSession::get(client)->checkAuthForGetMore(
+            request.nss, request.cursorid, request.term.is_initialized());
     }
 
     bool run(OperationContext* txn,
@@ -160,10 +166,11 @@ public:
         }
         const GetMoreRequest& request = parseStatus.getValue();
 
-        CurOp::get(txn)->debug().cursorid = request.cursorid;
+        auto curOp = CurOp::get(txn);
+        curOp->debug().cursorid = request.cursorid;
 
         // Disable shard version checking - getmore commands are always unversioned
-        OperationShardVersion::get(txn).setShardVersion(request.nss, ChunkVersion::IGNORED());
+        OperationShardingState::get(txn).setShardVersion(request.nss, ChunkVersion::IGNORED());
 
         // Validate term before acquiring locks, if provided.
         if (request.term) {
@@ -274,7 +281,7 @@ public:
         // Reset timeout timer on the cursor since the cursor is still in use.
         cursor->setIdleTime(0);
 
-        const bool hasOwnMaxTime = CurOp::get(txn)->isMaxTimeSet();
+        const bool hasOwnMaxTime = txn->hasDeadline();
 
         if (!hasOwnMaxTime) {
             // There is no time limit set directly on this getMore command. If the cursor is
@@ -282,10 +289,15 @@ public:
             // any leftover time from the maxTimeMS of the operation that spawned this cursor,
             // applying it to this getMore.
             if (isCursorAwaitData(cursor)) {
-                Seconds awaitDataTimeout(1);
-                CurOp::get(txn)->setMaxTimeMicros(durationCount<Microseconds>(awaitDataTimeout));
-            } else {
-                CurOp::get(txn)->setMaxTimeMicros(cursor->getLeftoverMaxTimeMicros());
+                uassert(40117,
+                        "Illegal attempt to set operation deadline within DBDirectClient",
+                        !txn->getClient()->isInDirectClient());
+                txn->setDeadlineAfterNowBy(Seconds{1});
+            } else if (cursor->getLeftoverMaxTimeMicros() < Microseconds::max()) {
+                uassert(40118,
+                        "Illegal attempt to set operation deadline within DBDirectClient",
+                        !txn->getClient()->isInDirectClient());
+                txn->setDeadlineAfterNowBy(cursor->getLeftoverMaxTimeMicros());
             }
         }
         txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
@@ -298,6 +310,19 @@ public:
         PlanExecutor* exec = cursor->getExecutor();
         exec->reattachToOperationContext(txn);
         exec->restoreState();
+
+        auto planSummary = Explain::getPlanSummary(exec);
+        {
+            stdx::lock_guard<Client>(*txn->getClient());
+            curOp->setPlanSummary_inlock(planSummary);
+
+            // Ensure that the original query or command object is available in the slow query log,
+            // profiler and currentOp.
+            auto originatingCommand = cursor->getQuery();
+            if (!originatingCommand.isEmpty()) {
+                curOp->setOriginatingCommand_inlock(originatingCommand);
+            }
+        }
 
         uint64_t notifierVersion = 0;
         std::shared_ptr<CappedInsertNotifier> notifier;
@@ -319,6 +344,13 @@ public:
         BSONObj obj;
         PlanExecutor::ExecState state;
         long long numResults = 0;
+
+        // We report keysExamined and docsExamined to OpDebug for a given getMore operation. To
+        // obtain these values we need to take a diff of the pre-execution and post-execution
+        // metrics, as they accumulate over the course of a cursor's lifetime.
+        PlanSummaryStats preExecutionStats;
+        Explain::getSummaryStats(*exec, &preExecutionStats);
+
         Status batchStatus = generateBatch(cursor, request, &nextBatch, &state, &numResults);
         if (!batchStatus.isOK()) {
             return appendCommandStatus(result, batchStatus);
@@ -342,14 +374,14 @@ public:
                 ctx.reset();
 
                 // Block waiting for data.
-                Microseconds timeout(CurOp::get(txn)->getRemainingMaxTimeMicros());
+                const auto timeout = txn->getRemainingMaxTimeMicros();
                 notifier->wait(notifierVersion, timeout);
                 notifier.reset();
 
                 // Set expected latency to match wait time. This makes sure the logs aren't spammed
                 // by awaitData queries that exceed slowms due to blocking on the
                 // CappedInsertNotifier.
-                CurOp::get(txn)->setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
+                curOp->setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
 
                 ctx.reset(new AutoGetCollectionForRead(txn, request.nss));
                 exec->restoreState();
@@ -363,6 +395,22 @@ public:
             }
         }
 
+        PlanSummaryStats postExecutionStats;
+        Explain::getSummaryStats(*exec, &postExecutionStats);
+        postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
+        postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
+        curOp->debug().setPlanSummaryMetrics(postExecutionStats);
+
+        // We do not report 'execStats' for aggregation, both in the original request and
+        // subsequent getMore. The reason for this is that aggregation's source PlanExecutor
+        // could be destroyed before we know whether we need execStats and we do not want to
+        // generate for all operations due to cost.
+        if (!cursor->isAggCursor() && curOp->shouldDBProfile(curOp->elapsedMillis())) {
+            BSONObjBuilder execStatsBob;
+            Explain::getWinningPlanStats(exec, &execStatsBob);
+            curOp->debug().execStats = execStatsBob.obj();
+        }
+
         if (shouldSaveCursorGetMore(state, exec, isCursorTailable(cursor))) {
             respondWithId = request.cursorid;
 
@@ -373,19 +421,19 @@ public:
             // from a previous find, then don't roll remaining micros over to the next
             // getMore.
             if (!hasOwnMaxTime) {
-                cursor->setLeftoverMaxTimeMicros(CurOp::get(txn)->getRemainingMaxTimeMicros());
+                cursor->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
             }
 
             cursor->incPos(numResults);
         } else {
-            CurOp::get(txn)->debug().cursorExhausted = true;
+            curOp->debug().cursorExhausted = true;
         }
 
         nextBatch.done(respondWithId, request.nss.ns());
 
         // Ensure log and profiler include the number of results returned in this getMore's response
         // batch.
-        CurOp::get(txn)->debug().nreturned = numResults;
+        curOp->debug().nreturned = numResults;
 
         if (respondWithId) {
             cursorFreer.Dismiss();

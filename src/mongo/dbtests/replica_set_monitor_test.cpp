@@ -26,9 +26,11 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/connpool.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/dbclient_rs.h"
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_internal.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
@@ -98,6 +100,7 @@ TEST_F(ReplicaSetMonitorTest, SeedWithPriOnlySecDown) {
     ReplicaSetMonitorPtr monitor = ReplicaSetMonitor::get(replSet->getSetName());
     // Trigger calls to Node::getConnWithRefresh
     monitor->startOrContinueRefresh().refreshAll();
+    monitor.reset();
 }
 
 namespace {
@@ -178,6 +181,7 @@ TEST(ReplicaSetMonitorTest, PrimaryRemovedFromSetStress) {
         replMonitor->startOrContinueRefresh().refreshAll();
     }
 
+    replMonitor.reset();
     ReplicaSetMonitor::cleanup();
     ConnectionString::setConnectionHook(originalConnHook);
     mongo::ScopedDbConnection::clearPool();
@@ -271,6 +275,7 @@ TEST_F(TwoNodeWithTags, SecDownRetryNoTag) {
 
     ASSERT_FALSE(monitor->isPrimary(node));
     ASSERT_EQUALS(secHost, node.toString());
+    monitor.reset();
 }
 
 // Tests the case where the connection to secondary went bad and the replica set
@@ -299,6 +304,7 @@ TEST_F(TwoNodeWithTags, SecDownRetryWithTag) {
 
     ASSERT_FALSE(monitor->isPrimary(node));
     ASSERT_EQUALS(secHost, node.toString());
+    monitor.reset();
 }
 
 }  // namespace mongo

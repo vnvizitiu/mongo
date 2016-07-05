@@ -38,10 +38,11 @@
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/security_key.h"
+#include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -245,7 +246,7 @@ Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns,
 
 Status AuthorizationSession::checkAuthForInsert(const NamespaceString& ns,
                                                 const BSONObj& document) {
-    if (ns.coll() == StringData("system.indexes", StringData::LiteralTag())) {
+    if (ns.coll() == "system.indexes"_sd) {
         BSONElement nsElement = document["ns"];
         if (nsElement.type() != String) {
             return Status(ErrorCodes::Unauthorized,
@@ -337,7 +338,8 @@ Status AuthorizationSession::checkAuthorizedToGrantPrivilege(const Privilege& pr
                 ActionType::grantRole)) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "Not authorized to grant privileges on the "
-                                        << resource.databaseToMatch() << "database");
+                                        << resource.databaseToMatch()
+                                        << "database");
         }
     } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
                                                  ActionType::grantRole)) {
@@ -357,7 +359,8 @@ Status AuthorizationSession::checkAuthorizedToRevokePrivilege(const Privilege& p
                 ActionType::revokeRole)) {
             return Status(ErrorCodes::Unauthorized,
                           str::stream() << "Not authorized to revoke privileges on the "
-                                        << resource.databaseToMatch() << "database");
+                                        << resource.databaseToMatch()
+                                        << "database");
         }
     } else if (!isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName("admin"),
                                                  ActionType::revokeRole)) {
@@ -366,6 +369,29 @@ Status AuthorizationSession::checkAuthorizedToRevokePrivilege(const Privilege& p
                       " must be authorized to revoke roles from the admin database");
     }
     return Status::OK();
+}
+
+bool AuthorizationSession::isAuthorizedToCreateRole(
+    const struct auth::CreateOrUpdateRoleArgs& args) {
+    // A user is allowed to create a role under either of two conditions.
+
+    // The user may create a role if the authorization system says they are allowed to.
+    if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(args.roleName.getDB()),
+                                         ActionType::createRole)) {
+        return true;
+    }
+
+    // The user may create a role if the localhost exception is enabled, and they already own the
+    // role. This implies they have obtained the role through an external authorization mechanism.
+    if (_externalState->shouldAllowLocalhost()) {
+        for (const User* const user : _authenticatedUsers) {
+            if (user->hasRole(args.roleName)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 bool AuthorizationSession::isAuthorizedToGrantRole(const RoleName& role) {

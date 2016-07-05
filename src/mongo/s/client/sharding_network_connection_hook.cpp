@@ -31,12 +31,13 @@
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/set_shard_version_request.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/hostandport.h"
@@ -58,6 +59,7 @@ Status ShardingNetworkConnectionHook::validateHostImpl(
 
     long long configServerModeNumber;
     auto status = bsonExtractIntegerField(isMasterReply.data, "configsvr", &configServerModeNumber);
+    // TODO SERVER-22320 fix should collapse the switch to only NoSuchKey handling
 
     switch (status.code()) {
         case ErrorCodes::OK: {
@@ -67,12 +69,7 @@ Status ShardingNetworkConnectionHook::validateHostImpl(
                         str::stream() << "Surprised to discover that " << remoteHost.toString()
                                       << " believes it is a config server"};
             }
-            using ConfigServerMode = CatalogManager::ConfigServerMode;
-            const BSONElement setName = isMasterReply.data["setName"];
-            return grid.forwardingCatalogManager()->scheduleReplaceCatalogManagerIfNeeded(
-                (configServerModeNumber == 0 ? ConfigServerMode::SCCC : ConfigServerMode::CSRS),
-                (setName.type() == String ? setName.valueStringData() : StringData()),
-                remoteHost);
+            return Status::OK();
         }
         case ErrorCodes::NoSuchKey: {
             // The ismaster response indicates that remoteHost is not a config server, or that
@@ -123,7 +120,7 @@ ShardingNetworkConnectionHook::makeRequest(const HostAndPort& remoteHost) {
     executor::RemoteCommandRequest request;
     request.dbname = "admin";
     request.target = remoteHost;
-    request.timeout = stdx::chrono::seconds{30};
+    request.timeout = Seconds{30};
     request.cmdObj = ssv.toBSON();
 
     return {request};

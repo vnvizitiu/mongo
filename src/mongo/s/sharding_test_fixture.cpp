@@ -39,25 +39,34 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
+#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
-#include "mongo/s/catalog/replset/catalog_manager_replica_set.h"
+#include "mongo/s/catalog/replset/sharding_catalog_client_impl.h"
+#include "mongo/s/catalog/replset/sharding_catalog_manager_impl.h"
 #include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/shard_remote.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/set_shard_version_request.h"
+#include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
@@ -65,6 +74,7 @@ using executor::NetworkInterfaceMock;
 using executor::NetworkTestEnv;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
+using rpc::ShardingEgressMetadataHookForMongos;
 using unittest::assertGet;
 
 using std::string;
@@ -75,26 +85,27 @@ ShardingTestFixture::ShardingTestFixture() = default;
 
 ShardingTestFixture::~ShardingTestFixture() = default;
 
-const stdx::chrono::seconds ShardingTestFixture::kFutureTimeout{5};
+const Seconds ShardingTestFixture::kFutureTimeout{5};
 
 void ShardingTestFixture::setUp() {
     _service = stdx::make_unique<ServiceContextNoop>();
-    _service->setClockSource(stdx::make_unique<ClockSourceMock>());
+    _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+    _service->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
+    _service->setTickSource(stdx::make_unique<TickSourceMock>());
     _messagePort = stdx::make_unique<MessagingPortMock>();
     _client = _service->makeClient("ShardingTestFixture", _messagePort.get());
     _opCtx = _client->makeOperationContext();
 
-    auto targeterFactory(stdx::make_unique<RemoteCommandTargeterFactoryMock>());
-    _targeterFactory = targeterFactory.get();
-
     // Set up executor pool used for most operations.
     auto fixedNet = stdx::make_unique<executor::NetworkInterfaceMock>();
+    fixedNet->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHookForMongos>());
     _mockNetwork = fixedNet.get();
     auto fixedExec = makeThreadPoolTestExecutor(std::move(fixedNet));
     _networkTestEnv = stdx::make_unique<NetworkTestEnv>(fixedExec.get(), _mockNetwork);
     _executor = fixedExec.get();
 
     auto netForPool = stdx::make_unique<executor::NetworkInterfaceMock>();
+    netForPool->setEgressMetadataHook(stdx::make_unique<ShardingEgressMetadataHookForMongos>());
     auto execForPool = makeThreadPoolTestExecutor(std::move(netForPool));
     std::vector<std::unique_ptr<executor::TaskExecutor>> executorsForPool;
     executorsForPool.emplace_back(std::move(execForPool));
@@ -111,36 +122,66 @@ void ShardingTestFixture::setUp() {
 
     auto uniqueDistLockManager = stdx::make_unique<DistLockManagerMock>();
     _distLockManager = uniqueDistLockManager.get();
-    std::unique_ptr<CatalogManagerReplicaSet> cm(
-        stdx::make_unique<CatalogManagerReplicaSet>(std::move(uniqueDistLockManager)));
-    _catalogManagerRS = cm.get();
+    std::unique_ptr<ShardingCatalogClientImpl> catalogClient(
+        stdx::make_unique<ShardingCatalogClientImpl>(std::move(uniqueDistLockManager)));
+    _catalogClient = catalogClient.get();
+    catalogClient->startup();
+
+    std::unique_ptr<ShardingCatalogManagerImpl> catalogManager(
+        stdx::make_unique<ShardingCatalogManagerImpl>(_catalogClient, std::move(specialExec)));
+    _catalogManager = catalogManager.get();
+    catalogManager->startup();
 
     ConnectionString configCS = ConnectionString::forReplicaSet(
-        "CatalogManagerReplSetTest", {HostAndPort{"TestHost1"}, HostAndPort{"TestHost2"}});
+        "configRS", {HostAndPort{"TestHost1"}, HostAndPort{"TestHost2"}});
+
+    auto targeterFactory(stdx::make_unique<RemoteCommandTargeterFactoryMock>());
+    auto targeterFactoryPtr = targeterFactory.get();
+    _targeterFactory = targeterFactoryPtr;
 
     auto configTargeter(stdx::make_unique<RemoteCommandTargeterMock>());
     _configTargeter = configTargeter.get();
     _targeterFactory->addTargeterToReturn(configCS, std::move(configTargeter));
 
-    auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(targeterFactory),
-                                                        std::move(executorPool),
-                                                        _mockNetwork,
-                                                        std::move(specialExec),
-                                                        configCS));
-    shardRegistry->startup();
+    ShardFactory::BuilderCallable setBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
 
-    // For now initialize the global grid object. All sharding objects will be accessible
-    // from there until we get rid of it.
-    auto shardRegistryPtr = shardRegistry.get();
-    grid.init(stdx::make_unique<ForwardingCatalogManager>(
-                  _service.get(), std::move(cm), shardRegistryPtr, HostAndPort("somehost")),
+    ShardFactory::BuilderCallable masterBuilder =
+        [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+            return stdx::make_unique<ShardRemote>(
+                shardId, connStr, targeterFactoryPtr->create(connStr));
+        };
+
+    ShardFactory::BuildersMap buildersMap{
+        {ConnectionString::SET, std::move(setBuilder)},
+        {ConnectionString::MASTER, std::move(masterBuilder)},
+    };
+
+    auto shardFactory =
+        stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+
+    auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
+    executorPool->startup();
+
+    // For now initialize the global grid object. All sharding objects will be accessible from there
+    // until we get rid of it.
+    grid.init(std::move(catalogClient),
+              std::move(catalogManager),
+              stdx::make_unique<CatalogCache>(),
               std::move(shardRegistry),
-              stdx::make_unique<ClusterCursorManager>(_service->getClockSource()));
+              stdx::make_unique<ClusterCursorManager>(_service->getPreciseClockSource()),
+              stdx::make_unique<BalancerConfiguration>(),
+              std::move(executorPool),
+              _mockNetwork);
 }
 
 void ShardingTestFixture::tearDown() {
-    // This call will shut down the shard registry, which will terminate the underlying executor
-    // and its threads.
+    grid.getExecutorPool()->shutdownAndJoin();
+    grid.catalogManager()->shutDown(_opCtx.get());
+    grid.catalogClient(_opCtx.get())->shutDown(_opCtx.get());
     grid.clearForUnitTests();
 
     _opCtx.reset();
@@ -155,12 +196,16 @@ void ShardingTestFixture::shutdownExecutor() {
     }
 }
 
-CatalogManager* ShardingTestFixture::catalogManager() const {
-    return grid.catalogManager(_opCtx.get());
+ShardingCatalogClient* ShardingTestFixture::catalogClient() const {
+    return grid.catalogClient(_opCtx.get());
 }
 
-CatalogManagerReplicaSet* ShardingTestFixture::getCatalogManagerReplicaSet() const {
-    return _catalogManagerRS;
+ShardingCatalogManager* ShardingTestFixture::catalogManager() const {
+    return grid.catalogManager();
+}
+
+ShardingCatalogClientImpl* ShardingTestFixture::getCatalogClient() const {
+    return _catalogClient;
 }
 
 ShardRegistry* ShardingTestFixture::shardRegistry() const {
@@ -185,6 +230,12 @@ executor::NetworkInterfaceMock* ShardingTestFixture::network() const {
     invariant(_mockNetwork);
 
     return _mockNetwork;
+}
+
+executor::TaskExecutor* ShardingTestFixture::executor() const {
+    invariant(_executor);
+
+    return _executor;
 }
 
 MessagingPortMock* ShardingTestFixture::getMessagingPort() const {
@@ -237,7 +288,7 @@ void ShardingTestFixture::expectGetShards(const std::vector<ShardType>& shards) 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss.toString(), ShardType::ConfigNS);
 
-        auto queryResult = LiteParsedQuery::makeFromFindCommand(nss, request.cmdObj, false);
+        auto queryResult = QueryRequest::makeFromFindCommand(nss, request.cmdObj, false);
         ASSERT_OK(queryResult.getStatus());
 
         const auto& query = queryResult.getValue();
@@ -296,8 +347,14 @@ void ShardingTestFixture::expectConfigCollectionCreate(const HostAndPort& config
         ASSERT_EQUALS(configHost, request.target);
         ASSERT_EQUALS("config", request.dbname);
 
-        BSONObj expectedCreateCmd = BSON("create" << collName << "capped" << true << "size"
-                                                  << cappedSize << "maxTimeMS" << 30000);
+        BSONObj expectedCreateCmd =
+            BSON("create" << collName << "capped" << true << "size" << cappedSize << "writeConcern"
+                          << BSON("w"
+                                  << "majority"
+                                  << "wtimeout"
+                                  << 15000)
+                          << "maxTimeMS"
+                          << 30000);
         ASSERT_EQUALS(expectedCreateCmd, request.cmdObj);
 
         return response;
@@ -343,7 +400,7 @@ void ShardingTestFixture::expectConfigCollectionInsert(const HostAndPort& config
         const std::string timePiece = changeId.substr(firstDash + 1, lastDash - firstDash - 1);
         const std::string oidPiece = changeId.substr(lastDash + 1);
 
-        ASSERT_EQUALS(shardRegistry()->getNetwork()->getHostName(), serverPiece);
+        ASSERT_EQUALS(grid.getNetwork()->getHostName(), serverPiece);
         ASSERT_EQUALS(timestamp.toString(), timePiece);
 
         OID generatedOID;

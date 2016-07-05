@@ -30,8 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional.hpp>
-#include <boost/intrusive_ptr.hpp>
 #include <deque>
 #include <list>
 #include <string>
@@ -46,12 +44,15 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/dependencies.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lookup_set_cache.h"
+#include "mongo/db/pipeline/parsed_aggregation_projection.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/sorter/sorter.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
@@ -73,17 +74,35 @@ class RecordCursor;
  *
  * As an example, if your document source looks like {"$foo": <args>}, with a parsing function
  * 'createFromBson', you would add this line:
- * REGISTER_EXPRESSION(foo, DocumentSourceFoo::createFromBson);
+ * REGISTER_DOCUMENT_SOURCE(foo, DocumentSourceFoo::createFromBson);
  */
-#define REGISTER_DOCUMENT_SOURCE(key, parser)                               \
-    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) { \
-        DocumentSource::registerParser("$" #key, (parser));                 \
-        return Status::OK();                                                \
+#define REGISTER_DOCUMENT_SOURCE(key, parser)                                                      \
+    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                        \
+        auto parserWrapper = [](BSONElement stageSpec,                                             \
+                                const boost::intrusive_ptr<ExpressionContext>& expCtx) {           \
+            return std::vector<boost::intrusive_ptr<DocumentSource>>{(parser)(stageSpec, expCtx)}; \
+        };                                                                                         \
+        DocumentSource::registerParser("$" #key, parserWrapper);                                   \
+        return Status::OK();                                                                       \
+    }
+
+/**
+ * Registers an alias to have the name 'key'. When a stage with name '$key' is found,
+ * 'parser' will be called to construct a vector of DocumentSources.
+ *
+ * As an example, if your document source looks like {"$foo": <args>}, with a parsing function
+ * 'createFromBson', you would add this line:
+ * REGISTER_DOCUMENT_SOURCE_ALIAS(foo, DocumentSourceFoo::createFromBson);
+ */
+#define REGISTER_DOCUMENT_SOURCE_ALIAS(key, parser)                              \
+    MONGO_INITIALIZER(addAliasToDocSourceParserMap_##key)(InitializerContext*) { \
+        DocumentSource::registerParser("$" #key, (parser));                      \
+        return Status::OK();                                                     \
     }
 
 class DocumentSource : public IntrusiveCounterUnsigned {
 public:
-    using Parser = stdx::function<boost::intrusive_ptr<DocumentSource>(
+    using Parser = stdx::function<std::vector<boost::intrusive_ptr<DocumentSource>>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
     virtual ~DocumentSource() {}
@@ -126,6 +145,13 @@ public:
       @param pSource the underlying source to use
      */
     virtual void setSource(DocumentSource* pSource);
+
+    /**
+     * Gets a BSONObjSet representing the sort order(s) of the output of the stage.
+     */
+    virtual BSONObjSet getOutputSorts() {
+        return BSONObjSet();
+    }
 
     /**
      * Returns an optimized DocumentSource that is semantically equivalent to this one, or
@@ -199,10 +225,14 @@ public:
      */
     virtual void addInvolvedCollections(std::vector<NamespaceString>* collections) const {}
 
+    virtual void detachFromOperationContext() {}
+
+    virtual void reattachToOperationContext(OperationContext* opCtx) {}
+
     /**
      * Create a DocumentSource pipeline stage from 'stageObj'.
      */
-    static boost::intrusive_ptr<DocumentSource> parse(
+    static std::vector<boost::intrusive_ptr<DocumentSource>> parse(
         const boost::intrusive_ptr<ExpressionContext> expCtx, BSONObj stageObj);
 
     /**
@@ -213,6 +243,20 @@ public:
      * this file.
      */
     static void registerParser(std::string name, Parser parser);
+
+    /**
+     * Given a BSONObj, construct a BSONObjSet consisting of all prefixes of that object. For
+     * example, given {a: 1, b: 1, c: 1}, this will return a set: {{a: 1}, {a: 1, b: 1}, {a: 1, b:
+     * 1, c: 1}}.
+     */
+    static BSONObjSet allPrefixes(BSONObj obj);
+
+    /**
+     * Given a BSONObjSet, where each BSONObj represents a sort key, return the BSONObjSet that
+     * results from truncating each sort key before the first path that is a member of 'fields', or
+     * is a child of a member of 'fields'.
+     */
+    static BSONObjSet truncateSortSet(const BSONObjSet& sorts, const std::set<std::string>& fields);
 
 protected:
     /**
@@ -268,7 +312,7 @@ protected:
  *  It causes a MongodInterface to be injected when in a mongod and prevents mongos from
  *  merging pipelines containing this stage.
  */
-class DocumentSourceNeedsMongod {
+class DocumentSourceNeedsMongod : public DocumentSource {
 public:
     // Wraps mongod-specific functions to allow linking into mongos.
     class MongodInterface {
@@ -303,17 +347,51 @@ public:
         virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                       const NamespaceString& ns) = 0;
 
+        virtual bool hasUniqueIdIndex(const NamespaceString& ns) const = 0;
+
+        /**
+         * Appends operation latency statistics for collection "nss" to "builder"
+         */
+        virtual void appendLatencyStats(const NamespaceString& nss,
+                                        BSONObjBuilder* builder) const = 0;
+
         // Add new methods as needed.
     };
 
+    DocumentSourceNeedsMongod(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSource(expCtx) {}
+
     void injectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
         _mongod = mongod;
+        doInjectMongodInterface(mongod);
     }
 
-    void setOperationContext(OperationContext* opCtx) {
+    /**
+     * Derived classes may override this method to register custom inject functionality.
+     */
+    virtual void doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) {}
+
+    void detachFromOperationContext() override {
+        invariant(_mongod);
+        _mongod->setOperationContext(nullptr);
+        doDetachFromOperationContext();
+    }
+
+    /**
+     * Derived classes may override this method to register custom detach functionality.
+     */
+    virtual void doDetachFromOperationContext() {}
+
+    void reattachToOperationContext(OperationContext* opCtx) final {
         invariant(_mongod);
         _mongod->setOperationContext(opCtx);
+        doReattachToOperationContext(opCtx);
     }
+
+    /**
+     * Derived classes may override this method to register custom reattach functionality.
+     */
+    virtual void doReattachToOperationContext(OperationContext* opCtx) {}
 
 protected:
     // It is invalid to delete through a DocumentSourceNeedsMongod-typed pointer.
@@ -335,6 +413,9 @@ public:
     ~DocumentSourceCursor() final;
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
+    BSONObjSet getOutputSorts() final {
+        return _outputSorts;
+    }
     /**
      * Attempts to combine with any subsequent $limit stages by setting the internal '_limit' field.
      */
@@ -398,6 +479,18 @@ public:
     /// returns -1 for no limit
     long long getLimit() const;
 
+    /**
+     * If subsequent sources need no information from the cursor, the cursor can simply output empty
+     * documents, avoiding the overhead of converting BSONObjs to Documents.
+     */
+    void shouldProduceEmptyDocs() {
+        _shouldProduceEmptyDocs = true;
+    }
+
+    const std::string& getPlanSummaryStr() const;
+
+    const PlanSummaryStats& getPlanSummaryStats() const;
+
 private:
     DocumentSourceCursor(const std::string& ns,
                          const std::shared_ptr<PlanExecutor>& exec,
@@ -405,90 +498,115 @@ private:
 
     void loadBatch();
 
+    void recordPlanSummaryStr();
+
+    void recordPlanSummaryStats();
+
     std::deque<Document> _currentBatch;
 
     // BSONObj members must outlive _projection and cursor.
     BSONObj _query;
     BSONObj _sort;
     BSONObj _projection;
+    bool _shouldProduceEmptyDocs = false;
     boost::optional<ParsedDeps> _dependencies;
     boost::intrusive_ptr<DocumentSourceLimit> _limit;
     long long _docsAddedToBatches;  // for _limit enforcement
 
     const std::string _ns;
     std::shared_ptr<PlanExecutor> _exec;  // PipelineProxyStage holds a weak_ptr to this.
+    BSONObjSet _outputSorts;
+    std::string _planSummary;
+    PlanSummaryStats _planSummaryStats;
 };
 
 
 class DocumentSourceGroup final : public DocumentSource, public SplittableDocumentSource {
 public:
-    // virtuals from DocumentSource
-    boost::optional<Document> getNext() final;
-    const char* getSourceName() const final;
+    using Accumulators = std::vector<boost::intrusive_ptr<Accumulator>>;
+    using GroupsMap = std::unordered_map<Value, Accumulators, Value::Hash>;
+
+    // Virtuals from DocumentSource.
     boost::intrusive_ptr<DocumentSource> optimize() final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
-    void dispose() final;
     Value serialize(bool explain = false) const final;
+    boost::optional<Document> getNext() final;
+    void dispose() final;
+    const char* getSourceName() const final;
+    BSONObjSet getOutputSorts() final;
 
     static boost::intrusive_ptr<DocumentSourceGroup> create(
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /**
-      Add an accumulator.
+     * This is a convenience method that uses create(), and operates on a BSONElement that has been
+     * determined to be an Object with an element named $group.
+     */
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-      Accumulators become fields in the Documents that result from
-      grouping.  Each unique group document must have it's own
-      accumulator; the accumulator factory is used to create that.
-
-      @param fieldName the name the accumulator result will have in the
-            result documents
-      @param pAccumulatorFactory used to create the accumulator for the
-            group field
+    /**
+     * Add an accumulator.
+     *
+     * Accumulators become fields in the Documents that result from grouping. Each unique group
+     * document must have it's own accumulator; the accumulator factory is used to create that.
+     *
+     * 'fieldName' is the name the accumulator result will have in the result documents and
+     * 'AccumulatorFactory' is used to create the accumulator for the group field.
      */
     void addAccumulator(const std::string& fieldName,
                         Accumulator::Factory accumulatorFactory,
                         const boost::intrusive_ptr<Expression>& pExpression);
 
-    /// Tell this source if it is doing a merge from shards. Defaults to false.
+    /**
+     * Tell this source if it is doing a merge from shards. Defaults to false.
+     */
     void setDoingMerge(bool doingMerge) {
         _doingMerge = doingMerge;
     }
 
-    /**
-      Create a grouping DocumentSource from BSON.
+    bool isStreaming() const {
+        return _streaming;
+    }
 
-      This is a convenience method that uses the above, and operates on
-      a BSONElement that has been deteremined to be an Object with an
-      element named $group.
-
-      @param pBsonElement the BSONELement that defines the group
-      @param pExpCtx the expression context
-      @returns the grouping DocumentSource
-     */
-    static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    // Virtuals for SplittableDocumentSource
+    // Virtuals for SplittableDocumentSource.
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
     boost::intrusive_ptr<DocumentSource> getMergeSource() final;
 
 private:
     explicit DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    /// Spill groups map to disk and returns an iterator to the file.
+    /**
+     * getNext() dispatches to one of these three depending on what type of $group it is. All three
+     * of these methods expect '_currentAccumulators' to have been reset before being called, and
+     * also expect initialize() to have been called already.
+     */
+    boost::optional<Document> getNextStreaming();
+    boost::optional<Document> getNextSpilled();
+    boost::optional<Document> getNextStandard();
+
+    /**
+     * Attempt to identify an input sort order that allows us to turn into a streaming $group. If we
+     * find one, return it. Otherwise, return boost::none.
+     */
+    boost::optional<BSONObj> findRelevantInputSort() const;
+
+    /**
+     * Before returning anything, this source must prepare itself. In a streaming $group,
+     * initialize() requests the first document from the previous source, and uses it to prepare the
+     * accumulators. In an unsorted $group, initialize() exhausts the previous source before
+     * returning. The '_initialized' boolean indicates that initialize() has been called.
+     */
+    void initialize();
+
+    /**
+     * Spill groups map to disk and returns an iterator to the file. Note: Since a sorted $group
+     * does not exhaust the previous stage before returning, and thus does not maintain as large a
+     * store of documents at any one time, only an unsorted group can spill to disk.
+     */
     std::shared_ptr<Sorter<Value, Value>::Iterator> spill();
 
-    // Only used by spill. Would be function-local if that were legal in C++03.
-    class SpillSTLComparator;
-
-    /*
-      Before returning anything, this source must fetch everything from
-      the underlying source and group it.  populate() is used to do that
-      on the first call to any method on this source.  The populated
-      boolean indicates that this has been done.
-     */
-    void populate();
-    bool populated;
+    Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
 
     /**
      * Parses the raw id expression into _idExpressions and possibly _idFieldNames.
@@ -506,53 +624,50 @@ private:
      */
     Value expandId(const Value& val);
 
-
-    typedef std::vector<boost::intrusive_ptr<Accumulator>> Accumulators;
-    typedef std::unordered_map<Value, Accumulators, Value::Hash> GroupsMap;
-    GroupsMap groups;
-
-    /*
-      The field names for the result documents and the accumulator
-      factories for the result documents.  The Expressions are the
-      common expressions used by each instance of each accumulator
-      in order to find the right-hand side of what gets added to the
-      accumulator.  Note that each of those is the same for each group,
-      so we can share them across all groups by adding them to the
-      accumulators after we use the factories to make a new set of
-      accumulators for each new group.
-
-      These three vectors parallel each other.
-    */
+    /**
+     * 'vFieldName' contains the field names for the result documents, 'vpAccumulatorFactory'
+     * contains the accumulator factories for the result documents, and 'vpExpression' contains the
+     * common expressions used by each instance of each accumulator in order to find the right-hand
+     * side of what gets added to the accumulator. These three vectors parallel each other.
+     */
     std::vector<std::string> vFieldName;
     std::vector<Accumulator::Factory> vpAccumulatorFactory;
     std::vector<boost::intrusive_ptr<Expression>> vpExpression;
 
-
-    Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
-
     bool _doingMerge;
-    bool _spilled;
-    const bool _extSortAllowed;
-    const int _maxMemoryUsageBytes;
+    int _maxMemoryUsageBytes;
     std::unique_ptr<Variables> _variables;
     std::vector<std::string> _idFieldNames;  // used when id is a document
     std::vector<boost::intrusive_ptr<Expression>> _idExpressions;
 
-    // only used when !_spilled
-    GroupsMap::iterator groupsIterator;
+    BSONObj _inputSort;
+    bool _streaming;
+    bool _initialized;
 
-    // only used when _spilled
-    std::unique_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
-    std::pair<Value, Value> _firstPartOfNextGroup;
     Value _currentId;
     Accumulators _currentAccumulators;
+
+    GroupsMap groups;
+
+    bool _spilled;
+
+    // Only used when '_spilled' is false.
+    GroupsMap::iterator groupsIterator;
+
+    // Only used when '_spilled' is true.
+    std::unique_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
+    const bool _extSortAllowed;
+
+    std::pair<Value, Value> _firstPartOfNextGroup;
+    // Only used when '_sorted' is true.
+    boost::optional<Document> _firstDocOfNextGroup;
 };
 
 /**
  * Provides a document source interface to retrieve index statistics for a given namespace.
  * Each document returned represents a single index and mongod instance.
  */
-class DocumentSourceIndexStats final : public DocumentSource, public DocumentSourceNeedsMongod {
+class DocumentSourceIndexStats final : public DocumentSourceNeedsMongod {
 public:
     // virtuals from DocumentSource
     boost::optional<Document> getNext() final;
@@ -581,6 +696,9 @@ public:
     const char* getSourceName() const final;
     Value serialize(bool explain = false) const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
+    BSONObjSet getOutputSorts() final {
+        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+    }
     /**
      * Attempts to combine with any subsequent $match stages, joining the query objects with a
      * $and.
@@ -599,6 +717,19 @@ public:
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+    /**
+     * Access the MatchExpression stored inside the DocumentSourceMatch. Does not release ownership.
+     */
+    MatchExpression* getMatchExpression() const {
+        return _expression.get();
+    }
+
+    /**
+     * Combines the filter in this $match with the filter of 'other' using a $and, updating this
+     * match in place.
+     */
+    void joinMatchWith(boost::intrusive_ptr<DocumentSourceMatch> other);
 
     /**
      * Returns the query in MatchExpression syntax.
@@ -622,20 +753,69 @@ public:
         return _isTextQuery;
     }
 
+    /**
+     * Attempt to split this $match into two stages, where the first is not dependent upon any path
+     * from 'fields', and where applying them in sequence is equivalent to applying this stage once.
+     *
+     * Will return two intrusive_ptrs to new $match stages, where the first pointer is independent
+     * of 'fields', and the second is dependent. Either pointer may be null, so be sure to check the
+     * return value.
+     *
+     * For example, {$match: {a: "foo", "b.c": 4}} split by "b" will return pointers to two stages:
+     * {$match: {a: "foo"}}, and {$match: {"b.c": 4}}.
+     */
+    std::pair<boost::intrusive_ptr<DocumentSource>, boost::intrusive_ptr<DocumentSource>>
+    splitSourceBy(const std::set<std::string>& fields);
+
+    /**
+     * Given a document 'input', extract 'fields' and produce a BSONObj with those values.
+     */
+    static BSONObj getObjectForMatch(const Document& input, const std::set<std::string>& fields);
+
+    /**
+     * Should be called _only_ on a MatchExpression  that is a predicate on 'path', or subfields  of
+     * 'path'. It is also invalid to call this method on a $match including a $elemMatch on 'path',
+     * for example: {$match: {'path': {$elemMatch: {'subfield': 3}}}}
+     *
+     * Returns a new DocumentSourceMatch that, if executed on the subdocument at 'path', is
+     * equivalent to 'expression'.
+     *
+     * For example, if the original expression is {$and: [{'a.b': {$gt: 0}}, {'a.d': {$eq: 3}}]},
+     * the new $match will have the expression {$and: [{b: {$gt: 0}}, {d: {$eq: 3}}]} after
+     * descending on the path 'a'.
+     */
+    static boost::intrusive_ptr<DocumentSourceMatch> descendMatchOnPath(
+        MatchExpression* matchExpr,
+        const std::string& path,
+        boost::intrusive_ptr<ExpressionContext> expCtx);
+
 private:
     DocumentSourceMatch(const BSONObj& query,
                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    void addDependencies(MatchExpression* expression, DepsTracker* deps, std::string prefix) const;
+    void addDependencies(DepsTracker* deps) const;
 
     std::unique_ptr<MatchExpression> _expression;
+
+    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
+    DepsTracker _dependencies;
+
     BSONObj _predicate;
     bool _isTextQuery;
 };
 
 class DocumentSourceMergeCursors : public DocumentSource {
 public:
-    typedef std::vector<std::pair<ConnectionString, CursorId>> CursorIds;
+    struct CursorDescriptor {
+        CursorDescriptor(ConnectionString connectionString, std::string ns, CursorId cursorId)
+            : connectionString(std::move(connectionString)),
+              ns(std::move(ns)),
+              cursorId(cursorId) {}
+
+        ConnectionString connectionString;
+        std::string ns;
+        CursorId cursorId;
+    };
 
     // virtuals from DocumentSource
     boost::optional<Document> getNext();
@@ -650,7 +830,8 @@ public:
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     static boost::intrusive_ptr<DocumentSource> create(
-        const CursorIds& cursorIds, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+        std::vector<CursorDescriptor> cursorDescriptors,
+        const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /** Returns non-owning pointers to cursors managed by this stage.
      *  Call this instead of getNext() if you want access to the raw streams.
@@ -666,7 +847,7 @@ public:
 
 private:
     struct CursorAndConnection {
-        CursorAndConnection(ConnectionString host, NamespaceString ns, CursorId id);
+        CursorAndConnection(const CursorDescriptor& cursorDescriptor);
         ScopedDbConnection connection;
         DBClientCursor cursor;
     };
@@ -674,14 +855,14 @@ private:
     // using list to enable removing arbitrary elements
     typedef std::list<std::shared_ptr<CursorAndConnection>> Cursors;
 
-    DocumentSourceMergeCursors(const CursorIds& cursorIds,
+    DocumentSourceMergeCursors(std::vector<CursorDescriptor> cursorDescriptors,
                                const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    // Converts _cursorIds into active _cursors.
+    // Converts _cursorDescriptors into active _cursors.
     void start();
 
     // This is the description of cursors to merge.
-    const CursorIds _cursorIds;
+    const std::vector<CursorDescriptor> _cursorDescriptors;
 
     // These are the actual cursors we are merging. Created lazily.
     Cursors _cursors;
@@ -697,6 +878,8 @@ private:
 class DocumentSourceMock : public DocumentSource {
 public:
     DocumentSourceMock(std::deque<Document> docs);
+    DocumentSourceMock(std::deque<Document> docs,
+                       const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     boost::optional<Document> getNext() override;
     const char* getSourceName() const override;
@@ -704,6 +887,9 @@ public:
     void dispose() override;
     bool isValidInitialSource() const override {
         return true;
+    }
+    BSONObjSet getOutputSorts() override {
+        return sorts;
     }
 
     static boost::intrusive_ptr<DocumentSourceMock> create();
@@ -715,14 +901,29 @@ public:
     static boost::intrusive_ptr<DocumentSourceMock> create(
         const std::initializer_list<const char*>& jsons);
 
+    void reattachToOperationContext(OperationContext* opCtx) {
+        isDetachedFromOpCtx = false;
+    }
+
+    void detachFromOperationContext() {
+        isDetachedFromOpCtx = true;
+    }
+
+    boost::intrusive_ptr<DocumentSource> optimize() override {
+        isOptimized = true;
+        return this;
+    }
+
     // Return documents from front of queue.
     std::deque<Document> queue;
-    bool disposed = false;
+    bool isDisposed = false;
+    bool isDetachedFromOpCtx = false;
+    bool isOptimized = false;
+
+    BSONObjSet sorts;
 };
 
-class DocumentSourceOut final : public DocumentSource,
-                                public SplittableDocumentSource,
-                                public DocumentSourceNeedsMongod {
+class DocumentSourceOut final : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
 public:
     // virtuals from DocumentSource
     ~DocumentSourceOut() final;
@@ -777,46 +978,41 @@ private:
 
 class DocumentSourceProject final : public DocumentSource {
 public:
-    // virtuals from DocumentSource
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
+    Value serialize(bool explain = false) const final;
+    void dispose() final;
+
+    /**
+     * Adds any paths that are included via this projection, or that are referenced by any
+     * expressions.
+     */
+    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+
     /**
      * Attempt to move a subsequent $skip or $limit stage before the $project, thus reducing the
      * number of documents that pass through this stage.
      */
     Pipeline::SourceContainer::iterator optimizeAt(Pipeline::SourceContainer::iterator itr,
                                                    Pipeline::SourceContainer* container) final;
-    boost::intrusive_ptr<DocumentSource> optimize() final;
-    Value serialize(bool explain = false) const final;
-
-    virtual GetDepsReturn getDependencies(DepsTracker* deps) const;
 
     /**
-      Create a new projection DocumentSource from BSON.
+     * Optimize any expressions being used in this stage.
+     */
+    boost::intrusive_ptr<DocumentSource> optimize() final;
 
-      This is a convenience for directly handling BSON, and relies on the
-      above methods.
-
-      @param pBsonElement the BSONElement with an object named $project
-      @param pExpCtx the expression context for the pipeline
-      @returns the created projection
+    /**
+     * Parse the projection from the user-supplied BSON.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    /** projection as specified by the user */
-    BSONObj getRaw() const {
-        return _raw;
-    }
-
 private:
-    DocumentSourceProject(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
-                          const boost::intrusive_ptr<ExpressionObject>& exprObj);
+    DocumentSourceProject(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        std::unique_ptr<parsed_aggregation_projection::ParsedAggregationProjection> parsedProject);
 
-    // configuration state
-    std::unique_ptr<Variables> _variables;
-    boost::intrusive_ptr<ExpressionObject> pEO;
-    BSONObj _raw;
+    std::unique_ptr<parsed_aggregation_projection::ParsedAggregationProjection> _parsedProject;
 };
 
 class DocumentSourceRedact final : public DocumentSource {
@@ -932,6 +1128,9 @@ public:
     // virtuals from DocumentSource
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
+    BSONObjSet getOutputSorts() final {
+        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+    }
     /**
      * Attempts to combine with a subsequent $limit stage, setting 'limit' appropriately.
      */
@@ -995,6 +1194,11 @@ public:
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
     void serializeToArray(std::vector<Value>& array, bool explain = false) const final;
+
+    BSONObjSet getOutputSorts() final {
+        return allPrefixes(_sort);
+    }
+
     /**
      * Attempts to move a subsequent $match stage before the $sort, reducing the number of
      * documents that pass through the stage. Also attempts to absorb a subsequent $limit stage so
@@ -1090,6 +1294,8 @@ private:
     void populate();
     bool populated;
 
+    BSONObj _sort;
+
     SortOptions makeSortOptions() const;
 
     // This is used to merge pre-sorted results from a DocumentSourceMergeCursors.
@@ -1151,6 +1357,9 @@ public:
                                                    Pipeline::SourceContainer* container) final;
     Value serialize(bool explain = false) const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
+    BSONObjSet getOutputSorts() final {
+        return pSource ? pSource->getOutputSorts() : BSONObjSet();
+    }
 
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
         return SEE_NEXT;  // This doesn't affect needed fields
@@ -1209,8 +1418,16 @@ public:
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
     Value serialize(bool explain = false) const final;
+    BSONObjSet getOutputSorts() final;
 
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
+
+    /**
+     * If the next stage is a $match, the part of the match that is not dependent on the unwound
+     * field can be moved into a new, preceding, $match stage.
+     */
+    Pipeline::SourceContainer::iterator optimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                   Pipeline::SourceContainer* container) final;
 
     /**
      * Creates a new $unwind DocumentSource from a BSON specification.
@@ -1225,7 +1442,7 @@ public:
         const boost::optional<std::string>& includeArrayIndex);
 
     std::string getUnwindPath() const {
-        return _unwindPath.getPath(false);
+        return _unwindPath.fullPath();
     }
 
     bool preserveNullAndEmptyArrays() const {
@@ -1256,9 +1473,7 @@ private:
     std::unique_ptr<Unwinder> _unwinder;
 };
 
-class DocumentSourceGeoNear : public DocumentSource,
-                              public SplittableDocumentSource,
-                              public DocumentSourceNeedsMongod {
+class DocumentSourceGeoNear : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
 public:
     static const long long kDefaultLimit;
 
@@ -1275,6 +1490,9 @@ public:
         return true;
     }
     Value serialize(bool explain = false) const final;
+    BSONObjSet getOutputSorts() final {
+        return {BSON(distanceField->fullPath() << -1)};
+    }
 
     // Virtuals for SplittableDocumentSource
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
@@ -1326,9 +1544,8 @@ private:
  * Queries separate collection for equality matches with documents in the pipeline collection.
  * Adds matching documents to a new array field in the input document.
  */
-class DocumentSourceLookUp final : public DocumentSource,
-                                   public SplittableDocumentSource,
-                                   public DocumentSourceNeedsMongod {
+class DocumentSourceLookUp final : public DocumentSourceNeedsMongod,
+                                   public SplittableDocumentSource {
 public:
     boost::optional<Document> getNext() final;
     const char* getSourceName() const final;
@@ -1341,6 +1558,10 @@ public:
                                                    Pipeline::SourceContainer* container) final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
     void dispose() final;
+
+    BSONObjSet getOutputSorts() final {
+        return DocumentSource::truncateSortSet(pSource->getOutputSorts(), {_as.fullPath()});
+    }
 
     bool needsPrimaryShard() const final {
         return true;
@@ -1361,6 +1582,14 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    /**
+     * Build the BSONObj used to query the foreign collection.
+     */
+    static BSONObj queryForInput(const Document& input,
+                                 const FieldPath& localFieldName,
+                                 const std::string& foreignFieldName,
+                                 const BSONObj& additionalFilter);
+
 private:
     DocumentSourceLookUp(NamespaceString fromNs,
                          std::string as,
@@ -1373,18 +1602,198 @@ private:
     }
 
     boost::optional<Document> unwindResult();
-    BSONObj queryForInput(const Document& input) const;
 
     NamespaceString _fromNs;
     FieldPath _as;
     FieldPath _localField;
     FieldPath _foreignField;
     std::string _foreignFieldFieldName;
+    boost::optional<BSONObj> _additionalFilter;
 
+    boost::intrusive_ptr<DocumentSourceMatch> _matchSrc;
     boost::intrusive_ptr<DocumentSourceUnwind> _unwindSrc;
+
     bool _handlingUnwind = false;
+    bool _handlingMatch = false;
     std::unique_ptr<DBClientCursor> _cursor;
     long long _cursorIndex = 0;
     boost::optional<Document> _input;
 };
-}
+
+class DocumentSourceGraphLookUp final : public DocumentSourceNeedsMongod {
+public:
+    boost::optional<Document> getNext() final;
+    const char* getSourceName() const final;
+    void dispose() final;
+    BSONObjSet getOutputSorts() final;
+    void serializeToArray(std::vector<Value>& array, bool explain = false) const final;
+
+    /**
+     * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwind' field.
+     */
+    Pipeline::SourceContainer::iterator optimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                   Pipeline::SourceContainer* container) final;
+
+    GetDepsReturn getDependencies(DepsTracker* deps) const final {
+        _startWith->addDependencies(deps);
+        return SEE_NEXT;
+    };
+
+    bool needsPrimaryShard() const final {
+        return true;
+    }
+
+    void addInvolvedCollections(std::vector<NamespaceString>* collections) const final {
+        collections->push_back(_from);
+    }
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    DocumentSourceGraphLookUp(NamespaceString from,
+                              std::string as,
+                              std::string connectFromField,
+                              std::string connectToField,
+                              boost::intrusive_ptr<Expression> startWith,
+                              boost::optional<FieldPath> depthField,
+                              boost::optional<long long> maxDepth,
+                              const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    Value serialize(bool explain = false) const final {
+        // Should not be called; use serializeToArray instead.
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Prepare the query to execute on the 'from' collection, using the contents of '_frontier'.
+     *
+     * Fills 'cached' with any values that were retrieved from the cache.
+     *
+     * Returns boost::none if no query is necessary, i.e., all values were retrieved from the cache.
+     * Otherwise, returns a query object.
+     */
+    boost::optional<BSONObj> constructQuery(BSONObjSet* cached);
+
+    /**
+     * If we have internalized a $unwind, getNext() dispatches to this function.
+     */
+    boost::optional<Document> getNextUnwound();
+
+    /**
+     * Perform a breadth-first search of the 'from' collection. '_frontier' should already be
+     * populated with the values for the initial query. Populates '_discovered' with the result(s)
+     * of the query.
+     */
+    void doBreadthFirstSearch();
+
+    /**
+     * Populates '_frontier' with the '_startWith' value(s) from '_input' and then performs a
+     * breadth-first search. Caller should check that _input is not boost::none.
+     */
+    void performSearch();
+
+    /**
+     * Updates '_cache' with 'result' appropriately, given that 'result' was retrieved when querying
+     * for 'queried'.
+     */
+    void addToCache(const BSONObj& result, const unordered_set<Value, Value::Hash>& queried);
+
+    /**
+     * Assert that '_visited' and '_frontier' have not exceeded the maximum meory usage, and then
+     * evict from '_cache' until this source is using less than '_maxMemoryUsageBytes'.
+     */
+    void checkMemoryUsage();
+
+    /**
+     * Process 'result', adding it to '_visited' with the given 'depth', and updating '_frontier'
+     * with the object's 'connectTo' values.
+     *
+     * Returns whether '_visited' was updated, and thus, whether the search should recurse.
+     */
+    bool addToVisitedAndFrontier(BSONObj result, long long depth);
+
+    // $graphLookup options.
+    NamespaceString _from;
+    FieldPath _as;
+    FieldPath _connectFromField;
+    FieldPath _connectToField;
+    boost::intrusive_ptr<Expression> _startWith;
+    boost::optional<FieldPath> _depthField;
+    boost::optional<long long> _maxDepth;
+
+    size_t _maxMemoryUsageBytes = 100 * 1024 * 1024;
+
+    // Track memory usage to ensure we don't exceed '_maxMemoryUsageBytes'.
+    size_t _visitedUsageBytes = 0;
+    size_t _frontierUsageBytes = 0;
+
+    // Only used during the breadth-first search, tracks the set of values on the current frontier.
+    std::unordered_set<Value, Value::Hash> _frontier;
+
+    // Tracks nodes that have been discovered for a given input. Keys are the '_id' value of the
+    // document from the foreign collection, value is the document itself.
+    std::unordered_map<Value, BSONObj, Value::Hash> _visited;
+
+    // Caches query results to avoid repeating any work. This structure is maintained across calls
+    // to getNext().
+    LookupSetCache _cache;
+
+    // When we have internalized a $unwind, we must keep track of the input document, since we will
+    // need it for multiple "getNext()" calls.
+    boost::optional<Document> _input;
+
+    // The variables that are in scope to be used by the '_startWith' expression.
+    std::unique_ptr<Variables> _variables;
+
+    // Keep track of a $unwind that was absorbed into this stage.
+    boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> _unwind;
+
+    // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
+    // field, tracking how many results we've returned so far for the current input document.
+    long long _outputIndex;
+};
+
+class DocumentSourceSortByCount final {
+public:
+    static std::vector<boost::intrusive_ptr<DocumentSource>> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    DocumentSourceSortByCount() = default;
+};
+
+class DocumentSourceCount final {
+public:
+    static std::vector<boost::intrusive_ptr<DocumentSource>> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    DocumentSourceCount() = default;
+};
+
+/**
+ * Provides a document source interface to retrieve collection-level statistics for a given
+ * collection.
+ */
+class DocumentSourceCollStats : public DocumentSourceNeedsMongod {
+public:
+    DocumentSourceCollStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
+        : DocumentSourceNeedsMongod(pExpCtx) {}
+
+    boost::optional<Document> getNext() final;
+
+    const char* getSourceName() const final;
+
+    bool isValidInitialSource() const final;
+
+    Value serialize(bool explain = false) const;
+
+    static boost::intrusive_ptr<DocumentSource> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+private:
+    bool _latencySpecified = false;
+    bool _finished = false;
+};
+}  // namespace mongo

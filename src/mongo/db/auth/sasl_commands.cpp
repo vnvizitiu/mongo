@@ -81,7 +81,7 @@ public:
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -109,7 +109,7 @@ public:
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {

@@ -36,9 +36,9 @@
 #include <string>
 
 #include "mongo/stdx/functional.h"
-#include "mongo/util/assert_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 namespace stdx = mongo::stdx;
@@ -71,6 +71,9 @@ TEST(UnitTestSelfTest, TestAssertThrowsSuccess) {
 
 class MyException {
 public:
+    std::string toString() const {
+        return what();
+    }
     std::string what() const {
         return "whatever";
     }

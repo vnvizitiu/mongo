@@ -4,7 +4,29 @@
  */
 (function() {
     "use strict";
-    var defaultWriteConcern = {w: "majority", wtimeout: 60000};
+    var defaultWriteConcern = {
+        w: "majority",
+        // Use a "signature" value that won't typically match a value assigned in normal use.
+        wtimeout: 60321
+    };
+    var defaultReadConcern = {level: "majority"};
+
+    var originalDBQuery = DBQuery;
+
+    DBQuery = function(mongo, db, collection, ns, query, fields, limit, skip, batchSize, options) {
+        if (ns.endsWith("$cmd")) {
+            if (query.hasOwnProperty("writeConcern") &&
+                bsonWoCompare(query.writeConcern, defaultWriteConcern) !== 0) {
+                jsTestLog("Warning: DBQuery overriding existing writeConcern of: " +
+                          tojson(query.writeConcern));
+                query.writeConcern = defaultWriteConcern;
+            }
+        }
+
+        return originalDBQuery.apply(this, arguments);
+    };
+
+    DBQuery.Option = originalDBQuery.Option;
 
     var originalStartParallelShell = startParallelShell;
     startParallelShell = function(jsCode, port, noConnect) {
@@ -13,13 +35,9 @@
 
         if (typeof(jsCode) === "function") {
             // Load the override file and immediately invoke the supplied function.
-            // clang-format off
             newCode = `load("${overridesFile}"); (${jsCode})();`;
-            // clang-format on
         } else {
-            // clang-format off
             newCode = `load("${overridesFile}"); ${jsCode};`;
-            // clang-format on
         }
 
         return originalStartParallelShell(newCode, port, noConnect);
@@ -80,9 +98,7 @@
             // Aggregate can be either a read or a write depending on whether it has a $out stage.
             // $out is required to be the last stage of the pipeline.
             var stages = obj.pipeline;
-            var hasOut = stages &&
-                         (stages.length !== 0) &&
-                         ('$out' in stages[stages.length - 1]);
+            var hasOut = stages && (stages.length !== 0) && ('$out' in stages[stages.length - 1]);
             if (hasOut) {
                 emulateWriteConcern = true;
             } else {
@@ -92,17 +108,25 @@
 
         if (forceWriteConcern) {
             if (obj.hasOwnProperty("writeConcern")) {
-                jsTestLog("Warning: overriding existing writeConcern of: " +
-                           tojson(obj.writeConcern));
+                if (bsonWoCompare(obj.writeConcern, defaultWriteConcern) !== 0) {
+                    jsTestLog("Warning: _runCommandImpl overriding existing writeConcern of: " +
+                              tojson(obj.writeConcern));
+                    obj.writeConcern = defaultWriteConcern;
+                }
+            } else {
+                obj.writeConcern = defaultWriteConcern;
             }
-            obj.writeConcern = defaultWriteConcern;
 
         } else if (forceReadConcern) {
             if (obj.hasOwnProperty("readConcern")) {
-                jsTestLog("Warning: overriding existing readConcern of: " +
-                           tojson(obj.readConcern));
+                if (bsonWoCompare(obj.readConcern, defaultReadConcern) !== 0) {
+                    jsTestLog("Warning: _runCommandImpl overriding existing readConcern of: " +
+                              tojson(obj.readConcern));
+                    obj.readConcern = defaultReadConcern;
+                }
+            } else {
+                obj.readConcern = defaultReadConcern;
             }
-            obj.readConcern = {level: "majority"};
         }
 
         var res = this.getMongo().runCommand(dbName, obj, options);
@@ -123,4 +147,3 @@
     };
 
 })();
-

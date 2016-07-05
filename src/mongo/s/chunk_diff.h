@@ -75,8 +75,8 @@ public:
     typedef typename std::map<BSONObj, ValType, BSONObjCmp> RangeMap;
 
     // Pair of iterators defining a subset of ranges
-    typedef
-        typename std::pair<typename RangeMap::iterator, typename RangeMap::iterator> RangeOverlap;
+    typedef typename std::pair<typename RangeMap::iterator, typename RangeMap::iterator>
+        RangeOverlap;
 
     // Map of shard identifiers to the maximum chunk version on that shard
     typedef typename std::map<ShardId, ChunkVersion> MaxChunkVersionMap;
@@ -128,7 +128,7 @@ protected:
     virtual std::pair<BSONObj, ValType> rangeFor(OperationContext* txn,
                                                  const ChunkType& chunk) const = 0;
 
-    virtual ShardId shardFor(OperationContext* txn, const std::string& name) const = 0;
+    virtual ShardId shardFor(OperationContext* txn, const ShardId& name) const = 0;
 
 private:
     void _assertAttached() const;

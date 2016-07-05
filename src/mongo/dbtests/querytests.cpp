@@ -34,18 +34,17 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/global_timestamp.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/find.h"
-#include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_d.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/timer.h"
 
@@ -99,21 +98,23 @@ protected:
 
     void insert(const BSONObj& o) {
         WriteUnitOfWork wunit(&_txn);
+        OpDebug* const nullOpDebug = nullptr;
         if (o["_id"].eoo()) {
             BSONObjBuilder b;
             OID oid;
             oid.init();
             b.appendOID("_id", &oid);
             b.appendElements(o);
-            _collection->insertDocument(&_txn, b.obj(), false);
+            _collection->insertDocument(&_txn, b.obj(), nullOpDebug, false);
         } else {
-            _collection->insertDocument(&_txn, o, false);
+            _collection->insertDocument(&_txn, o, nullOpDebug, false);
         }
         wunit.commit();
     }
 
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     ScopedTransaction _scopedXact;
     Lock::GlobalWrite _lk;
     OldClientContext _context;
@@ -197,7 +198,8 @@ public:
         bool ok = cl.runCommand("unittests",
                                 BSON("godinsert"
                                      << "querytests"
-                                     << "obj" << BSONObj()),
+                                     << "obj"
+                                     << BSONObj()),
                                 info);
         ASSERT(ok);
 
@@ -232,7 +234,8 @@ protected:
         return !_client.getPrevError().getField("err").isNull();
     }
 
-    OperationContextImpl _txn;
+    const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
+    OperationContext& _txn = *_txnPtr;
     DBDirectClient _client;
 };
 
@@ -587,7 +590,12 @@ public:
         _client.runCommand("unittests",
                            BSON("create"
                                 << "querytests.TailableQueryOnId"
-                                << "capped" << true << "size" << 8192 << "autoIndexId" << true),
+                                << "capped"
+                                << true
+                                << "size"
+                                << 8192
+                                << "autoIndexId"
+                                << true),
                            info);
         insertA(ns, 0);
         insertA(ns, 1);
@@ -673,7 +681,10 @@ public:
         _client.runCommand("unittests",
                            BSON("create"
                                 << "querytests.OplogReplaySlaveReadTill"
-                                << "capped" << true << "size" << 8192),
+                                << "capped"
+                                << true
+                                << "size"
+                                << 8192),
                            info);
 
         Date_t one = Date_t::fromMillisSinceEpoch(getNextGlobalTimestamp().asLL());
@@ -1282,14 +1293,18 @@ public:
             ASSERT_EQUALS(17, _client.findOne(ns(), b.obj())["z"].number());
         }
         ASSERT_EQUALS(17,
-                      _client.findOne(ns(),
-                                      BSON("x"
-                                           << "eliot"))["z"].number());
+                      _client
+                          .findOne(ns(),
+                                   BSON("x"
+                                        << "eliot"))["z"]
+                          .number());
         ASSERT_OK(dbtests::createIndex(&_txn, ns(), BSON("x" << 1)));
         ASSERT_EQUALS(17,
-                      _client.findOne(ns(),
-                                      BSON("x"
-                                           << "eliot"))["z"].number());
+                      _client
+                          .findOne(ns(),
+                                   BSON("x"
+                                        << "eliot"))["z"]
+                          .number());
     }
 };
 
@@ -1311,7 +1326,8 @@ public:
                                 ctx.db(),
                                 ns(),
                                 fromjson("{ capped : true, size : 2000, max: 10000 }"),
-                                false).isOK());
+                                false)
+                       .isOK());
             wunit.commit();
         }
 
@@ -1449,7 +1465,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1496,7 +1516,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1544,7 +1568,11 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.findingstart"
-                                       << "capped" << true << "$nExtents" << 5 << "autoIndexId"
+                                       << "capped"
+                                       << true
+                                       << "$nExtents"
+                                       << 5
+                                       << "autoIndexId"
                                        << false),
                                   info));
 
@@ -1597,7 +1625,10 @@ public:
         ASSERT(_client.runCommand("unittests",
                                   BSON("create"
                                        << "querytests.exhaust"
-                                       << "capped" << true << "size" << 8192),
+                                       << "capped"
+                                       << true
+                                       << "size"
+                                       << 8192),
                                   info));
         _client.insert(ns(), BSON("ts" << 0));
         Message message;

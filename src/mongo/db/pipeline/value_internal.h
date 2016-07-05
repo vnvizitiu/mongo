@@ -32,13 +32,13 @@
 #include <boost/config.hpp>
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/intrusive_counter.h"
-#include "mongo/bson/timestamp.h"
 
 
 namespace mongo {
@@ -197,11 +197,6 @@ public:
     }
 
     ValueStorage& operator=(ValueStorage&& rhs) BOOST_NOEXCEPT {
-#if defined(_MSC_VER) && _MSC_VER < 1900  // MSVC 2013 STL can emit self-move-assign.
-        if (&rhs == this)
-            return *this;
-#endif
-
         DEV verifyRefCountingIfShould();
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);

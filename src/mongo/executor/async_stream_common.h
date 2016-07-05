@@ -42,9 +42,15 @@ void destroyStream(ASIOStream* stream, bool connected) {
     if (!connected) {
         return;
     }
+
     std::error_code ec;
+
     stream->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-    stream->close();
+    if (ec) {
+        logCloseFailed(ec);
+    }
+
+    stream->close(ec);
     if (ec) {
         logCloseFailed(ec);
     }
@@ -76,7 +82,6 @@ void readStream(ASIOStream* stream,
 
 template <typename ASIOStream>
 void cancelStream(ASIOStream* stream, bool connected) {
-    invariant(connected);
     stream->cancel();
 }
 

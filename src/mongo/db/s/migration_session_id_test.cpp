@@ -34,7 +34,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -72,8 +71,9 @@ TEST(MigrationSessionId, Comparison) {
 }
 
 TEST(MigrationSessionId, ErrorWhenTypeIsNotString) {
-    ASSERT_NOT_OK(MigrationSessionId::extractFromBSON(
-                      BSON("SomeField" << 1 << "sessionId" << Date_t::now())).getStatus());
+    ASSERT_NOT_OK(
+        MigrationSessionId::extractFromBSON(BSON("SomeField" << 1 << "sessionId" << Date_t::now()))
+            .getStatus());
     ASSERT_NOT_OK(MigrationSessionId::extractFromBSON(BSON("SomeField" << 1 << "sessionId" << 2))
                       .getStatus());
 }

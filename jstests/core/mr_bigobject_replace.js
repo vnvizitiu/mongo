@@ -42,13 +42,20 @@
             mapReduce: "input",
             map: mapper,
             out: {replace: "mr_bigobject_replace"},
-        }, testOptions));
+        },
+                                              testOptions));
 
         assert.commandFailed(res, "creating a document larger than 16MB didn't fail");
-        assert.lte(0, res.errmsg.indexOf("object to insert too large"),
+        assert.lte(0,
+                   res.errmsg.indexOf("object to insert too large"),
                    "map-reduce command failed for a reason other than inserting a large document");
     }
 
     runTest({reduce: createBigDocument});
-    runTest({reduce: function() { return 1; }, finalize: createBigDocument});
+    runTest({
+        reduce: function() {
+            return 1;
+        },
+        finalize: createBigDocument
+    });
 })();

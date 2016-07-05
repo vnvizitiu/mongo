@@ -26,7 +26,11 @@ function getPlanStages(root, stage) {
 
     if ("shards" in root) {
         for (var i = 0; i < root.shards.length; i++) {
-            results = results.concat(getPlanStages(root.shards[i].winningPlan, stage));
+            if ("winningPlan" in root.shards[i]) {
+                results = results.concat(getPlanStages(root.shards[i].winningPlan, stage));
+            } else {
+                results = results.concat(getPlanStages(root.shards[i].executionStages, stage));
+            }
         }
     }
 
@@ -43,11 +47,10 @@ function getPlanStage(root, stage) {
 
     if (planStageList.length === 0) {
         return null;
-    }
-    else {
+    } else {
         assert(planStageList.length === 1,
-               "getPlanStage expects to find 0 or 1 matching stages. planStageList: "
-               + tojson(planStageList));
+               "getPlanStage expects to find 0 or 1 matching stages. planStageList: " +
+                   tojson(planStageList));
         return planStageList[0];
     }
 }
@@ -100,11 +103,9 @@ function isCollscan(root) {
 function getChunkSkips(root) {
     if (root.stage === "SHARDING_FILTER") {
         return root.chunkSkips;
-    }
-    else if ("inputStage" in root) {
+    } else if ("inputStage" in root) {
         return getChunkSkips(root.inputStage);
-    }
-    else if ("inputStages" in root) {
+    } else if ("inputStages" in root) {
         var skips = 0;
         for (var i = 0; i < root.inputStages.length; i++) {
             skips += getChunkSkips(root.inputStages[0]);

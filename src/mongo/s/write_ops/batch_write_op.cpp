@@ -572,7 +572,7 @@ void BatchWriteOp::noteBatchResponse(const TargetedWriteBatch& targetedBatch,
     vector<WriteErrorDetail*>::iterator itemErrorIt = itemErrors.begin();
     int index = 0;
     WriteErrorDetail* lastError = NULL;
-    for (vector<TargetedWrite*>::const_iterator it = targetedBatch.getWrites().begin();
+    for (vector<TargetedWrite *>::const_iterator it = targetedBatch.getWrites().begin();
          it != targetedBatch.getWrites().end();
          ++it, ++index) {
         const TargetedWrite* write = *it;
@@ -745,7 +745,7 @@ void BatchWriteOp::buildClientResponse(BatchedCommandResponse* batchResp) {
     bool reportWCError = errOps.empty() ||
         (!_clientRequest->getOrdered() && errOps.size() < _clientRequest->sizeWriteOps());
     if (!_wcErrors.empty() && reportWCError) {
-        WCErrorDetail* error = new WCErrorDetail;
+        WriteConcernErrorDetail* error = new WriteConcernErrorDetail;
 
         // Generate the multi-error message below
         stringstream msg;

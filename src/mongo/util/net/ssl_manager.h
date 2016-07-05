@@ -38,6 +38,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
 
@@ -70,25 +71,23 @@ public:
 };
 
 struct SSLConfiguration {
-    SSLConfiguration() : serverSubjectName(""), clientSubjectName(""), hasCA(false) {}
+    SSLConfiguration() : serverSubjectName(""), clientSubjectName("") {}
     SSLConfiguration(const std::string& serverSubjectName,
                      const std::string& clientSubjectName,
-                     const Date_t& serverCertificateExpirationDate,
-                     bool hasCA)
+                     const Date_t& serverCertificateExpirationDate)
         : serverSubjectName(serverSubjectName),
           clientSubjectName(clientSubjectName),
-          serverCertificateExpirationDate(serverCertificateExpirationDate),
-          hasCA(hasCA) {}
+          serverCertificateExpirationDate(serverCertificateExpirationDate) {}
 
     bool isClusterMember(StringData subjectName) const;
     BSONObj getServerStatusBSON() const;
     std::string serverSubjectName;
     std::string clientSubjectName;
     Date_t serverCertificateExpirationDate;
-    bool hasCA;
+    bool hasCA = false;
 };
 
-class SSLManagerInterface {
+class SSLManagerInterface : public Decorable<SSLManagerInterface> {
 public:
     static std::unique_ptr<SSLManagerInterface> create(const SSLParams& params, bool isServer);
 
@@ -119,12 +118,6 @@ public:
      */
     virtual std::string parseAndValidatePeerCertificateDeprecated(
         const SSLConnection* conn, const std::string& remoteHost) = 0;
-
-    /**
-     * Cleans up SSL thread local memory; use at thread exit
-     * to avoid memory leaks
-     */
-    virtual void cleanupThreadLocals() = 0;
 
     /**
      * Gets the SSLConfiguration containing all information about the current SSL setup

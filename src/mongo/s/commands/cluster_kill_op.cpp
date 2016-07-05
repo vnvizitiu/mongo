@@ -55,7 +55,8 @@ class ClusterKillOpCommand : public Command {
 public:
     ClusterKillOpCommand() : Command("killOp") {}
 
-    bool isWriteCommandForConfigServer() const final {
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -90,7 +91,9 @@ public:
 
         uassert(28625,
                 str::stream() << "The op argument to killOp must be of the format shardid:opid"
-                              << " but found \"" << opToKill << '"',
+                              << " but found \""
+                              << opToKill
+                              << '"',
                 (opToKill.size() >= 3) &&                  // must have at least N:N
                     (opSepPos != std::string::npos) &&     // must have ':' as separator
                     (opSepPos != 0) &&                     // can't be :NN

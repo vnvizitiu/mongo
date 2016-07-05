@@ -29,6 +29,7 @@
 
 #include "mongo/db/hasher.h"
 #include "mongo/db/json.h"
+#include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -53,12 +54,15 @@ TEST(ShardKeyPattern, ValidShardKeyPatternSingle) {
     ASSERT(!ShardKeyPattern(BSON("a" << -1)).isValid());
     ASSERT(!ShardKeyPattern(BSON("a" << -1.0)).isValid());
     ASSERT(!ShardKeyPattern(BSON("a"
-                                 << "1")).isValid());
+                                 << "1"))
+                .isValid());
 
     ASSERT(ShardKeyPattern(BSON("a"
-                                << "hashed")).isValid());
+                                << "hashed"))
+               .isValid());
     ASSERT(!ShardKeyPattern(BSON("a"
-                                 << "hash")).isValid());
+                                 << "hash"))
+                .isValid());
     ASSERT(!ShardKeyPattern(BSON("" << 1)).isValid());
     ASSERT(!ShardKeyPattern(BSON("." << 1)).isValid());
 }
@@ -72,7 +76,8 @@ TEST(ShardKeyPattern, ValidShardKeyPatternComposite) {
     ASSERT(ShardKeyPattern(BSON("a" << 1.0f << "b" << 1.0)).isValid());
     ASSERT(!ShardKeyPattern(BSON("a" << 1 << "b" << -1)).isValid());
     ASSERT(!ShardKeyPattern(BSON("a" << 1 << "b"
-                                     << "1")).isValid());
+                                     << "1"))
+                .isValid());
 
     ASSERT(ShardKeyPattern(BSON("a" << 1 << "b" << 1.0 << "c" << 1.0f)).isValid());
     ASSERT(!ShardKeyPattern(BSON("a" << 1 << "b." << 1.0)).isValid());
@@ -147,7 +152,8 @@ TEST(ShardKeyPattern, ExtractDocShardKeySingle) {
                   BSON("a" << regex));
     const BSONObj ref = BSON("$ref"
                              << "coll"
-                             << "$id" << 1);
+                             << "$id"
+                             << 1);
     ASSERT_EQUALS(docKey(pattern, BSON("a" << ref)), BSON("a" << ref));
 
     ASSERT_EQUALS(docKey(pattern, BSONObj()), BSONObj());
@@ -171,7 +177,8 @@ TEST(ShardKeyPattern, ExtractDocShardKeyCompound) {
     ASSERT_EQUALS(docKey(pattern,
                          BSON("c" << 30 << "b"
                                   << "20"
-                                  << "a" << 10)),
+                                  << "a"
+                                  << 10)),
                   fromjson("{a:10, b:'20'}"));
 
     ASSERT_EQUALS(docKey(pattern, fromjson("{a:10, b:[1, 2]}")), BSONObj());
@@ -198,7 +205,8 @@ TEST(ShardKeyPattern, ExtractDocShardKeyNested) {
                   fromjson("{'a.b':10, c:30}"));
     const BSONObj ref = BSON("$ref"
                              << "coll"
-                             << "$id" << 1);
+                             << "$id"
+                             << 1);
     ASSERT_EQUALS(docKey(pattern, BSON("a" << BSON("b" << ref) << "c" << 30)),
                   BSON("a.b" << ref << "c" << 30));
 
@@ -249,7 +257,10 @@ TEST(ShardKeyPattern, ExtractDocShardKeyHashed) {
 }
 
 static BSONObj queryKey(const ShardKeyPattern& pattern, const BSONObj& query) {
-    StatusWith<BSONObj> status = pattern.extractShardKeyFromQuery(query);
+    QueryTestServiceContext serviceContext;
+    auto txn = serviceContext.makeOperationContext();
+
+    StatusWith<BSONObj> status = pattern.extractShardKeyFromQuery(txn.get(), query);
     if (!status.isOK())
         return BSONObj();
     return status.getValue();
@@ -302,7 +313,8 @@ TEST(ShardKeyPattern, ExtractQueryShardKeyCompound) {
     ASSERT_EQUALS(queryKey(pattern,
                            BSON("c" << 30 << "b"
                                     << "20"
-                                    << "a" << 10)),
+                                    << "a"
+                                    << 10)),
                   fromjson("{a:10, b:'20'}"));
 
     ASSERT_EQUALS(queryKey(pattern, fromjson("{a:10, b:[1, 2]}")), BSONObj());

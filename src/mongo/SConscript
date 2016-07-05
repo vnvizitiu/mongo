@@ -16,7 +16,11 @@ Import("use_system_version_of_library")
 
 # Boost we need everywhere. 's2' is spammed in all over the place by
 # db/geo unfortunately. pcre is also used many places.
-env.InjectThirdPartyIncludePaths(libraries=['boost', 's2', 'pcre'])
+env.InjectThirdPartyIncludePaths(libraries=[
+    'boost',
+    'pcre',
+    's2',
+])
 env.InjectMongoIncludePaths()
 
 env.SConscript(
@@ -36,6 +40,7 @@ env.SConscript(
         'scripting',
         'shell',
         'tools',
+        'transport',
         'unittest',
         'util',
     ],
@@ -85,13 +90,16 @@ baseSource=[
     'logger/ramlog.cpp',
     'logger/rotatable_file_manager.cpp',
     'logger/rotatable_file_writer.cpp',
+    'platform/decimal128.cpp',
     'platform/random.cpp',
     'platform/strnlen.cpp',
     'util/allocator.cpp',
     'util/assert_util.cpp',
     'util/base64.cpp',
     'util/concurrency/thread_name.cpp',
+    'util/duration.cpp',
     'util/exception_filter_win32.cpp',
+    'util/exit.cpp',
     'util/hex.cpp',
     'util/itoa.cpp',
     'util/log.cpp',
@@ -113,15 +121,11 @@ baseLibDeps=[
     '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
     '$BUILD_DIR/third_party/shim_boost',
     '$BUILD_DIR/third_party/shim_pcrecpp',
+    '$BUILD_DIR/third_party/shim_intel_decimal128',
+    '$BUILD_DIR/third_party/shim_tz',
     'util/debugger',
     'util/quick_exit',
 ]
-
-if GetOption('experimental-decimal-support') == 'on':
-    baseSource.append('platform/decimal128.cpp')
-    baseLibDeps.append('$BUILD_DIR/third_party/shim_intel_decimal128')
-else:
-    baseSource.append('platform/decimal128_dummy.cpp')
 
 env.Library(
     target='base',
@@ -208,7 +212,6 @@ env.Alias('generated-sources', generatedVersionFile)
 config_header_substs = (
     ('@mongo_config_byte_order@', 'MONGO_CONFIG_BYTE_ORDER'),
     ('@mongo_config_debug_build@', 'MONGO_CONFIG_DEBUG_BUILD'),
-    ('@mongo_config_experimental_decimal_support@', 'MONGO_CONFIG_EXPERIMENTAL_DECIMAL_SUPPORT'),
     ('@mongo_config_have_thread_local@', 'MONGO_CONFIG_HAVE_THREAD_LOCAL'),
     ('@mongo_config_have___declspec_thread@', 'MONGO_CONFIG_HAVE___DECLSPEC_THREAD'),
     ('@mongo_config_have___thread@', 'MONGO_CONFIG_HAVE___THREAD'),
@@ -218,7 +221,9 @@ config_header_substs = (
     ('@mongo_config_have_memset_s@', 'MONGO_CONFIG_HAVE_MEMSET_S'),
     ('@mongo_config_have_posix_monotonic_clock@', 'MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK'),
     ('@mongo_config_have_std_is_trivially_copyable@', 'MONGO_CONFIG_HAVE_STD_IS_TRIVIALLY_COPYABLE'),
+    ('@mongo_config_have_std_enable_if_t@', 'MONGO_CONFIG_HAVE_STD_ENABLE_IF_T'),
     ('@mongo_config_have_std_make_unique@', 'MONGO_CONFIG_HAVE_STD_MAKE_UNIQUE'),
+    ('@mongo_config_have_std_align@', 'MONGO_CONFIG_HAVE_STD_ALIGN'),
     ('@mongo_config_have_strnlen@', 'MONGO_CONFIG_HAVE_STRNLEN'),
     ('@mongo_config_optimized_build@', 'MONGO_CONFIG_OPTIMIZED_BUILD'),
     ('@mongo_config_ssl@', 'MONGO_CONFIG_SSL'),
@@ -248,6 +253,7 @@ mongodLibDeps = [
     "db/repl/storage_interface_impl",
     "executor/network_interface_factory",
     's/commands/shared_cluster_commands',
+    "util/clock_sources",
     "util/ntservice",
 ]
 
@@ -278,7 +284,6 @@ env.Install(
                     ],
                     LIBDEPS=[
                         "db/serveronly",
-                        "util/ntservice_mock",
                     ]),
     ])
 
@@ -286,22 +291,24 @@ env.Install(
 env.Install(
     '#/',
     env.Program(
-        "mongos",
-        [
-            "s/server.cpp",
-            "s/mongos_options.cpp",
-            "s/mongos_options_init.cpp",
+        target='mongos',
+        source=[
+            's/client/sharding_connection_hook_for_mongos.cpp',
+            's/mongos_options_init.cpp',
+            's/server.cpp',
         ],
         LIBDEPS=[
             'db/conn_pool_options',
             'db/commands/core',
             'db/mongodandmongos',
             's/client/sharding_connection_hook',
+            's/cluster_ops_impl',
             's/commands/cluster_commands',
             's/commands/shared_cluster_commands',
             's/coreshard',
             's/mongoscore',
             's/sharding_initialization',
+            'util/clock_sources',
             'util/ntservice',
             'util/options_parser/options_parser_init',
         ]))
@@ -337,45 +344,34 @@ if not has_option('noshell') and usemozjs:
     shell_core_env.Library("shell_core",
                 source=[
                     "shell/bench.cpp",
-                    "shell/clientAndShell.cpp",
                     "shell/linenoise.cpp",
                     "shell/mk_wcwidth.cpp",
                     "shell/mongo-server.cpp",
+                    "shell/shell_options.cpp",
+                    "shell/shell_options_init.cpp",
                     "shell/shell_utils.cpp",
                     "shell/shell_utils_extended.cpp",
                     "shell/shell_utils_launcher.cpp",
-                    "shell/shell_options_init.cpp"
                 ],
                 LIBDEPS=[
                     'db/catalog/index_key_validate',
                     'db/index/external_key_generator',
                     'db/query/command_request_response',
-                    'db/query/lite_parsed_query',
+                    'db/query/query_request',
+                    'db/server_options_core',
                     'linenoise_utf8',
+                    'rpc/protocol',
                     'scripting/scripting',
                     'shell/mongojs',
+                    'util/net/network',
+                    'util/options_parser/options_parser_init',
                     'util/processinfo',
                     'util/signal_handlers',
-                ],
-                LIBDEPS_TAGS=[
-                    # Circular with shell_options below. It is unclear
-                    # why this is split into two libraries, or even
-                    # why these libraries exist at all, since it seems
-                    # that the only thing that links them is the shell
-                    # itself.
-                    'incomplete',
+                    'executor/thread_pool_task_executor',
+                    'executor/network_interface_thread_pool',
+                    'executor/network_interface_factory'
                 ],
     )
-
-    # mongo shell options
-    shell_core_env.Library("shell_options", ["shell/shell_options.cpp"],
-                LIBDEPS=[
-                    '$BUILD_DIR/mongo/db/server_options_core',
-                    '$BUILD_DIR/mongo/rpc/protocol',
-                    '$BUILD_DIR/mongo/util/net/network',
-                    '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
-                    'shell_core',
-                ])
 
     shellEnv = env.Clone()
     if env.TargetOSIs('windows'):
@@ -385,7 +381,6 @@ if not has_option('noshell') and usemozjs:
         "mongo",
         "shell/dbshell.cpp",
         LIBDEPS=["$BUILD_DIR/third_party/shim_pcrecpp",
-                 "shell_options",
                  "shell_core",
                  "db/server_options_core",
                  "client/clientdriver",

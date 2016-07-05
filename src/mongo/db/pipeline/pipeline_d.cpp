@@ -37,24 +37,27 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_iterator.h"
 #include "mongo/db/exec/multi_iterator.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -83,9 +86,8 @@ public:
 
     bool isSharded(const NamespaceString& ns) final {
         const ChunkVersion unsharded(0, 0, OID());
-        return !(ShardingState::get(_ctx->opCtx)
-                     ->getVersion(ns.ns())
-                     .isWriteCompatibleWith(unsharded));
+        return !(
+            ShardingState::get(_ctx->opCtx)->getVersion(ns.ns()).isWriteCompatibleWith(unsharded));
     }
 
     bool isCapped(const NamespaceString& ns) final {
@@ -114,6 +116,22 @@ public:
         }
 
         return collection->infoCache()->getIndexUsageStats();
+    }
+
+    bool hasUniqueIdIndex(const NamespaceString& ns) const final {
+        AutoGetCollectionForRead ctx(_ctx->opCtx, ns.ns());
+        Collection* collection = ctx.getCollection();
+
+        if (!collection) {
+            // Collection doesn't exist; the correct return value is questionable.
+            return false;
+        }
+
+        return collection->getIndexCatalog()->findIdIndex(_ctx->opCtx);
+    }
+
+    void appendLatencyStats(const NamespaceString& nss, BSONObjBuilder* builder) const {
+        Top::get(_ctx->opCtx->getServiceContext()).appendLatencyStats(nss.ns(), builder);
     }
 
 private:
@@ -175,9 +193,12 @@ shared_ptr<PlanExecutor> createRandomCursorExecutor(Collection* collection,
     ShardingState* const shardingState = ShardingState::get(txn);
 
     // If we're in a sharded environment, we need to filter out documents we don't own.
-    if (shardingState->needCollectionMetadata(txn, txn->getNS())) {
+    if (shardingState->needCollectionMetadata(txn, collection->ns().ns())) {
         auto shardFilterStage = stdx::make_unique<ShardFilterStage>(
-            txn, shardingState->getCollectionMetadata(txn->getNS()), ws.get(), stage.release());
+            txn,
+            shardingState->getCollectionMetadata(collection->ns().ns()),
+            ws.get(),
+            stage.release());
         return uassertStatusOK(PlanExecutor::make(
             txn, std::move(ws), std::move(shardFilterStage), collection, PlanExecutor::YIELD_AUTO));
     }
@@ -194,10 +215,23 @@ StatusWith<std::unique_ptr<PlanExecutor>> attemptToGetExecutor(
     BSONObj projectionObj,
     BSONObj sortObj,
     const size_t plannerOpts) {
+    auto qr = stdx::make_unique<QueryRequest>(pExpCtx->ns);
+    qr->setFilter(queryObj);
+    qr->setProj(projectionObj);
+    qr->setSort(sortObj);
+
+    // If the pipeline has a non-null collator, set the collation option to the result of
+    // serializing the collator's spec back into BSON. We do this in order to fill in all options
+    // that the user omitted.
+    //
+    // If pipeline has a null collator (representing the "simple" collation), we simply set the
+    // collation option to the original user BSON.
+    qr->setCollation(pExpCtx->collator ? pExpCtx->collator->getSpec().toBSON()
+                                       : pExpCtx->collation);
+
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &pExpCtx->ns);
 
-    auto cq = CanonicalQuery::canonicalize(
-        pExpCtx->ns, queryObj, sortObj, projectionObj, extensionsCallback);
+    auto cq = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -220,7 +254,7 @@ shared_ptr<PlanExecutor> PipelineD::prepareCursorSource(
     const intrusive_ptr<Pipeline>& pPipeline,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     // We will be modifying the source vector as we go.
-    Pipeline::SourceContainer& sources = pPipeline->sources;
+    Pipeline::SourceContainer& sources = pPipeline->_sources;
 
     // Inject a MongodImplementation to sources that need them.
     for (auto&& source : sources) {
@@ -352,6 +386,12 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
         plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
 
+    if (deps.hasNoRequirements()) {
+        // If we don't need any fields from the input document, performing a count is faster, and
+        // will output empty documents, which is okay.
+        plannerOpts |= QueryPlannerParams::IS_COUNT;
+    }
+
     // The only way to get a text score is to let the query system handle the projection. In all
     // other cases, unless the query system can do an index-covered projection and avoid going to
     // the raw record at all, it is faster to have ParsedDeps filter the fields we need.
@@ -382,11 +422,11 @@ std::shared_ptr<PlanExecutor> PipelineD::prepareExecutor(
             }
 
             // We know the sort is being handled by the query system, so remove the $sort stage.
-            pipeline->sources.pop_front();
+            pipeline->_sources.pop_front();
 
             if (sortStage->getLimitSrc()) {
                 // We need to reinsert the coalesced $limit after removing the $sort.
-                pipeline->sources.push_front(sortStage->getLimitSrc());
+                pipeline->_sources.push_front(sortStage->getLimitSrc());
             }
             return exec;
         }
@@ -431,6 +471,10 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
     pSource->setQuery(queryObj);
     pSource->setSort(sortObj);
 
+    if (deps.hasNoRequirements()) {
+        pSource->shouldProduceEmptyDocs();
+    }
+
     if (!projectionObj.isEmpty()) {
         pSource->setProjection(projectionObj, boost::none);
     } else {
@@ -453,6 +497,35 @@ shared_ptr<PlanExecutor> PipelineD::addCursorSource(const intrusive_ptr<Pipeline
     exec->saveState();
 
     return exec;
+}
+
+std::string PipelineD::getPlanSummaryStr(const boost::intrusive_ptr<Pipeline>& pPipeline) {
+    if (auto docSourceCursor =
+            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+        return docSourceCursor->getPlanSummaryStr();
+    }
+
+    return "";
+}
+
+void PipelineD::getPlanSummaryStats(const boost::intrusive_ptr<Pipeline>& pPipeline,
+                                    PlanSummaryStats* statsOut) {
+    invariant(statsOut);
+
+    if (auto docSourceCursor =
+            dynamic_cast<DocumentSourceCursor*>(pPipeline->_sources.front().get())) {
+        *statsOut = docSourceCursor->getPlanSummaryStats();
+    }
+
+    bool hasSortStage{false};
+    for (auto&& source : pPipeline->_sources) {
+        if (dynamic_cast<DocumentSourceSort*>(source.get())) {
+            hasSortStage = true;
+            break;
+        }
+    }
+
+    statsOut->hasSortStage = hasSortStage;
 }
 
 }  // namespace mongo

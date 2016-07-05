@@ -29,14 +29,19 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+Milliseconds ClockSourceMock::getPrecision() {
+    return Milliseconds(1);
+}
 
 Date_t ClockSourceMock::now() {
     return _now;
 }
 
-void ClockSourceMock::advance(stdx::chrono::milliseconds ms) {
+void ClockSourceMock::advance(Milliseconds ms) {
     _now += ms;
 }
 

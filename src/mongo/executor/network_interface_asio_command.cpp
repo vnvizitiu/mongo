@@ -75,7 +75,7 @@ template <typename Handler>
 void asyncSendMessage(AsyncStreamInterface& stream, Message* m, Handler&& handler) {
     static_assert(IsNetworkHandler<Handler>::value,
                   "Handler passed to asyncSendMessage does not conform to NetworkHandler concept");
-    m->header().setResponseTo(0);
+    m->header().setResponseToMsgId(0);
     m->header().setId(nextMessageId());
     // TODO: Some day we may need to support vector messages.
     fassert(28708, m->buf() != 0);
@@ -115,7 +115,7 @@ void asyncRecvMessageBody(AsyncStreamInterface& stream,
 
     int z = (len + 1023) & 0xfffffc00;
     invariant(z >= len);
-    m->setData(reinterpret_cast<char*>(mongoMalloc(z)), true);
+    m->setData(SharedBuffer::allocate(z));
     MsgData::View mdView = m->buf();
 
     // copy header data into master buffer
@@ -143,9 +143,11 @@ ResponseStatus decodeRPC(Message* received,
 
             return Status(ErrorCodes::RPCProtocolNegotiationFailed,
                           str::stream() << "Mismatched RPC protocols - request was '"
-                                        << requestProtocol.getValue().toString() << "' '"
+                                        << requestProtocol.getValue().toString()
+                                        << "' '"
                                         << " but reply was '"
-                                        << networkOpToString(received->operation()) << "'");
+                                        << networkOpToString(received->operation())
+                                        << "'");
         }
         auto commandReply = reply->getCommandReply();
         auto replyMetadata = reply->getMetadata();
@@ -174,7 +176,7 @@ NetworkInterfaceASIO::AsyncCommand::AsyncCommand(AsyncConnection* conn,
                                                  Date_t now,
                                                  const HostAndPort& target)
     : _conn(conn), _type(type), _toSend(std::move(command)), _start(now), _target(target) {
-    _toSend.header().setResponseTo(0);
+    _toSend.header().setResponseToMsgId(0);
 }
 
 NetworkInterfaceASIO::AsyncConnection& NetworkInterfaceASIO::AsyncCommand::conn() {
@@ -246,10 +248,9 @@ void NetworkInterfaceASIO::_beginCommunication(AsyncOp* op) {
         return _completeOperation(op, beginStatus);
     }
 
-    _asyncRunCommand(op,
-                     [this, op](std::error_code ec, size_t bytes) {
-                         _validateAndRun(op, ec, [this, op]() { _completedOpCallback(op); });
-                     });
+    _asyncRunCommand(op, [this, op](std::error_code ec, size_t bytes) {
+        _validateAndRun(op, ec, [this, op]() { _completedOpCallback(op); });
+    });
 }
 
 void NetworkInterfaceASIO::_completedOpCallback(AsyncOp* op) {
@@ -276,12 +277,17 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         op->_timeoutAlarm->cancel();
     }
 
+    if (resp.getStatus().code() == ErrorCodes::ExceededTimeLimit) {
+        _numTimedOutOps.fetchAndAdd(1);
+    }
+
     if (op->_inSetup) {
         // If we are in setup we should only be here if we failed to connect.
         MONGO_ASIO_INVARIANT(!resp.isOK(), "Failed to connect in setup", op);
         // If we fail during connection, we won't be able to access any of op's members after
         // calling finish(), so we return here.
         LOG(1) << "Failed to connect to " << op->request().target << " - " << resp.getStatus();
+        _numFailedOps.fetchAndAdd(1);
         op->finish(resp);
         return;
     }
@@ -292,9 +298,13 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         // we got from the pool to execute a command, but it failed for some reason.
         LOG(2) << "Failed to execute command: " << op->request().toString()
                << " reason: " << resp.getStatus();
-    }
 
-    op->finish(resp);
+        if (resp.getStatus().code() != ErrorCodes::CallbackCanceled) {
+            _numFailedOps.fetchAndAdd(1);
+        }
+    } else {
+        _numSucceededOps.fetchAndAdd(1);
+    }
 
     std::unique_ptr<AsyncOp> ownedOp;
 
@@ -309,6 +319,8 @@ void NetworkInterfaceASIO::_completeOperation(AsyncOp* op, const ResponseStatus&
         ownedOp = std::move(iter->second);
         _inProgress.erase(iter);
     }
+
+    op->finish(resp);
 
     MONGO_ASIO_INVARIANT(static_cast<bool>(ownedOp), "Invalid AsyncOp", op);
 
@@ -359,39 +371,34 @@ void NetworkInterfaceASIO::_asyncRunCommand(AsyncOp* op, NetworkOpHandler handle
                                                                             size_t bytes) {
         // The operation could have been canceled after starting the command, but before
         // receiving the header
-        _validateAndRun(op,
-                        ec,
-                        [this, op, recvMessageCallback, ec, bytes, cmd, handler] {
-                            // validate response id
-                            uint32_t expectedId = cmd->toSend().header().getId();
-                            uint32_t actualId = cmd->header().constView().getResponseTo();
-                            if (actualId != expectedId) {
-                                LOG(3) << "got wrong response:"
-                                       << " expected response id: " << expectedId
-                                       << ", got response id: " << actualId;
-                                return handler(make_error_code(ErrorCodes::ProtocolError), bytes);
-                            }
+        _validateAndRun(op, ec, [this, op, recvMessageCallback, ec, bytes, cmd, handler] {
+            // validate response id
+            uint32_t expectedId = cmd->toSend().header().getId();
+            uint32_t actualId = cmd->header().constView().getResponseToMsgId();
+            if (actualId != expectedId) {
+                LOG(3) << "got wrong response:"
+                       << " expected response id: " << expectedId
+                       << ", got response id: " << actualId;
+                return handler(make_error_code(ErrorCodes::ProtocolError), bytes);
+            }
 
-                            asyncRecvMessageBody(cmd->conn().stream(),
-                                                 &cmd->header(),
-                                                 &cmd->toRecv(),
-                                                 std::move(recvMessageCallback));
-                        });
+            asyncRecvMessageBody(cmd->conn().stream(),
+                                 &cmd->header(),
+                                 &cmd->toRecv(),
+                                 std::move(recvMessageCallback));
+        });
     };
 
     // Step 2
-    auto sendMessageCallback =
-        [this, cmd, handler, recvHeaderCallback, op](std::error_code ec, size_t bytes) {
-            _validateAndRun(op,
-                            ec,
-                            [this, cmd, op, recvHeaderCallback] {
-                                asyncRecvMessageHeader(cmd->conn().stream(),
-                                                       &cmd->header(),
-                                                       std::move(recvHeaderCallback));
-                            });
+    auto sendMessageCallback = [this, cmd, handler, recvHeaderCallback, op](std::error_code ec,
+                                                                            size_t bytes) {
+        _validateAndRun(op, ec, [this, cmd, op, recvHeaderCallback] {
+            asyncRecvMessageHeader(
+                cmd->conn().stream(), &cmd->header(), std::move(recvHeaderCallback));
+        });
 
 
-        };
+    };
 
     // Step 1
     asyncSendMessage(cmd->conn().stream(), &cmd->toSend(), std::move(sendMessageCallback));
@@ -440,10 +447,9 @@ void NetworkInterfaceASIO::_runConnectionHook(AsyncOp* op) {
         return _beginCommunication(op);
     };
 
-    return _asyncRunCommand(op,
-                            [this, op, finishHook](std::error_code ec, std::size_t bytes) {
-                                _validateAndRun(op, ec, finishHook);
-                            });
+    return _asyncRunCommand(op, [this, op, finishHook](std::error_code ec, std::size_t bytes) {
+        _validateAndRun(op, ec, finishHook);
+    });
 }
 
 

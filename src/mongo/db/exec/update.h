@@ -39,6 +39,7 @@
 namespace mongo {
 
 class OperationContext;
+class OpDebug;
 struct PlanSummaryStats;
 
 struct UpdateStageParams {
@@ -106,12 +107,9 @@ public:
     static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
 
     /**
-     * Populate 'opDebug' with stats from 'updateStats' and 'summaryStats' describing the execution
-     * of this update.
+     * Populate 'opDebug' with stats from 'updateStats' describing the execution of this update.
      */
-    static void fillOutOpDebug(const UpdateStats* updateStats,
-                               const PlanSummaryStats* summaryStats,
-                               OpDebug* opDebug);
+    static void recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug);
 
     /**
      * Converts 'updateStats' into an UpdateResult.
@@ -136,12 +134,13 @@ public:
      *
      * Returns the document to insert in *out.
      */
-    static Status applyUpdateOpsForInsert(const CanonicalQuery* cq,
+    static Status applyUpdateOpsForInsert(OperationContext* txn,
+                                          const CanonicalQuery* cq,
                                           const BSONObj& query,
                                           UpdateDriver* driver,
-                                          UpdateLifecycle* lifecycle,
                                           mutablebson::Document* doc,
                                           bool isInternalRequest,
+                                          const NamespaceString& ns,
                                           UpdateStats* stats,
                                           BSONObj* out);
 
@@ -175,6 +174,12 @@ private:
      * Helper for restoring the state of this update.
      */
     Status restoreUpdateState();
+
+    /**
+     * Stores 'idToRetry' in '_idRetrying' so the update can be retried during the next call to
+     * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
+     */
+    StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     UpdateStageParams _params;
 

@@ -63,6 +63,7 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 */
 	*root_addr_sizep = 0;
 
+#ifdef HAVE_VERBOSE
 	if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT)) {
 		if (addr != NULL) {
 			WT_ERR(__wt_scr_alloc(session, 0, &tmp));
@@ -72,6 +73,7 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 		    "%s: load-checkpoint: %s", block->name,
 		    addr == NULL ? "[Empty]" : (const char *)tmp->data));
 	}
+#endif
 
 	/*
 	 * There's a single checkpoint in the file that can be written, all of
@@ -135,16 +137,17 @@ __wt_block_checkpoint_load(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	 * that was done when the checkpoint was first written (re-writing the
 	 * checkpoint might possibly make it relevant here, but it's unlikely
 	 * enough I don't bother).
+	 *
+	 * If in-memory, we don't read or write the object, and the truncate
+	 * will unnecessarily allocate buffer space.
 	 */
-	if (!checkpoint) {
-		/*
-		 * The truncate might fail if there's a file mapping (if there's
-		 * an open checkpoint on the file), that's OK.
-		 */
+	if (!checkpoint && !F_ISSET(S2C(session), WT_CONN_IN_MEMORY)) {
 		WT_ERR(__wt_verbose(session, WT_VERB_CHECKPOINT,
 		    "truncate file to %" PRIuMAX, (uintmax_t)ci->file_size));
+
+		/* The truncate might fail, and that's OK. */
 		WT_ERR_BUSY_OK(
-		    __wt_block_truncate(session, block->fh, ci->file_size));
+		    __wt_block_truncate(session, block, ci->file_size));
 	}
 
 	if (0) {
@@ -187,12 +190,9 @@ __wt_block_checkpoint_unload(
 	 * checkpoints.
 	 */
 	if (!checkpoint) {
-		/*
-		 * The truncate might fail if there's a file mapping (if there's
-		 * an open checkpoint on the file), that's OK.
-		 */
+		/* The truncate might fail, and that's OK. */
 		WT_TRET_BUSY_OK(
-		    __wt_block_truncate(session, block->fh, block->fh->size));
+		    __wt_block_truncate(session, block, block->size));
 
 		__wt_spin_lock(session, &block->live_lock);
 		__wt_block_ckpt_destroy(session, &block->live);
@@ -509,6 +509,7 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
 		    !F_ISSET(ckpt, WT_CKPT_DELETE))
 			continue;
 
+#ifdef HAVE_VERBOSE
 		if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT)) {
 			if (tmp == NULL)
 				WT_ERR(__wt_scr_alloc(session, 0, &tmp));
@@ -518,7 +519,7 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
 			    "%s: delete-checkpoint: %s: %s",
 			    block->name, ckpt->name, (const char *)tmp->data));
 		}
-
+#endif
 		/*
 		 * Find the checkpoint into which we'll roll this checkpoint's
 		 * blocks: it's the next real checkpoint in the list, and it
@@ -738,7 +739,7 @@ __ckpt_update(WT_SESSION_IMPL *session,
 	 * if there ever is, this will need to be fixed.
 	 */
 	if (is_live)
-		ci->file_size = block->fh->size;
+		ci->file_size = block->size;
 
 	/*
 	 * Copy the checkpoint information into the checkpoint array's address
@@ -812,8 +813,7 @@ __ckpt_string(WT_SESSION_IMPL *session,
 	WT_RET(__wt_block_buffer_to_ckpt(session, block, addr, ci));
 
 	WT_RET(__wt_buf_fmt(session, buf,
-	    "version=%d",
-	    ci->version));
+	    "version=%" PRIu8, ci->version));
 	if (ci->root_offset == WT_BLOCK_INVALID_OFFSET)
 		WT_RET(__wt_buf_catfmt(session, buf, ", root=[Empty]"));
 	else

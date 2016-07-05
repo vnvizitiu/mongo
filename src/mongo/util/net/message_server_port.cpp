@@ -40,19 +40,22 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message.h"
-#include "mongo/util/net/message_port.h"
 #include "mongo/util/net/message_server.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/thread_idle_callback.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
 
 #ifdef __linux__  // TODO: consider making this ifndef _WIN32
@@ -70,25 +73,7 @@ using std::endl;
 
 namespace {
 
-class MessagingPortWithHandler : public MessagingPort {
-    MONGO_DISALLOW_COPYING(MessagingPortWithHandler);
-
-public:
-    MessagingPortWithHandler(const std::shared_ptr<Socket>& socket,
-                             MessageHandler* handler,
-                             long long connectionId)
-        : MessagingPort(socket), _handler(handler) {
-        setConnectionId(connectionId);
-    }
-
-    MessageHandler* getHandler() const {
-        return _handler;
-    }
-
-private:
-    // Not owned.
-    MessageHandler* const _handler;
-};
+using MessagingPortWithHandler = std::pair<AbstractMessagingPort*, std::shared_ptr<MessageHandler>>;
 
 }  // namespace
 
@@ -98,16 +83,16 @@ public:
      * Creates a new message server.
      *
      * @param opts
-     * @param handler the handler to use. Caller is responsible for managing this object
-     *     and should make sure that it lives longer than this server.
+     * @param handler the handler to use.
      */
-    PortMessageServer(const MessageServer::Options& opts, MessageHandler* handler)
-        : Listener("", opts.ipList, opts.port), _handler(handler) {}
+    PortMessageServer(const MessageServer::Options& opts,
+                      std::shared_ptr<MessageHandler> handler,
+                      ServiceContext* ctx)
+        : Listener("", opts.ipList, opts.port, ctx, true), _handler(std::move(handler)) {}
 
-    virtual void accepted(std::shared_ptr<Socket> psocket, long long connectionId) {
+    virtual void accepted(AbstractMessagingPort* mp) {
         ScopeGuard sleepAfterClosingPort = MakeGuard(sleepmillis, 2);
-        std::unique_ptr<MessagingPortWithHandler> portWithHandler(
-            new MessagingPortWithHandler(psocket, _handler, connectionId));
+        auto portWithHandler = stdx::make_unique<MessagingPortWithHandler>(mp, _handler);
 
         if (!Listener::globalTicketHolder.tryAcquire()) {
             log() << "connection refused because too many open connections: "
@@ -164,10 +149,6 @@ public:
         }
     }
 
-    virtual void setAsTimeTracker() {
-        Listener::setAsTimeTracker();
-    }
-
     virtual bool setupSockets() {
         return Listener::setupSockets();
     }
@@ -181,7 +162,7 @@ public:
     }
 
 private:
-    MessageHandler* _handler;
+    const std::shared_ptr<MessageHandler> _handler;
 
     /**
      * Handles incoming messages from a given socket.
@@ -201,34 +182,34 @@ private:
         invariant(arg);
         unique_ptr<MessagingPortWithHandler> portWithHandler(
             static_cast<MessagingPortWithHandler*>(arg));
-        MessageHandler* const handler = portWithHandler->getHandler();
+        auto mp = portWithHandler->first;
+        auto handler = portWithHandler->second;
 
-        setThreadName(std::string(str::stream() << "conn" << portWithHandler->connectionId()));
-        portWithHandler->psock->setLogLevel(logger::LogSeverity::Debug(1));
+        setThreadName(std::string(str::stream() << "conn" << mp->connectionId()));
+        mp->setLogLevel(logger::LogSeverity::Debug(1));
 
         Message m;
         int64_t counter = 0;
         try {
-            handler->connected(portWithHandler.get());
+            handler->connected(mp);
             ON_BLOCK_EXIT([handler]() { handler->close(); });
 
             while (!inShutdown()) {
                 m.reset();
-                portWithHandler->psock->clearCounters();
+                mp->clearCounters();
 
-                if (!portWithHandler->recv(m)) {
+                if (!mp->recv(m)) {
                     if (!serverGlobalParams.quiet) {
                         int conns = Listener::globalTicketHolder.used() - 1;
                         const char* word = (conns == 1 ? " connection" : " connections");
-                        log() << "end connection " << portWithHandler->psock->remoteString() << " ("
-                              << conns << word << " now open)" << endl;
+                        log() << "end connection " << mp->remote().toString() << " (" << conns
+                              << word << " now open)" << endl;
                     }
                     break;
                 }
 
-                handler->process(m, portWithHandler.get());
-                networkCounter.hit(portWithHandler->psock->getBytesIn(),
-                                   portWithHandler->psock->getBytesOut());
+                handler->process(m, mp);
+                networkCounter.hit(mp->getBytesIn(), mp->getBytesOut());
 
                 // Occasionally we want to see if we're using too much memory.
                 if ((counter++ & 0xf) == 0) {
@@ -245,24 +226,19 @@ private:
             log() << "DBException handling request, closing client connection: " << e << endl;
         } catch (std::exception& e) {
             error() << "Uncaught std::exception: " << e.what() << ", terminating" << endl;
-            dbexit(EXIT_UNCAUGHT);
+            quickExit(EXIT_UNCAUGHT);
         }
-        portWithHandler->shutdown();
-
-// Normal disconnect path.
-#ifdef MONGO_CONFIG_SSL
-        SSLManagerInterface* manager = getSSLManager();
-        if (manager)
-            manager->cleanupThreadLocals();
-#endif
+        mp->shutdown();
 
         return NULL;
     }
 };
 
 
-MessageServer* createServer(const MessageServer::Options& opts, MessageHandler* handler) {
-    return new PortMessageServer(opts, handler);
+MessageServer* createServer(const MessageServer::Options& opts,
+                            std::shared_ptr<MessageHandler> handler,
+                            ServiceContext* ctx) {
+    return new PortMessageServer(opts, std::move(handler), ctx);
 }
 
 }  // namespace mongo

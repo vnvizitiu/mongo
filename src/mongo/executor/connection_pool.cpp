@@ -31,11 +31,12 @@
 
 #include "mongo/executor/connection_pool.h"
 
-#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -362,30 +363,29 @@ void ConnectionPool::SpecificPool::addToReady(stdx::unique_lock<stdx::mutex>& lk
     // Our strategy for refreshing connections is to check them out and
     // immediately check them back in (which kicks off the refresh logic in
     // returnConnection
-    connPtr->setTimeout(_parent->_options.refreshRequirement,
-                        [this, connPtr]() {
-                            OwnedConnection conn;
+    connPtr->setTimeout(_parent->_options.refreshRequirement, [this, connPtr]() {
+        OwnedConnection conn;
 
-                            stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
 
-                            if (!_readyPool.count(connPtr)) {
-                                // We've already been checked out. We don't need to refresh
-                                // ourselves.
-                                return;
-                            }
+        if (!_readyPool.count(connPtr)) {
+            // We've already been checked out. We don't need to refresh
+            // ourselves.
+            return;
+        }
 
-                            conn = takeFromPool(_readyPool, connPtr);
+        conn = takeFromPool(_readyPool, connPtr);
 
-                            // If we're in shutdown, we don't need to refresh connections
-                            if (_state == State::kInShutdown)
-                                return;
+        // If we're in shutdown, we don't need to refresh connections
+        if (_state == State::kInShutdown)
+            return;
 
-                            _checkedOutPool[connPtr] = std::move(conn);
+        _checkedOutPool[connPtr] = std::move(conn);
 
-                            connPtr->indicateSuccess();
+        connPtr->indicateSuccess();
 
-                            returnConnection(connPtr, std::move(lk));
-                        });
+        returnConnection(connPtr, std::move(lk));
+    });
 
     fulfillRequests(lk);
 }
@@ -533,6 +533,25 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
 void ConnectionPool::SpecificPool::shutdown() {
     stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
 
+    // We're racing:
+    //
+    // Thread A (this thread)
+    //   * Fired the shutdown timer
+    //   * Came into shutdown() and blocked
+    //
+    // Thread B (some new consumer)
+    //   * Requested a new connection
+    //   * Beat thread A to the mutex
+    //   * Cancelled timer (but thread A already made it in)
+    //   * Set state to running
+    //   * released the mutex
+    //
+    // So we end up in shutdown, but with kRunning.  If we're here we raced and
+    // we should just bail.
+    if (_state == State::kRunning) {
+        return;
+    }
+
     _state = State::kInShutdown;
 
     // If we have processing connections, wait for them to finish or timeout
@@ -588,31 +607,29 @@ void ConnectionPool::SpecificPool::updateStateInLock() {
 
         // We set a timer for the most recent request, then invoke each timed
         // out request we couldn't service
-        _requestTimer->setTimeout(
-            timeout,
-            [this]() {
-                stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
+        _requestTimer->setTimeout(timeout, [this]() {
+            stdx::unique_lock<stdx::mutex> lk(_parent->_mutex);
 
-                auto now = _parent->_factory->now();
+            auto now = _parent->_factory->now();
 
-                while (_requests.size()) {
-                    auto& x = _requests.top();
+            while (_requests.size()) {
+                auto& x = _requests.top();
 
-                    if (x.first <= now) {
-                        auto cb = std::move(x.second);
-                        _requests.pop();
+                if (x.first <= now) {
+                    auto cb = std::move(x.second);
+                    _requests.pop();
 
-                        lk.unlock();
-                        cb(Status(ErrorCodes::ExceededTimeLimit,
-                                  "Couldn't get a connection within the time limit"));
-                        lk.lock();
-                    } else {
-                        break;
-                    }
+                    lk.unlock();
+                    cb(Status(ErrorCodes::ExceededTimeLimit,
+                              "Couldn't get a connection within the time limit"));
+                    lk.lock();
+                } else {
+                    break;
                 }
+            }
 
-                updateStateInLock();
-            });
+            updateStateInLock();
+        });
     } else if (_checkedOutPool.size()) {
         // If we have no requests, but someone's using a connection, we just
         // hang around until the next request or a return

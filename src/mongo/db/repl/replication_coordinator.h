@@ -32,6 +32,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/sync_source_selector.h"
@@ -74,8 +75,6 @@ class ReadConcernArgs;
 class ReadConcernResponse;
 class ReplicaSetConfig;
 class ReplicationExecutor;
-class ReplSetDeclareElectionWinnerArgs;
-class ReplSetDeclareElectionWinnerResponse;
 class ReplSetHeartbeatArgs;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
@@ -126,14 +125,14 @@ public:
      * components of the replication system to start up whatever threads and do whatever
      * initialization they need.
      */
-    virtual void startReplication(OperationContext* txn) = 0;
+    virtual void startup(OperationContext* txn) = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
      * components of the replication system to shut down and stop any threads they are using,
      * blocking until all replication-related shutdown tasks are complete.
      */
-    virtual void shutdown() = 0;
+    virtual void shutdown(OperationContext* txn) = 0;
 
     /**
      * Returns a pointer to the ReplicationExecutor.
@@ -429,14 +428,17 @@ public:
      */
     virtual void signalUpstreamUpdater() = 0;
 
+    enum class ReplSetUpdatePositionCommandStyle {
+        kNewStyle,
+        kOldStyle  // Pre-3.2.4 servers.
+    };
+
     /**
      * Prepares a BSONObj describing an invocation of the replSetUpdatePosition command that can
      * be sent to this node's sync source to update it about our progress in replication.
-     *
-     * The returned bool indicates whether or not the command was created.
      */
-    virtual bool prepareOldReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) = 0;
-    virtual bool prepareReplSetUpdatePositionCommand(BSONObjBuilder* cmdBuilder) = 0;
+    virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
+        ReplSetUpdatePositionCommandStyle commandStyle) const = 0;
 
     /**
      * Handles an incoming replSetGetStatus command. Adds BSON to 'result'.
@@ -602,7 +604,7 @@ public:
      * "configVersion" will be populated with our config version if and only if we return
      * InvalidReplicaSetConfig.
      *
-     * The OldUpdatePositionArgs version provides support for the pre-3.2.2 format of
+     * The OldUpdatePositionArgs version provides support for the pre-3.2.4 format of
      * UpdatePositionArgs.
      */
     virtual Status processReplSetUpdatePosition(const OldUpdatePositionArgs& updates,
@@ -674,25 +676,16 @@ public:
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) = 0;
 
-    /*
-    * Handles an incoming replSetDeclareElectionWinner command.
-    * Returns a Status with either OK or an error message.
-    * Populates responseTerm with the current term from our perspective.
-    */
-    virtual Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
-                                                       long long* responseTerm) = 0;
-
     /**
      * Prepares a metadata object describing the current term, primary, and lastOp information.
      */
-    virtual void prepareReplResponseMetadata(const rpc::RequestInterface& request,
-                                             const OpTime& lastOpTimeFromClient,
-                                             BSONObjBuilder* builder) = 0;
+    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+                                     BSONObjBuilder* builder) const = 0;
 
     /**
      * Returns true if the V1 election protocol is being used and false otherwise.
      */
-    virtual bool isV1ElectionProtocol() = 0;
+    virtual bool isV1ElectionProtocol() const = 0;
 
     /**
      * Returns whether or not majority write concerns should implicitly journal, if j has not been
@@ -765,7 +758,7 @@ public:
     /**
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
-    virtual OpTime getCurrentCommittedSnapshotOpTime() = 0;
+    virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
 
     /**
      * Appends connection information to the provided BSONObjBuilder.
@@ -785,6 +778,12 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
+
+    virtual bool getInitialSyncRequestedFlag() const = 0;
+    virtual void setInitialSyncRequestedFlag(bool value) = 0;
+
+    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
+    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
 protected:
     ReplicationCoordinator();

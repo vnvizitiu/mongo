@@ -2,7 +2,7 @@
  * Tests running explain on a variety of explainable commands (find, update, remove, etc.) when
  * there are multiple plans available. This is a regression test for SERVER-20849 and SERVER-21376.
  */
-(function () {
+(function() {
     "use strict";
     var coll = db.explainMultiPlan;
     coll.drop();
@@ -52,7 +52,7 @@
         coll.explain("allPlansExecution").group({
             key: {a: 1},
             cond: {a: {$gte: 1}},
-            reduce: function (curr, result) {},
+            reduce: function(curr, result) {},
             initial: {}
         });
     });

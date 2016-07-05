@@ -34,8 +34,8 @@
 #include "mongo/base/init.h"
 #include "mongo/util/processinfo.h"
 
-#include <iostream>
 #include <fstream>
+#include <iostream>
 
 #include "mongo/util/log.h"
 
@@ -85,7 +85,12 @@ void ProcessInfo::initializeSystemInfo() {
     }
 }
 
-MONGO_INITIALIZER(SystemInfo)(InitializerContext* context) {
+/**
+ * We need this get the system page size for the secure allocator, which the enterprise modules need
+ * for storage for command line parameters.
+ */
+MONGO_INITIALIZER_GENERAL(SystemInfo, MONGO_NO_PREREQUISITES, MONGO_NO_DEPENDENTS)
+(InitializerContext* context) {
     ProcessInfo::initializeSystemInfo();
     return Status::OK();
 }

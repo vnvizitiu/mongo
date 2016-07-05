@@ -29,12 +29,14 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/util/net/listen.h"  // For DEFAULT_MAX_CONN
 
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
+
+enum class ClusterRole { None, ShardServer, ConfigServer };
 
 struct ServerGlobalParams {
     std::string binaryName;  // mongod or mongos
@@ -54,9 +56,7 @@ struct ServerGlobalParams {
 
     std::atomic<bool> quiet{false};  // --quiet NOLINT
 
-    bool configsvr = false;  // --configsvr
-    CatalogManager::ConfigServerMode configsvrMode =
-        CatalogManager::ConfigServerMode::NONE;  // -- configsvrMode
+    ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
 
     bool cpu = false;  // --cpu show cpu time periodically
 
@@ -103,8 +103,13 @@ struct ServerGlobalParams {
 
     BSONArray argvArray;
     BSONObj parsedOpts;
-    bool isAuthEnabled = false;
-    AtomicInt32 clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
+
+    enum AuthState { kEnabled, kDisabled, kUndefined };
+
+    AuthState authState = AuthState::kUndefined;
+
+    bool transitionToAuth = false;  // --transitionToAuth, mixed mode for rolling auth upgrade
+    AtomicInt32 clusterAuthMode;    // --clusterAuthMode, the internal cluster auth mode
 
     enum ClusterAuthModes {
         ClusterAuthMode_undefined,
@@ -128,6 +133,10 @@ struct ServerGlobalParams {
         */
         ClusterAuthMode_x509
     };
+
+    // for the YAML config, sharding._overrideShardIdentity. Can only be used when in
+    // queryableBackupMode.
+    BSONObj overrideShardIdentity;
 };
 
 extern ServerGlobalParams serverGlobalParams;

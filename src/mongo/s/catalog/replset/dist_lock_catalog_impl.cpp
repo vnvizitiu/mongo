@@ -75,12 +75,18 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  * the findAndModify command did not modify any document.
  * This also checks for errors in the response object.
  */
-StatusWith<BSONObj> extractFindAndModifyNewObj(const BSONObj& responseObj) {
-    auto cmdStatus = getStatusFromCommandResult(responseObj);
-
-    if (!cmdStatus.isOK()) {
-        return cmdStatus;
+StatusWith<BSONObj> extractFindAndModifyNewObj(StatusWith<Shard::CommandResponse> response) {
+    if (!response.isOK()) {
+        return response.getStatus();
     }
+    if (!response.getValue().commandStatus.isOK()) {
+        return response.getValue().commandStatus;
+    }
+    if (!response.getValue().writeConcernStatus.isOK()) {
+        return response.getValue().writeConcernStatus;
+    }
+
+    auto responseObj = std::move(response.getValue().response);
 
     if (const auto& newDocElem = responseObj[kFindAndModifyResponseResultDocField]) {
         if (newDocElem.isNull()) {
@@ -92,10 +98,11 @@ StatusWith<BSONObj> extractFindAndModifyNewObj(const BSONObj& responseObj) {
             return {ErrorCodes::UnsupportedFormat,
                     str::stream() << "expected an object from the findAndModify response '"
                                   << kFindAndModifyResponseResultDocField
-                                  << "'field, got: " << newDocElem};
+                                  << "'field, got: "
+                                  << newDocElem};
         }
 
-        return newDocElem.Obj();
+        return newDocElem.Obj().getOwned();
     }
 
     return {ErrorCodes::UnsupportedFormat,
@@ -167,15 +174,14 @@ Status DistLockCatalogImpl::ping(OperationContext* txn, StringData processID, Da
     request.setUpsert(true);
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->runCommandOnConfigWithRetries(
-        txn, _locksNS.db().toString(), request.toBSON(), ShardRegistry::kNotMasterErrors);
+    auto resultStatus =
+        _client->getConfigShard()->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              _locksNS.db().toString(),
+                                              request.toBSON(),
+                                              Shard::RetryPolicy::kNotIdempotent);
 
-    if (!resultStatus.isOK()) {
-        return resultStatus.getStatus();
-    }
-
-    BSONObj responseObj(resultStatus.getValue());
-    auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
+    auto findAndModifyStatus = extractFindAndModifyNewObj(std::move(resultStatus));
     return findAndModifyStatus.getStatus();
 }
 
@@ -186,10 +192,14 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* txn,
                                                     StringData processId,
                                                     Date_t time,
                                                     StringData why) {
-    BSONObj newLockDetails(BSON(LocksType::lockID(lockSessionID)
-                                << LocksType::state(LocksType::LOCKED) << LocksType::who() << who
-                                << LocksType::process() << processId << LocksType::when(time)
-                                << LocksType::why() << why));
+    BSONObj newLockDetails(BSON(
+        LocksType::lockID(lockSessionID) << LocksType::state(LocksType::LOCKED) << LocksType::who()
+                                         << who
+                                         << LocksType::process()
+                                         << processId
+                                         << LocksType::when(time)
+                                         << LocksType::why()
+                                         << why));
 
     auto request = FindAndModifyRequest::makeUpdate(
         _locksNS,
@@ -199,16 +209,14 @@ StatusWith<LocksType> DistLockCatalogImpl::grabLock(OperationContext* txn,
     request.setShouldReturnNew(true);
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->runCommandOnConfigWithRetries(
-        txn, _locksNS.db().toString(), request.toBSON(), ShardRegistry::kNotMasterErrors);
+    auto resultStatus = _client->getConfigShard()->runCommand(
+        txn,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        _locksNS.db().toString(),
+        request.toBSON(),
+        Shard::RetryPolicy::kNoRetry);  // Dist lock manager is handling own retries
 
-    if (!resultStatus.isOK()) {
-        return resultStatus.getStatus();
-    }
-
-    BSONObj responseObj(resultStatus.getValue());
-
-    auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
+    auto findAndModifyStatus = extractFindAndModifyNewObj(std::move(resultStatus));
     if (!findAndModifyStatus.isOK()) {
         if (findAndModifyStatus == ErrorCodes::DuplicateKey) {
             // Another thread won the upsert race. Also see SERVER-14322.
@@ -243,26 +251,28 @@ StatusWith<LocksType> DistLockCatalogImpl::overtakeLock(OperationContext* txn,
         BSON(LocksType::name() << lockID << LocksType::state(LocksType::UNLOCKED)));
     orQueryBuilder.append(BSON(LocksType::name() << lockID << LocksType::lockID(currentHolderTS)));
 
-    BSONObj newLockDetails(BSON(LocksType::lockID(lockSessionID)
-                                << LocksType::state(LocksType::LOCKED) << LocksType::who() << who
-                                << LocksType::process() << processId << LocksType::when(time)
-                                << LocksType::why() << why));
+    BSONObj newLockDetails(BSON(
+        LocksType::lockID(lockSessionID) << LocksType::state(LocksType::LOCKED) << LocksType::who()
+                                         << who
+                                         << LocksType::process()
+                                         << processId
+                                         << LocksType::when(time)
+                                         << LocksType::why()
+                                         << why));
 
     auto request = FindAndModifyRequest::makeUpdate(
         _locksNS, BSON("$or" << orQueryBuilder.arr()), BSON("$set" << newLockDetails));
     request.setShouldReturnNew(true);
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->runCommandOnConfigWithRetries(
-        txn, _locksNS.db().toString(), request.toBSON(), ShardRegistry::kNotMasterErrors);
+    auto resultStatus =
+        _client->getConfigShard()->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              _locksNS.db().toString(),
+                                              request.toBSON(),
+                                              Shard::RetryPolicy::kNotIdempotent);
 
-    if (!resultStatus.isOK()) {
-        return resultStatus.getStatus();
-    }
-
-    BSONObj responseObj(resultStatus.getValue());
-
-    auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
+    auto findAndModifyStatus = extractFindAndModifyNewObj(std::move(resultStatus));
     if (!findAndModifyStatus.isOK()) {
         return findAndModifyStatus.getStatus();
     }
@@ -285,17 +295,14 @@ Status DistLockCatalogImpl::unlock(OperationContext* txn, const OID& lockSession
         BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))));
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->runCommandOnConfigWithRetries(
-        txn, _locksNS.db().toString(), request.toBSON(), ShardRegistry::kAllRetriableErrors);
+    auto resultStatus =
+        _client->getConfigShard()->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              _locksNS.db().toString(),
+                                              request.toBSON(),
+                                              Shard::RetryPolicy::kIdempotent);
 
-    if (!resultStatus.isOK()) {
-        return resultStatus.getStatus();
-    }
-
-    BSONObj responseObj(resultStatus.getValue());
-
-    auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj).getStatus();
-
+    auto findAndModifyStatus = extractFindAndModifyNewObj(std::move(resultStatus));
     if (findAndModifyStatus == ErrorCodes::LockStateChangeFailed) {
         // Did not modify any document, which implies that the lock already has a
         // a different owner. This is ok since it means that the objective of
@@ -303,7 +310,7 @@ Status DistLockCatalogImpl::unlock(OperationContext* txn, const OID& lockSession
         return Status::OK();
     }
 
-    return findAndModifyStatus;
+    return findAndModifyStatus.getStatus();
 }
 
 Status DistLockCatalogImpl::unlockAll(OperationContext* txn, const std::string& processID) {
@@ -322,39 +329,47 @@ Status DistLockCatalogImpl::unlockAll(OperationContext* txn, const std::string& 
 
     BSONObj cmdObj = request.toBSON();
 
-    auto response = _client->runCommandOnConfigWithRetries(
-        txn, "config", cmdObj, ShardRegistry::kAllRetriableErrors);
+    auto response =
+        _client->getConfigShard()->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              _locksNS.db().toString(),
+                                              cmdObj,
+                                              Shard::RetryPolicy::kIdempotent);
 
     if (!response.isOK()) {
         return response.getStatus();
     }
+    if (!response.getValue().commandStatus.isOK()) {
+        return response.getValue().commandStatus;
+    }
+    if (!response.getValue().writeConcernStatus.isOK()) {
+        return response.getValue().writeConcernStatus;
+    }
 
     BatchedCommandResponse batchResponse;
     std::string errmsg;
-    if (!batchResponse.parseBSON(response.getValue(), &errmsg)) {
+    if (!batchResponse.parseBSON(response.getValue().response, &errmsg)) {
         return Status(ErrorCodes::FailedToParse,
                       str::stream()
                           << "Failed to parse config server response to batch request for "
-                             "unlocking existing distributed locks" << causedBy(errmsg));
+                             "unlocking existing distributed locks"
+                          << causedBy(errmsg));
     }
     return batchResponse.toStatus();
 }
 
 StatusWith<DistLockCatalog::ServerInfo> DistLockCatalogImpl::getServerInfo(OperationContext* txn) {
-    auto resultStatus =
-        _client->runCommandOnConfig(txn, kReadPref, "admin", BSON("serverStatus" << 1));
+    auto resultStatus = _client->getConfigShard()->runCommand(
+        txn, kReadPref, "admin", BSON("serverStatus" << 1), Shard::RetryPolicy::kIdempotent);
 
     if (!resultStatus.isOK()) {
         return resultStatus.getStatus();
     }
-
-    BSONObj responseObj(resultStatus.getValue());
-
-    auto cmdStatus = getStatusFromCommandResult(responseObj);
-
-    if (!cmdStatus.isOK()) {
-        return cmdStatus;
+    if (!resultStatus.getValue().commandStatus.isOK()) {
+        return resultStatus.getValue().commandStatus;
     }
+
+    BSONObj responseObj(std::move(resultStatus.getValue().response));
 
     BSONElement localTimeElem;
     auto localTimeStatus =
@@ -431,16 +446,14 @@ Status DistLockCatalogImpl::stopPing(OperationContext* txn, StringData processId
         FindAndModifyRequest::makeRemove(_lockPingNS, BSON(LockpingsType::process() << processId));
     request.setWriteConcern(kMajorityWriteConcern);
 
-    auto resultStatus = _client->runCommandOnConfigWithRetries(
-        txn, _locksNS.db().toString(), request.toBSON(), ShardRegistry::kNotMasterErrors);
+    auto resultStatus =
+        _client->getConfigShard()->runCommand(txn,
+                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                              _locksNS.db().toString(),
+                                              request.toBSON(),
+                                              Shard::RetryPolicy::kNotIdempotent);
 
-    if (!resultStatus.isOK()) {
-        return resultStatus.getStatus();
-    }
-
-    BSONObj responseObj(resultStatus.getValue());
-
-    auto findAndModifyStatus = extractFindAndModifyNewObj(responseObj);
+    auto findAndModifyStatus = extractFindAndModifyNewObj(std::move(resultStatus));
     return findAndModifyStatus.getStatus();
 }
 
@@ -451,7 +464,8 @@ StatusWith<vector<BSONObj>> DistLockCatalogImpl::_findOnConfig(
     const BSONObj& query,
     const BSONObj& sort,
     boost::optional<long long> limit) {
-    auto result = _client->exhaustiveFindOnConfig(txn, readPref, nss, query, sort, limit);
+    auto result = _client->getConfigShard()->exhaustiveFindOnConfig(
+        txn, readPref, repl::ReadConcernLevel::kMajorityReadConcern, nss, query, sort, limit);
     if (!result.isOK()) {
         return result.getStatus();
     }

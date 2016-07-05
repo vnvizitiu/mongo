@@ -34,7 +34,8 @@ static FILE *logfp;				/* Log file */
 
 static int  handle_error(WT_EVENT_HANDLER *, WT_SESSION *, int, const char *);
 static int  handle_message(WT_EVENT_HANDLER *, WT_SESSION *, const char *);
-static void onint(int);
+static void onint(int)
+    WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static void shutdown(void);
 static int  usage(void);
 static void wt_connect(SHARED_CONFIG *, char *);
@@ -154,8 +155,10 @@ main(int argc, char *argv[])
 
 	printf("%s: process %" PRIu64 "\n", progname, (uint64_t)getpid());
 	for (cnt = 1; runs == 0 || cnt <= runs; ++cnt) {
-		printf("    %d: %u reverse scanners, %u writers\n", cnt,
-		    (int)cfg->reverse_scanners, (int)cfg->append_inserters);
+		printf(
+		    "    %d: %" PRIu64
+		    " reverse scanners, %" PRIu64 " writers\n",
+		    cnt, cfg->reverse_scanners, cfg->append_inserters);
 
 		shutdown();			/* Clean up previous runs */
 

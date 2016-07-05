@@ -53,7 +53,8 @@ compressor(uint32_t compress_flag)
 	default:
 		break;
 	}
-	testutil_die(EINVAL, "illegal compression flag: 0x%x", compress_flag);
+	testutil_die(EINVAL,
+	    "illegal compression flag: %#" PRIx32, compress_flag);
 }
 
 /*
@@ -71,7 +72,8 @@ encryptor(uint32_t encrypt_flag)
 	default:
 		break;
 	}
-	testutil_die(EINVAL, "illegal encryption flag: 0x%x", encrypt_flag);
+	testutil_die(EINVAL,
+	    "illegal encryption flag: %#" PRIx32, encrypt_flag);
 }
 
 static int
@@ -85,10 +87,10 @@ handle_message(WT_EVENT_HANDLER *handler,
 
 	/* Write and flush the message so we're up-to-date on error. */
 	if (g.logfp == NULL) {
-		out = printf("%p:%s\n", session, message);
+		out = printf("%p:%s\n", (void *)session, message);
 		(void)fflush(stdout);
 	} else {
-		out = fprintf(g.logfp, "%p:%s\n", session, message);
+		out = fprintf(g.logfp, "%p:%s\n", (void *)session, message);
 		(void)fflush(g.logfp);
 	}
 	return (out < 0 ? EIO : 0);
@@ -124,10 +126,10 @@ static WT_EVENT_HANDLER event_handler = {
  *	Open a connection to a WiredTiger database.
  */
 void
-wts_open(const char *home, int set_api, WT_CONNECTION **connp)
+wts_open(const char *home, bool set_api, WT_CONNECTION **connp)
 {
 	WT_CONNECTION *conn;
-	int ret;
+	WT_DECL_RET;
 	char *config, *end, *p, helium_config[1024];
 
 	*connp = NULL;
@@ -136,10 +138,11 @@ wts_open(const char *home, int set_api, WT_CONNECTION **connp)
 	end = config + sizeof(g.wiredtiger_open_config);
 
 	p += snprintf(p, REMAIN(p, end),
-	    "create,checkpoint_sync=false,cache_size=%" PRIu32 "MB",
-	    g.c_cache);
-
-	p += snprintf(p, REMAIN(p, end), ",error_prefix=\"%s\"", g.progname);
+	    "create=true,"
+	    "cache_size=%" PRIu32 "MB,"
+	    "checkpoint_sync=false,"
+	    "error_prefix=\"%s\"",
+	    g.c_cache, g.progname);
 
 	/* In-memory configuration. */
 	if (g.c_in_memory != 0)
@@ -271,8 +274,13 @@ wts_open(const char *home, int set_api, WT_CONNECTION **connp)
 void
 wts_reopen(void)
 {
+	WT_CONNECTION *conn;
+
 	testutil_checkfmt(wiredtiger_open(g.home, &event_handler,
-	    g.wiredtiger_open_config, &g.wts_conn), "%s", g.home);
+	    g.wiredtiger_open_config, &conn), "%s", g.home);
+
+	g.wt_api = conn->get_extension_api(conn);
+	g.wts_conn = conn;
 }
 
 /*
@@ -280,7 +288,7 @@ wts_reopen(void)
  *	Create the underlying store.
  */
 void
-wts_create(void)
+wts_init(void)
 {
 	WT_CONNECTION *conn;
 	WT_SESSION *session;
@@ -313,7 +321,7 @@ wts_create(void)
 	p += snprintf(p, REMAIN(p, end),
 	    "key_format=%s,"
 	    "allocation_size=512,%s"
-	    "internal_page_max=%d,leaf_page_max=%d",
+	    "internal_page_max=%" PRIu32 ",leaf_page_max=%" PRIu32,
 	    (g.type == ROW) ? "u" : "r",
 	    g.c_firstfit ? "block_allocation=first," : "",
 	    maxintlpage, maxleafpage);
@@ -325,15 +333,15 @@ wts_create(void)
 	maxintlkey = mmrand(NULL, maxintlpage / 50, maxintlpage / 40);
 	if (maxintlkey > 20)
 		p += snprintf(p, REMAIN(p, end),
-		    ",internal_key_max=%d", maxintlkey);
+		    ",internal_key_max=%" PRIu32, maxintlkey);
 	maxleafkey = mmrand(NULL, maxleafpage / 50, maxleafpage / 40);
 	if (maxleafkey > 20)
 		p += snprintf(p, REMAIN(p, end),
-		    ",leaf_key_max=%d", maxleafkey);
+		    ",leaf_key_max=%" PRIu32, maxleafkey);
 	maxleafvalue = mmrand(NULL, maxleafpage * 10, maxleafpage / 40);
 	if (maxleafvalue > 40 && maxleafvalue < 100 * 1024)
 		p += snprintf(p, REMAIN(p, end),
-		    ",leaf_value_max=%d", maxleafvalue);
+		    ",leaf_value_max=%" PRIu32, maxleafvalue);
 
 	switch (g.type) {
 	case FIX:
@@ -361,7 +369,7 @@ wts_create(void)
 			    ",huffman_value=english");
 		if (g.c_dictionary)
 			p += snprintf(p, REMAIN(p, end),
-			    ",dictionary=%d", mmrand(NULL, 123, 517));
+			    ",dictionary=%" PRIu32, mmrand(NULL, 123, 517));
 		break;
 	}
 
@@ -495,8 +503,8 @@ void
 wts_verify(const char *tag)
 {
 	WT_CONNECTION *conn;
+	WT_DECL_RET;
 	WT_SESSION *session;
-	int ret;
 
 	if (g.c_verify == 0)
 		return;
@@ -529,12 +537,12 @@ wts_stats(void)
 {
 	WT_CONNECTION *conn;
 	WT_CURSOR *cursor;
+	WT_DECL_RET;
 	WT_SESSION *session;
 	FILE *fp;
 	char *stat_name;
 	const char *pval, *desc;
 	uint64_t v;
-	int ret;
 
 	/* Ignore statistics if they're not configured. */
 	if (g.c_statistics == 0)

@@ -38,8 +38,10 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/rpc/request_interface.h"
@@ -47,20 +49,21 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 using std::string;
 using std::stringstream;
 
-
 bool isMongos() {
     return true;
 }
 
-/** When this callback is run, we record a shard that we've used for useful work
- *  in an operation to be read later by getLastError()
-*/
+/**
+ * When this callback is run, we record a shard that we've used for useful work in an operation to
+ * be read later by getLastError()
+ */
 void usingAShardConnection(const std::string& addr) {
     ClusterLastErrorInfo::get(cc()).addShardHost(addr);
 }
@@ -93,7 +96,7 @@ void Command::execCommand(OperationContext* txn,
 
 void Command::execCommandClientBasic(OperationContext* txn,
                                      Command* c,
-                                     ClientBasic& client,
+                                     Client& client,
                                      int queryOptions,
                                      const char* ns,
                                      BSONObj& cmdObj,
@@ -102,10 +105,9 @@ void Command::execCommandClientBasic(OperationContext* txn,
 
     if (cmdObj.getBoolField("help")) {
         stringstream help;
-        help << "help for: " << c->name << " ";
+        help << "help for: " << c->getName() << " ";
         c->help(help);
         result.append("help", help.str());
-        result.append("lockType", c->isWriteCommandForConfigServer() ? 1 : 0);
         appendCommandStatus(result, true, "");
         return;
     }
@@ -122,10 +124,37 @@ void Command::execCommandClientBasic(OperationContext* txn,
         globalOpCounters.gotCommand();
     }
 
+    StatusWith<WriteConcernOptions> wcResult =
+        WriteConcernOptions::extractWCFromCommand(cmdObj, dbname);
+    if (!wcResult.isOK()) {
+        appendCommandStatus(result, wcResult.getStatus());
+        return;
+    }
+
+    bool supportsWriteConcern = c->supportsWriteConcern(cmdObj);
+    if (!supportsWriteConcern && !wcResult.getValue().usedDefault) {
+        // This command doesn't do writes so it should not be passed a writeConcern.
+        // If we did not use the default writeConcern, one was provided when it shouldn't have
+        // been by the user.
+        appendCommandStatus(
+            result, Status(ErrorCodes::InvalidOptions, "Command does not support writeConcern"));
+        return;
+    }
+
+
     std::string errmsg;
     bool ok = false;
     try {
-        ok = c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
+        if (!supportsWriteConcern) {
+            ok = c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
+        } else {
+            // Change the write concern while running the command.
+            const auto oldWC = txn->getWriteConcern();
+            ON_BLOCK_EXIT([&] { txn->setWriteConcern(oldWC); });
+            txn->setWriteConcern(wcResult.getValue());
+
+            ok = c->run(txn, dbname, cmdObj, queryOptions, errmsg, result);
+        }
     } catch (const DBException& e) {
         result.resetToEmpty();
         const int code = e.getCode();
@@ -144,31 +173,6 @@ void Command::execCommandClientBasic(OperationContext* txn,
     }
 
     appendCommandStatus(result, ok, errmsg);
-}
-
-void Command::runAgainstRegistered(OperationContext* txn,
-                                   const char* ns,
-                                   BSONObj& jsobj,
-                                   BSONObjBuilder& anObjBuilder,
-                                   int queryOptions) {
-    // It should be impossible for this uassert to fail since there should be no way to get
-    // into this function with any other collection name.
-    uassert(16618,
-            "Illegal attempt to run a command against a namespace other than $cmd.",
-            nsToCollectionSubstring(ns) == "$cmd");
-
-    BSONElement e = jsobj.firstElement();
-    std::string commandName = e.fieldName();
-    Command* c = e.type() ? Command::findCommand(commandName) : NULL;
-    if (!c) {
-        Command::appendCommandStatus(
-            anObjBuilder, false, str::stream() << "no such cmd: " << commandName);
-        anObjBuilder.append("code", ErrorCodes::CommandNotFound);
-        Command::unknownCommands.increment();
-        return;
-    }
-
-    execCommandClientBasic(txn, c, cc(), queryOptions, ns, jsobj, anObjBuilder);
 }
 
 void Command::registerError(OperationContext* txn, const DBException& exception) {}

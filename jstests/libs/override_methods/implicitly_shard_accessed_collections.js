@@ -6,7 +6,7 @@
  * on the db object.
  */
 
-(function () {
+(function() {
     'use strict';
 
     // Save a reference to the original getCollection method in the IIFE's scope.
@@ -17,6 +17,7 @@
     var blacklistedNamespaces = [
         /\$cmd/,
         /^admin\./,
+        /^config\./,
         /\.system\./,
     ];
 

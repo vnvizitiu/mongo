@@ -29,11 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/global_conn_pool.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -44,8 +45,8 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
-#include "mongo/util/net/message_port.h"
 #include "mongo/util/net/message_server.h"
+#include "mongo/util/net/socket_exception.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -68,38 +69,6 @@ class OperationContext;
 
 namespace {
 
-stdx::mutex shutDownMutex;
-bool shuttingDown = false;
-
-}  // namespace
-
-// Symbols defined to build the binary correctly.
-bool inShutdown() {
-    stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-    return shuttingDown;
-}
-
-void signalShutdown() {}
-
-DBClientBase* createDirectClient(OperationContext* txn) {
-    return NULL;
-}
-
-void dbexit(ExitCode rc, const char* why) {
-    {
-        stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-        shuttingDown = true;
-    }
-
-    quickExit(rc);
-}
-
-void exitCleanly(ExitCode rc) {
-    dbexit(rc, "");
-}
-
-namespace {
-
 const string TARGET_HOST = "localhost:27017";
 const int TARGET_PORT = 27017;
 
@@ -115,7 +84,7 @@ public:
 
         // We need to handle the isMaster received during connection.
         if (request->getCommandName() == "isMaster") {
-            commandResponse.append("maxWireVersion", WireVersion::FIND_COMMAND);
+            commandResponse.append("maxWireVersion", WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN);
             commandResponse.append("minWireVersion", WireVersion::RELEASE_2_4_AND_BEFORE);
         }
 
@@ -127,8 +96,7 @@ public:
     }
 
     virtual void close() {}
-
-} dummyHandler;
+};
 
 // TODO: Take this out and make it as a reusable class in a header file. The only
 // thing that is preventing this from happening is the dependency on the inShutdown
@@ -162,7 +130,7 @@ public:
      * @param messageHandler the message handler to use for this server. Ownership
      *     of this object is passed to this server.
      */
-    void run(MessageHandler* messsageHandler) {
+    void run(std::shared_ptr<MessageHandler> messsageHandler) {
         if (_server != NULL) {
             return;
         }
@@ -170,12 +138,7 @@ public:
         MessageServer::Options options;
         options.port = _port;
 
-        {
-            stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-            shuttingDown = false;
-        }
-
-        _server.reset(createServer(options, messsageHandler));
+        _server.reset(createServer(options, std::move(messsageHandler), getGlobalServiceContext()));
         _serverThread = stdx::thread(runServer, _server.get());
     }
 
@@ -185,11 +148,6 @@ public:
     void stop() {
         if (!_server) {
             return;
-        }
-
-        {
-            stdx::lock_guard<stdx::mutex> sl(shutDownMutex);
-            shuttingDown = true;
         }
 
         ListeningSockets::get()->closeAll();
@@ -234,7 +192,8 @@ public:
         _maxPoolSizePerHost = globalConnPool.getMaxPoolSize();
         _dummyServer = new DummyServer(TARGET_PORT);
 
-        _dummyServer->run(&dummyHandler);
+        auto dummyHandler = std::make_shared<DummyMessageHandler>();
+        _dummyServer->run(std::move(dummyHandler));
         DBClientConnection conn;
         Timer timer;
 
@@ -245,8 +204,8 @@ public:
                 break;
             }
             if (timer.seconds() > 20) {
-                FAIL(str::stream()
-                     << "Timed out connecting to dummy server: " << connectStatus.toString());
+                FAIL(str::stream() << "Timed out connecting to dummy server: "
+                                   << connectStatus.toString());
             }
         }
     }

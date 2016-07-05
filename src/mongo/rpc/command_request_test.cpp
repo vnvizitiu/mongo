@@ -36,8 +36,8 @@
 #include "mongo/rpc/command_request.h"
 #include "mongo/rpc/command_request_builder.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/net/message.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/net/message.h"
 
 namespace {
 
@@ -61,7 +61,7 @@ TEST(CommandRequest, ParseAllFields) {
     auto database = std::string{"ookokokokok"};
     writeString(database);
 
-    auto commandName = std::string{"abababa"};
+    auto commandName = std::string{"baz"};
     writeString(commandName);
 
     BSONObjBuilder commandArgsBob{};
@@ -111,11 +111,31 @@ TEST(CommandRequest, ParseAllFields) {
 TEST(CommandRequest, InvalidNSThrows) {
     rpc::CommandRequestBuilder crb;
     crb.setDatabase("foo////!!!!<><><>");
-    crb.setCommandName("foo");
+    crb.setCommandName("ping");
     crb.setCommandArgs(BSON("ping" << 1));
     crb.setMetadata(BSONObj());
     auto msg = crb.done();
-    ASSERT_THROWS(rpc::CommandRequest{&msg}, AssertionException);
+    ASSERT_THROWS_CODE(rpc::CommandRequest{&msg}, AssertionException, ErrorCodes::InvalidNamespace);
+}
+
+TEST(CommandRequest, EmptyCommandObjThrows) {
+    rpc::CommandRequestBuilder crb;
+    crb.setDatabase("someDb");
+    crb.setCommandName("ping");
+    crb.setCommandArgs(BSONObj());
+    crb.setMetadata(BSONObj());
+    auto msg = crb.done();
+    ASSERT_THROWS_CODE(rpc::CommandRequest{&msg}, UserException, 39950);
+}
+
+TEST(CommandRequest, MismatchBetweenCommandNamesThrows) {
+    rpc::CommandRequestBuilder crb;
+    crb.setDatabase("someDb");
+    crb.setCommandName("ping");
+    crb.setCommandArgs(BSON("launchMissiles" << 1));
+    crb.setMetadata(BSONObj());
+    auto msg = crb.done();
+    ASSERT_THROWS_CODE(rpc::CommandRequest{&msg}, UserException, 39950);
 }
 
 }  // namespace

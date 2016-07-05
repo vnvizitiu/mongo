@@ -42,12 +42,20 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/network_test_env.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/s/catalog/catalog_manager_mock.h"
+#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/replset/dist_lock_catalog_impl.h"
+#include "mongo/s/catalog/sharding_catalog_client_mock.h"
+#include "mongo/s/catalog/sharding_catalog_manager_mock.h"
 #include "mongo/s/catalog/type_lockpings.h"
 #include "mongo/s/catalog/type_locks.h"
+#include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/client/shard_remote.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
@@ -67,7 +75,7 @@ using repl::ReadConcernArgs;
 namespace {
 
 const HostAndPort dummyHost("dummy", 123);
-static const stdx::chrono::seconds kFutureTimeout{5};
+static const Seconds kFutureTimeout{5};
 
 /**
  * Sets up the mocked out objects for testing the replica-set backed catalog manager.
@@ -89,7 +97,8 @@ public:
     }
 
     std::shared_ptr<RemoteCommandTargeterMock> targeter() {
-        return RemoteCommandTargeterMock::get(_shardRegistry->getConfigShard()->getTargeter());
+        return RemoteCommandTargeterMock::get(
+            grid.shardRegistry()->getConfigShard()->getTargeter());
     }
 
     DistLockCatalogImpl* catalog() {
@@ -97,10 +106,10 @@ public:
     }
 
     // Not thread safe
-    void shutdownShardRegistry() {
+    void shutdownExecutor() {
         if (!_shutdownCalled) {
             _shutdownCalled = true;
-            _shardRegistry->shutdown();
+            grid.getExecutorPool()->shutdownAndJoin();
         }
     }
 
@@ -121,35 +130,58 @@ private:
 
         auto executorPool = stdx::make_unique<executor::TaskExecutorPool>();
         executorPool->addExecutors(std::move(executorsForPool), std::move(fixedExecutor));
-
-        auto addShardExecutor = executor::makeThreadPoolTestExecutor(
-            stdx::make_unique<executor::NetworkInterfaceMock>());
+        executorPool->startup();
 
         ConnectionString configCS(HostAndPort("dummy:1234"));
-        _shardRegistry =
-            stdx::make_unique<ShardRegistry>(stdx::make_unique<RemoteCommandTargeterFactoryMock>(),
-                                             std::move(executorPool),
-                                             network,
-                                             std::move(addShardExecutor),
-                                             configCS);
-        _shardRegistry->startup();
 
-        _distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(_shardRegistry.get());
+        auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryMock>();
+        auto targeterFactoryPtr = targeterFactory.get();
+
+        ShardFactory::BuilderCallable setBuilder =
+            [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+                return stdx::make_unique<ShardRemote>(
+                    shardId, connStr, targeterFactoryPtr->create(connStr));
+            };
+
+        ShardFactory::BuilderCallable masterBuilder =
+            [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+                return stdx::make_unique<ShardRemote>(
+                    shardId, connStr, targeterFactoryPtr->create(connStr));
+            };
+
+        ShardFactory::BuildersMap buildersMap{
+            {ConnectionString::SET, std::move(setBuilder)},
+            {ConnectionString::MASTER, std::move(masterBuilder)},
+        };
+
+        auto shardFactory =
+            stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
+
+        auto shardRegistry(stdx::make_unique<ShardRegistry>(std::move(shardFactory), configCS));
+
+        _distLockCatalog = stdx::make_unique<DistLockCatalogImpl>(shardRegistry.get());
+
+        grid.init(stdx::make_unique<ShardingCatalogClientMock>(),
+                  stdx::make_unique<ShardingCatalogManagerMock>(),
+                  stdx::make_unique<CatalogCache>(),
+                  std::move(shardRegistry),
+                  std::unique_ptr<ClusterCursorManager>{nullptr},
+                  std::unique_ptr<BalancerConfiguration>{nullptr},
+                  std::move(executorPool),
+                  network);
 
         targeter()->setFindHostReturnValue(dummyHost);
     }
 
     void tearDown() override {
-        shutdownShardRegistry();
+        shutdownExecutor();
+        grid.clearForUnitTests();
     }
 
     bool _shutdownCalled = false;
 
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
 
-    CatalogManagerMock _catalogMgr;
-
-    std::unique_ptr<ShardRegistry> _shardRegistry;
     std::unique_ptr<DistLockCatalogImpl> _distLockCatalog;
     OperationContextNoop _txn;
 };
@@ -205,7 +237,7 @@ TEST_F(DistLockCatalogFixture, PingTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, PingRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->ping(txn(), "abcd", Date_t::now());
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -449,7 +481,7 @@ TEST_F(DistLockCatalogFixture, GrabLockTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, GrabLockRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->grabLock(txn(), "", OID::gen(), "", "", Date_t::now(), "").getStatus();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -517,7 +549,7 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
     auto future = launchAsync([this] {
         auto status =
             catalog()->grabLock(txn(), "", OID::gen(), "", "", Date_t::now(), "").getStatus();
-        ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, status.code());
+        ASSERT_EQUALS(ErrorCodes::NotMaster, status.code());
         ASSERT_FALSE(status.reason().empty());
     });
 
@@ -526,8 +558,8 @@ TEST_F(DistLockCatalogFixture, GrabLockWriteConcernError) {
                 ok: 1,
                 value: null,
                 writeConcernError: {
-                    code: 64,
-                    errmsg: "waiting for replication timed out"
+                    code: 10107,
+                    errmsg: "Not master while waiting for write concern"
                 }
             })");
     });
@@ -768,7 +800,7 @@ TEST_F(DistLockCatalogFixture, OvertakeLockTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, OvertakeLockRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status =
         catalog()->overtakeLock(txn(), "", OID(), OID(), "", "", Date_t::now(), "").getStatus();
@@ -943,7 +975,7 @@ TEST_F(DistLockCatalogFixture, UnlockTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, UnlockRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->unlock(txn(), OID());
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -1004,14 +1036,17 @@ TEST_F(DistLockCatalogFixture, UnlockWriteConcernError) {
 
     // The dist lock catalog calls into the ShardRegistry, which will retry 3 times for
     // WriteConcernFailed errors
-    onCommand([&](const RemoteCommandRequest& request)
-                  -> StatusWith<BSONObj> { return writeConcernFailedResponse; });
+    onCommand([&](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        return writeConcernFailedResponse;
+    });
 
-    onCommand([&](const RemoteCommandRequest& request)
-                  -> StatusWith<BSONObj> { return writeConcernFailedResponse; });
+    onCommand([&](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        return writeConcernFailedResponse;
+    });
 
-    onCommand([&](const RemoteCommandRequest& request)
-                  -> StatusWith<BSONObj> { return writeConcernFailedResponse; });
+    onCommand([&](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+        return writeConcernFailedResponse;
+    });
 
     future.timed_get(kFutureTimeout);
 }
@@ -1058,30 +1093,31 @@ TEST_F(DistLockCatalogFixture, BasicUnlockAll) {
         ASSERT_OK(status);
     });
 
-    onCommand([](const RemoteCommandRequest& request)
-                  -> StatusWith<BSONObj> {
-                      ASSERT_EQUALS(dummyHost, request.target);
-                      ASSERT_EQUALS("config", request.dbname);
+    onCommand(
+        [](const RemoteCommandRequest& request) -> StatusWith<BSONObj> {
+            ASSERT_EQUALS(dummyHost, request.target);
+            ASSERT_EQUALS("config", request.dbname);
 
-                      std::string errmsg;
-                      BatchedUpdateRequest batchRequest;
-                      ASSERT(batchRequest.parseBSON("config", request.cmdObj, &errmsg));
-                      ASSERT_EQUALS(LocksType::ConfigNS, batchRequest.getNS().toString());
-                      ASSERT_EQUALS(BSON("w"
-                                         << "majority"
-                                         << "wtimeout" << 15000),
-                                    batchRequest.getWriteConcern());
-                      auto updates = batchRequest.getUpdates();
-                      ASSERT_EQUALS(1U, updates.size());
-                      auto update = updates.front();
-                      ASSERT_FALSE(update->getUpsert());
-                      ASSERT_TRUE(update->getMulti());
-                      ASSERT_EQUALS(BSON(LocksType::process("processID")), update->getQuery());
-                      ASSERT_EQUALS(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
-                                    update->getUpdateExpr());
+            std::string errmsg;
+            BatchedUpdateRequest batchRequest;
+            ASSERT(batchRequest.parseBSON("config", request.cmdObj, &errmsg));
+            ASSERT_EQUALS(LocksType::ConfigNS, batchRequest.getNS().toString());
+            ASSERT_EQUALS(BSON("w"
+                               << "majority"
+                               << "wtimeout"
+                               << 15000),
+                          batchRequest.getWriteConcern());
+            auto updates = batchRequest.getUpdates();
+            ASSERT_EQUALS(1U, updates.size());
+            auto update = updates.front();
+            ASSERT_FALSE(update->getUpsert());
+            ASSERT_TRUE(update->getMulti());
+            ASSERT_EQUALS(BSON(LocksType::process("processID")), update->getQuery());
+            ASSERT_EQUALS(BSON("$set" << BSON(LocksType::state(LocksType::UNLOCKED))),
+                          update->getUpdateExpr());
 
-                      return BSON("ok" << 1);
-                  });
+            return BSON("ok" << 1);
+        });
 
     future.timed_get(kFutureTimeout);
 }
@@ -1151,7 +1187,7 @@ TEST_F(DistLockCatalogFixture, GetServerTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, GetServerRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->getServerInfo(txn()).getStatus();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -1297,7 +1333,7 @@ TEST_F(DistLockCatalogFixture, StopPingTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, StopPingRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->stopPing(txn(), "");
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -1442,7 +1478,7 @@ TEST_F(DistLockCatalogFixture, GetPingTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, GetPingRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->getPing(txn(), "").getStatus();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -1456,8 +1492,9 @@ TEST_F(DistLockCatalogFixture, GetPingNotFound) {
         ASSERT_FALSE(status.reason().empty());
     });
 
-    onFindCommand([](const RemoteCommandRequest& request)
-                      -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
+    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        return std::vector<BSONObj>();
+    });
 
     future.timed_get(kFutureTimeout);
 }
@@ -1527,7 +1564,7 @@ TEST_F(DistLockCatalogFixture, GetLockByTSTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByTSRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
     auto status = catalog()->getLockByTS(txn(), OID()).getStatus();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
     ASSERT_FALSE(status.reason().empty());
@@ -1540,8 +1577,9 @@ TEST_F(DistLockCatalogFixture, GetLockByTSNotFound) {
         ASSERT_FALSE(status.reason().empty());
     });
 
-    onFindCommand([](const RemoteCommandRequest& request)
-                      -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
+    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        return std::vector<BSONObj>();
+    });
 
     future.timed_get(kFutureTimeout);
 }
@@ -1614,7 +1652,7 @@ TEST_F(DistLockCatalogFixture, GetLockByNameTargetError) {
 }
 
 TEST_F(DistLockCatalogFixture, GetLockByNameRunCmdError) {
-    shutdownShardRegistry();
+    shutdownExecutor();
 
     auto status = catalog()->getLockByName(txn(), "x").getStatus();
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, status.code());
@@ -1628,8 +1666,9 @@ TEST_F(DistLockCatalogFixture, GetLockByNameNotFound) {
         ASSERT_FALSE(status.reason().empty());
     });
 
-    onFindCommand([](const RemoteCommandRequest& request)
-                      -> StatusWith<vector<BSONObj>> { return std::vector<BSONObj>(); });
+    onFindCommand([](const RemoteCommandRequest& request) -> StatusWith<vector<BSONObj>> {
+        return std::vector<BSONObj>();
+    });
 
     future.timed_get(kFutureTimeout);
 }

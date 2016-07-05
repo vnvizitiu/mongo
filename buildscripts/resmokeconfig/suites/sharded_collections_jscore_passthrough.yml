@@ -76,6 +76,10 @@ executor:
       shell_options:
         readMode: commands
         eval: load("jstests/libs/override_methods/implicitly_shard_accessed_collections.js")
+    hooks:
+    - class: ValidateCollections
+    - class: CleanEveryN
+      n: 20
     fixture:
       class: ShardedClusterFixture
       mongos_options:

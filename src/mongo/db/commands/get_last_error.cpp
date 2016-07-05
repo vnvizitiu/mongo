@@ -32,12 +32,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern.h"
@@ -56,7 +56,7 @@ using std::stringstream;
 */
 class CmdResetError : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -83,7 +83,7 @@ public:
 class CmdGetLastError : public Command {
 public:
     CmdGetLastError() : Command("getLastError", false, "getlasterror") {}
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -262,15 +262,13 @@ public:
             }
         }
 
-        txn->setWriteConcern(writeConcern);
-        setupSynchronousCommit(txn);
         {
             stdx::lock_guard<Client> lk(*txn->getClient());
             txn->setMessage_inlock("waiting for write concern");
         }
 
         WriteConcernResult wcResult;
-        status = waitForWriteConcern(txn, lastOpTime, txn->getWriteConcern(), &wcResult);
+        status = waitForWriteConcern(txn, lastOpTime, writeConcern, &wcResult);
         wcResult.appendTo(writeConcern, &result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0
@@ -289,7 +287,7 @@ public:
 
 class CmdGetPrevError : public Command {
 public:
-    virtual bool isWriteCommandForConfigServer() const {
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void help(stringstream& help) const {

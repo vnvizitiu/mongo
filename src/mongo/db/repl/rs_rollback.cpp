@@ -37,24 +37,23 @@
 #include <memory>
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -62,6 +61,7 @@
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/util/log.h"
 
 /* Scenarios
@@ -393,7 +393,7 @@ void syncFixUp(OperationContext* txn,
     // online until we get to that point in freshness.
     OpTime minValid = fassertStatusOK(28774, OpTime::parseFromOplogEntry(newMinValid));
     log() << "minvalid=" << minValid;
-    setMinValid(txn, {OpTime{}, minValid});
+    StorageInterface::get(txn)->setMinValid(txn, {OpTime{}, minValid});
 
     // any full collection resyncs required?
     if (!fixUpInfo.collectionsToResyncData.empty() ||
@@ -454,7 +454,8 @@ void syncFixUp(OperationContext* txn,
                 auto status = options.parse(optionsField.Obj());
                 if (!status.isOK()) {
                     throw RSFatalException(str::stream() << "Failed to parse options " << info
-                                                         << ": " << status.toString());
+                                                         << ": "
+                                                         << status.toString());
                 }
             } else {
                 // Use default options.
@@ -467,19 +468,19 @@ void syncFixUp(OperationContext* txn,
 
             auto status = collection->setValidator(txn, options.validator);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validator: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validator: "
+                                                     << status.toString());
             }
             status = collection->setValidationAction(txn, options.validationAction);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validationAction: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validationAction: "
+                                                     << status.toString());
             }
 
             status = collection->setValidationLevel(txn, options.validationLevel);
             if (!status.isOK()) {
-                throw RSFatalException(str::stream()
-                                       << "Failed to set validationLevel: " << status.toString());
+                throw RSFatalException(str::stream() << "Failed to set validationLevel: "
+                                                     << status.toString());
             }
 
             wuow.commit();
@@ -498,7 +499,7 @@ void syncFixUp(OperationContext* txn,
                 OpTime minValid = fassertStatusOK(28775, OpTime::parseFromOplogEntry(newMinValid));
                 log() << "minvalid=" << minValid;
                 const OpTime start{fixUpInfo.commonPoint, OpTime::kUninitializedTerm};
-                setMinValid(txn, {start, minValid});
+                StorageInterface::get(txn)->setMinValid(txn, {start, minValid});
             }
         } catch (const DBException& e) {
             err = "can't get/set minvalid: ";
@@ -681,9 +682,10 @@ void syncFixUp(OperationContext* txn,
                                 // TODO: IIRC cappedTruncateAfter does not handle completely
                                 // empty.
                                 // this will crazy slow if no _id index.
-                                long long start = Listener::getElapsedTimeMillis();
+                                const auto clock = txn->getServiceContext()->getFastClockSource();
+                                const auto findOneStart = clock->now();
                                 RecordId loc = Helpers::findOne(txn, collection, pattern, false);
-                                if (Listener::getElapsedTimeMillis() - start > 200)
+                                if (clock->now() - findOneStart > Milliseconds(200))
                                     warning() << "roll back slow no _id index for " << doc.ns
                                               << " perhaps?";
                                 // would be faster but requires index:
@@ -741,7 +743,6 @@ void syncFixUp(OperationContext* txn,
                     }
                 } else {
                     // TODO faster...
-                    OpDebug debug;
                     updates++;
 
                     const NamespaceString requestNs(doc.ns);
@@ -751,10 +752,10 @@ void syncFixUp(OperationContext* txn,
                     request.setUpdates(idAndDoc.second);
                     request.setGod();
                     request.setUpsert();
-                    UpdateLifecycleImpl updateLifecycle(true, requestNs);
+                    UpdateLifecycleImpl updateLifecycle(requestNs);
                     request.setLifecycle(&updateLifecycle);
 
-                    update(txn, ctx.db(), request, &debug);
+                    update(txn, ctx.db(), request);
                 }
             } catch (const DBException& e) {
                 log() << "exception in rollback ns:" << doc.ns << ' ' << pattern.toString() << ' '
@@ -822,7 +823,8 @@ Status _syncRollback(OperationContext* txn,
         if (!replCoord->setFollowerMode(MemberState::RS_ROLLBACK)) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Cannot transition from "
-                                        << replCoord->getMemberState().toString() << " to "
+                                        << replCoord->getMemberState().toString()
+                                        << " to "
                                         << MemberState(MemberState::RS_ROLLBACK).toString());
         }
     }
@@ -833,8 +835,9 @@ Status _syncRollback(OperationContext* txn,
     {
         log() << "rollback 2 FindCommonPoint";
         try {
-            auto processOperationForFixUp =
-                [&how](const BSONObj& operation) { return refetch(how, operation); };
+            auto processOperationForFixUp = [&how](const BSONObj& operation) {
+                return refetch(how, operation);
+            };
             auto res = syncRollBackLocalOperations(
                 localOplog, rollbackSource.getOplog(), processOperationForFixUp);
             if (!res.isOK()) {
@@ -856,7 +859,8 @@ Status _syncRollback(OperationContext* txn,
             return Status(ErrorCodes::UnrecoverableRollbackError,
                           str::stream()
                               << "need to rollback, but unable to determine common point between"
-                                 " local and remote oplog: " << e.what(),
+                                 " local and remote oplog: "
+                              << e.what(),
                           18752);
         } catch (const DBException& e) {
             warning() << "rollback 2 exception " << e.toString() << "; sleeping 1 min";
@@ -879,24 +883,12 @@ Status _syncRollback(OperationContext* txn,
     } catch (...) {
         replCoord->incrementRollbackID();
 
-        if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
-            warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
-                      << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                      << " but found self in " << replCoord->getMemberState();
-        }
-
         throw;
     }
     replCoord->incrementRollbackID();
 
-    // success - leave "ROLLBACK" state
-    // can go to SECONDARY once minvalid is achieved
-    if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
-        warning() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
-                  << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                  << " but found self in " << replCoord->getMemberState();
-    }
-
+    // Success; leave "ROLLBACK" state intact until applier thread has reloaded the new minValid.
+    // Otherwise, the applier could transition the node to SECONDARY with an out-of-date minValid.
     return Status::OK();
 }
 
@@ -924,11 +916,9 @@ Status syncRollback(OperationContext* txn,
                     const OplogInterface& localOplog,
                     const RollbackSource& rollbackSource,
                     ReplicationCoordinator* replCoord) {
-    return syncRollback(txn,
-                        localOplog,
-                        rollbackSource,
-                        replCoord,
-                        [](Seconds seconds) { sleepsecs(durationCount<Seconds>(seconds)); });
+    return syncRollback(txn, localOplog, rollbackSource, replCoord, [](Seconds seconds) {
+        sleepsecs(durationCount<Seconds>(seconds));
+    });
 }
 
 }  // namespace repl

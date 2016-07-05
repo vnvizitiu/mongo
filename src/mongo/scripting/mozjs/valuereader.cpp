@@ -32,8 +32,10 @@
 
 #include "mongo/scripting/mozjs/valuereader.h"
 
+#include <cmath>
 #include <cstdio>
 #include <js/CharacterEncoding.h>
+#include <js/Date.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/platform/decimal128.h"
@@ -89,7 +91,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             return;
         }
         case mongo::NumberDouble:
-            _value.setDouble(elem.Number());
+            fromDouble(elem.Number());
             return;
         case mongo::NumberInt:
             _value.setInt32(elem.Int());
@@ -117,7 +119,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             return;
         case mongo::Date:
             _value.setObjectOrNull(
-                JS_NewDateObjectMsec(_context, elem.Date().toMillisSinceEpoch()));
+                JS::NewDateObject(_context, JS::TimeClip(elem.Date().toMillisSinceEpoch())));
             return;
         case mongo::Bool:
             _value.setBoolean(elem.Bool());
@@ -162,33 +164,19 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
         case mongo::bsonTimestamp: {
             JS::AutoValueArray<2> args(_context);
 
-            args[0].setDouble(elem.timestampTime().toMillisSinceEpoch() / 1000);
-            args[1].setNumber(elem.timestampInc());
+            ValueReader(_context, args[0])
+                .fromDouble(elem.timestampTime().toMillisSinceEpoch() / 1000);
+            ValueReader(_context, args[1]).fromDouble(elem.timestampInc());
 
             scope->getProto<TimestampInfo>().newInstance(args, _value);
 
             return;
         }
         case mongo::NumberLong: {
-            unsigned long long nativeUnsignedLong = elem.numberLong();
-            // values above 2^53 are not accurately represented in JS
-            if (static_cast<long long>(nativeUnsignedLong) ==
-                    static_cast<long long>(
-                        static_cast<double>(static_cast<long long>(nativeUnsignedLong))) &&
-                nativeUnsignedLong < 9007199254740992ULL) {
-                JS::AutoValueArray<1> args(_context);
-                args[0].setNumber(static_cast<double>(static_cast<long long>(nativeUnsignedLong)));
-
-                scope->getProto<NumberLongInfo>().newInstance(args, _value);
-            } else {
-                JS::AutoValueArray<3> args(_context);
-                args[0].setNumber(static_cast<double>(static_cast<long long>(nativeUnsignedLong)));
-                args[1].setDouble(nativeUnsignedLong >> 32);
-                args[2].setDouble(
-                    static_cast<unsigned long>(nativeUnsignedLong & 0x00000000ffffffff));
-                scope->getProto<NumberLongInfo>().newInstance(args, _value);
-            }
-
+            JS::RootedObject thisv(_context);
+            scope->getProto<NumberLongInfo>().newObject(&thisv);
+            JS_SetPrivate(thisv, new int64_t(elem.numberLong()));
+            _value.setObjectOrNull(thisv);
             return;
         }
         case mongo::NumberDecimal: {
@@ -307,6 +295,22 @@ void ValueReader::fromStringData(StringData sd) {
  */
 void ValueReader::fromDecimal128(Decimal128 decimal) {
     NumberDecimalInfo::make(_context, _value, decimal);
+}
+
+/**
+ * SpiderMonkey has a nasty habit of interpreting certain NaN patterns as other boxed types (it
+ * assumes that only one kind of NaN exists in JS, rather than the full ieee754 spectrum).  Thus we
+ * have to flow all double setting through a wrapper which ensures that nan's are coerced to the
+ * canonical javascript NaN.
+ *
+ * See SERVER-24054 for more details.
+ */
+void ValueReader::fromDouble(double d) {
+    if (std::isnan(d)) {
+        _value.set(JS_GetNaNValue(_context));
+    } else {
+        _value.setDouble(d);
+    }
 }
 
 }  // namespace mozjs

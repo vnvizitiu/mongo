@@ -56,8 +56,8 @@ void DocumentSource::registerParser(string name, Parser parser) {
     parserMap[name] = parser;
 }
 
-intrusive_ptr<DocumentSource> DocumentSource::parse(const intrusive_ptr<ExpressionContext> expCtx,
-                                                    BSONObj stageObj) {
+vector<intrusive_ptr<DocumentSource>> DocumentSource::parse(
+    const intrusive_ptr<ExpressionContext> expCtx, BSONObj stageObj) {
     uassert(16435,
             "A pipeline stage specification object must contain exactly one field.",
             stageObj.nFields() == 1);
@@ -66,9 +66,11 @@ intrusive_ptr<DocumentSource> DocumentSource::parse(const intrusive_ptr<Expressi
 
     // Get the registered parser and call that.
     auto it = parserMap.find(stageName);
+
     uassert(16436,
             str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
             it != parserMap.end());
+
     return it->second(stageSpec, expCtx);
 }
 
@@ -79,7 +81,6 @@ const char* DocumentSource::getSourceName() const {
 
 void DocumentSource::setSource(DocumentSource* pTheSource) {
     verify(!isValidInitialSource());
-    verify(!pSource);
     pSource = pTheSource;
 }
 
@@ -98,5 +99,54 @@ void DocumentSource::serializeToArray(vector<Value>& array, bool explain) const 
     if (!entry.missing()) {
         array.push_back(entry);
     }
+}
+
+BSONObjSet DocumentSource::allPrefixes(BSONObj obj) {
+    BSONObjSet out;
+
+    BSONObj last = {};
+    for (auto&& field : obj) {
+        BSONObjBuilder builder(last.objsize() + field.size());
+        builder.appendElements(last);
+        builder.append(field);
+        last = builder.obj();
+        out.insert(last);
+    }
+
+    return out;
+}
+
+BSONObjSet DocumentSource::truncateSortSet(const BSONObjSet& sorts,
+                                           const std::set<std::string>& fields) {
+    BSONObjSet out;
+
+    for (auto&& sort : sorts) {
+        BSONObjBuilder outputSort;
+
+        for (auto&& key : sort) {
+            auto keyName = key.fieldNameStringData();
+
+            bool shouldAppend = true;
+            for (auto&& field : fields) {
+                if (keyName == field || keyName.startsWith(field + '.')) {
+                    shouldAppend = false;
+                    break;
+                }
+            }
+
+            if (!shouldAppend) {
+                break;
+            }
+
+            outputSort.append(key);
+        }
+
+        BSONObj outSortObj = outputSort.obj();
+        if (!outSortObj.isEmpty()) {
+            out.insert(outSortObj);
+        }
+    }
+
+    return out;
 }
 }

@@ -9,18 +9,6 @@
 #include "wt_internal.h"
 
 /*
- * __wt_metadata_init --
- *	Metadata initialization.
- */
-void
-__wt_metadata_init(WT_SESSION_IMPL *session)
-{
-	/* We cache the metadata file's URI hash for fast detection. */
-	S2C(session)->meta_uri_hash =
-	    __wt_hash_city64(WT_METAFILE_URI, strlen(WT_METAFILE_URI));
-}
-
-/*
  * __metadata_turtle --
  *	Return if a key's value should be taken from the turtle file.
  */
@@ -67,18 +55,16 @@ __wt_metadata_cursor_open(
 	btree = ((WT_CURSOR_BTREE *)(*cursorp))->btree;
 
 	/* 
-	 * Set special flags for the metadata file: eviction (the metadata file
-	 * is in-memory and never evicted), logging (the metadata file is always
-	 * logged if possible).
+	 * Special settings for metadata: skew eviction so metadata almost
+	 * always stays in cache and make sure metadata is logged if possible.
 	 *
-	 * Test flags before setting them so updates can't race in subsequent
-	 * opens (the first update is safe because it's single-threaded from
+	 * Test before setting so updates can't race in subsequent opens (the
+	 * first update is safe because it's single-threaded from
 	 * wiredtiger_open).
 	 */
-	if (!F_ISSET(btree, WT_BTREE_IN_MEMORY))
-		F_SET(btree, WT_BTREE_IN_MEMORY);
-	if (!F_ISSET(btree, WT_BTREE_NO_EVICTION))
-		F_SET(btree, WT_BTREE_NO_EVICTION);
+	if (btree->evict_priority == 0)
+		WT_WITH_BTREE(session, btree,
+		    __wt_evict_priority_set(session, WT_EVICT_INT_SKEW));
 	if (F_ISSET(btree, WT_BTREE_NO_LOGGING))
 		F_CLR(btree, WT_BTREE_NO_LOGGING);
 
@@ -292,6 +278,10 @@ __wt_metadata_search(WT_SESSION_IMPL *session, const char *key, char **valuep)
 
 	WT_ERR(cursor->get_value(cursor, &value));
 	WT_ERR(__wt_strdup(session, value, valuep));
+
 err:	WT_TRET(__wt_metadata_cursor_release(session, &cursor));
+
+	if (ret != 0)
+		__wt_free(session, *valuep);
 	return (ret);
 }
