@@ -26,9 +26,11 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/query/plan_executor.h"
 
-
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -268,7 +270,7 @@ BSONObjSet PlanExecutor::getOutputSorts() const {
         }
     }
 
-    return BSONObjSet();
+    return SimpleBSONObjComparator::kInstance.makeBSONObjSet();
 }
 
 OperationContext* PlanExecutor::getOpCtx() const {
@@ -517,29 +519,6 @@ void PlanExecutor::deregisterExec() {
 
 void PlanExecutor::kill(string reason) {
     _killReason = std::move(reason);
-
-    // XXX: PlanExecutor is designed to wrap a single execution tree. In the case of
-    // aggregation queries, PlanExecutor wraps a proxy stage responsible for pulling results
-    // from an aggregation pipeline. The aggregation pipeline pulls results from yet another
-    // PlanExecutor. Such nested PlanExecutors require us to manually propagate kill() to
-    // the "inner" executor. This is bad, and hopefully can be fixed down the line with the
-    // unification of agg and query.
-    //
-    // The CachedPlanStage is another special case. It needs to update the plan cache from
-    // its destructor. It needs to know whether it has been killed so that it can avoid
-    // touching a potentially invalid plan cache in this case.
-    //
-    // TODO: get rid of this code block.
-    {
-        PlanStage* foundStage = getStageByType(_root.get(), STAGE_PIPELINE_PROXY);
-        if (foundStage) {
-            PipelineProxyStage* proxyStage = static_cast<PipelineProxyStage*>(foundStage);
-            shared_ptr<PlanExecutor> childExec = proxyStage->getChildExecutor();
-            if (childExec) {
-                childExec->kill(*_killReason);
-            }
-        }
-    }
 }
 
 Status PlanExecutor::executePlan() {
@@ -551,12 +530,18 @@ Status PlanExecutor::executePlan() {
     }
 
     if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
+        if (killed()) {
+            return Status(ErrorCodes::QueryPlanKilled,
+                          str::stream() << "Operation aborted because: " << *_killReason);
+        }
+
         return Status(ErrorCodes::OperationFailed,
                       str::stream() << "Exec error: " << WorkingSetCommon::toStatusString(obj)
                                     << ", state: "
                                     << PlanExecutor::statestr(state));
     }
 
+    invariant(!killed());
     invariant(PlanExecutor::IS_EOF == state);
     return Status::OK();
 }

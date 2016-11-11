@@ -37,6 +37,7 @@
 
 #include <limits>
 
+#include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
@@ -148,7 +149,7 @@ Status WiredTigerUtil::getApplicationMetadata(OperationContext* opCtx,
     WT_CONFIG_ITEM keyItem;
     WT_CONFIG_ITEM valueItem;
     int ret;
-    unordered_set<StringData, StringData::Hasher> keysSeen;
+    auto keysSeen = SimpleStringDataComparator::kInstance.makeStringDataUnorderedSet();
     while ((ret = parser.next(&keyItem, &valueItem)) == 0) {
         const StringData key(keyItem.str, keyItem.len);
         if (keysSeen.count(key)) {
@@ -256,6 +257,11 @@ Status WiredTigerUtil::checkTableCreationOptions(const BSONElement& configElem) 
     ErrorAccumulator eventHandler(&errors);
 
     StringData config = configElem.valueStringData();
+    // Do NOT allow embedded null characters
+    if (config.size() != strlen(config.rawData())) {
+        return {ErrorCodes::FailedToParse, "malformed 'configString' value."};
+    }
+
     Status status = wtRCToStatus(
         wiredtiger_config_validate(nullptr, &eventHandler, "WT_SESSION.create", config.rawData()));
     if (!status.isOK()) {
@@ -351,7 +357,7 @@ int mdb_handle_error(WT_EVENT_HANDLER* handler,
                      int errorCode,
                      const char* message) {
     try {
-        error() << "WiredTiger (" << errorCode << ") " << message;
+        error() << "WiredTiger error (" << errorCode << ") " << redact(message);
         fassert(28558, errorCode != WT_PANIC);
     } catch (...) {
         std::terminate();
@@ -361,7 +367,7 @@ int mdb_handle_error(WT_EVENT_HANDLER* handler,
 
 int mdb_handle_message(WT_EVENT_HANDLER* handler, WT_SESSION* session, const char* message) {
     try {
-        log() << "WiredTiger " << message;
+        log() << "WiredTiger message " << redact(message);
     } catch (...) {
         std::terminate();
     }
@@ -373,7 +379,7 @@ int mdb_handle_progress(WT_EVENT_HANDLER* handler,
                         const char* operation,
                         uint64_t progress) {
     try {
-        log() << "WiredTiger progress " << operation << " " << progress;
+        log() << "WiredTiger progress " << redact(operation) << " " << progress;
     } catch (...) {
         std::terminate();
     }
@@ -421,7 +427,7 @@ int WiredTigerUtil::verifyTable(OperationContext* txn,
     // Try to close as much as possible to avoid EBUSY errors.
     WiredTigerRecoveryUnit::get(txn)->getSession(txn)->closeAllCursors();
     WiredTigerSessionCache* sessionCache = WiredTigerRecoveryUnit::get(txn)->getSessionCache();
-    sessionCache->closeAll();
+    sessionCache->closeAllCursors();
 
     // Open a new session with custom error handlers.
     WT_CONNECTION* conn = WiredTigerRecoveryUnit::get(txn)->getSessionCache()->conn();

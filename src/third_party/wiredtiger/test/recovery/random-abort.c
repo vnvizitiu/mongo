@@ -91,7 +91,8 @@ thread_run(void *arg)
 	if ((fp = fopen(buf, "w")) == NULL)
 		testutil_die(errno, "fopen");
 	/*
-	 * Set to no buffering.
+	 * Set to line buffering.  But that is advisory only.  We've seen
+	 * cases where the result files end up with partial lines.
 	 */
 	__wt_stream_set_line_buffer(fp);
 	if ((ret = td->conn->open_session(td->conn, NULL, NULL, &session)) != 0)
@@ -178,8 +179,6 @@ fill_db(uint32_t nth)
 extern int __wt_optind;
 extern char *__wt_optarg;
 
-void (*custom_die)(void) = NULL;
-
 int
 main(int argc, char *argv[])
 {
@@ -188,7 +187,7 @@ main(int argc, char *argv[])
 	WT_CURSOR *cursor;
 	WT_SESSION *session;
 	WT_RAND_STATE rnd;
-	uint64_t key;
+	uint64_t key, last_key;
 	uint32_t absent, count, i, nth, timeout;
 	int ch, status, ret;
 	pid_t pid;
@@ -244,7 +243,7 @@ main(int argc, char *argv[])
 	if (!verify_only) {
 		testutil_make_work_dir(home);
 
-		testutil_assert(__wt_random_init_seed(NULL, &rnd) == 0);
+		__wt_random_init_seed(NULL, &rnd);
 		if (rand_time) {
 			timeout = __wt_random(&rnd) % MAX_TIME;
 			if (timeout < MIN_TIME)
@@ -317,12 +316,23 @@ main(int argc, char *argv[])
 		 * in the table after recovery.  Since we did write-no-sync, we
 		 * expect every key to have been recovered.
 		 */
-		for (;; ++count) {
+		for (last_key = UINT64_MAX;; ++count, last_key = key) {
 			ret = fscanf(fp, "%" SCNu64 "\n", &key);
 			if (ret != EOF && ret != 1)
 				testutil_die(errno, "fscanf");
 			if (ret == EOF)
 				break;
+			/*
+			 * If we're unlucky, the last line may be a partially
+			 * written key at the end that can result in a false
+			 * negative error for a missing record.  Detect it.
+			 */
+			if (last_key != UINT64_MAX && key != last_key + 1) {
+				printf("%s: Ignore partial record %" PRIu64
+				    " last valid key %" PRIu64 "\n",
+				    fname, key, last_key);
+				break;
+			}
 			snprintf(kname, sizeof(kname), "%" PRIu64, key);
 			cursor->set_key(cursor, kname);
 			if ((ret = cursor->search(cursor)) != 0) {

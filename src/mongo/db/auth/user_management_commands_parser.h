@@ -35,6 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/privilege_format.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
@@ -51,7 +52,6 @@ struct CreateOrUpdateUserArgs {
     BSONObj customData;
     bool hasRoles;
     std::vector<RoleName> roles;
-    BSONObj writeConcern;
 
     CreateOrUpdateUserArgs() : hasHashedPassword(false), hasCustomData(false), hasRoles(false) {}
 };
@@ -114,9 +114,10 @@ Status parseUsersInfoCommand(const BSONObj& cmdObj, StringData dbname, UsersInfo
 struct RolesInfoArgs {
     std::vector<RoleName> roleNames;
     bool allForDB;
-    bool showPrivileges;
+    PrivilegeFormat privilegeFormat;
     bool showBuiltinRoles;
-    RolesInfoArgs() : allForDB(false), showPrivileges(false), showBuiltinRoles(false) {}
+    RolesInfoArgs()
+        : allForDB(false), privilegeFormat(PrivilegeFormat::kOmit), showBuiltinRoles(false) {}
 };
 
 /**
@@ -131,7 +132,7 @@ struct CreateOrUpdateRoleArgs {
     std::vector<RoleName> roles;
     bool hasPrivileges;
     PrivilegeVector privileges;
-    BSONObj writeConcern;
+
     CreateOrUpdateRoleArgs() : hasRoles(false), hasPrivileges(false) {}
 };
 
@@ -200,7 +201,7 @@ struct MergeAuthzCollectionsArgs {
     std::string rolesCollName;
     std::string db;
     bool drop;
-    BSONObj writeConcern;
+
     MergeAuthzCollectionsArgs() : drop(false) {}
 };
 
@@ -218,7 +219,6 @@ Status parseMergeAuthzCollectionsCommand(const BSONObj& cmdObj,
 struct AuthSchemaUpgradeArgs {
     int maxSteps = 3;
     bool shouldUpgradeShards = true;
-    BSONObj writeConcern;
 };
 
 /**

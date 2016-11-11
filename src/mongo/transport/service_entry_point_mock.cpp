@@ -86,11 +86,11 @@ ServiceEntryPointMock::~ServiceEntryPointMock() {
     }
 }
 
-void ServiceEntryPointMock::startSession(transport::Session&& session) {
+void ServiceEntryPointMock::startSession(transport::SessionHandle session) {
     _threads.emplace_back(&ServiceEntryPointMock::run, this, std::move(session));
 }
 
-void ServiceEntryPointMock::run(transport::Session&& session) {
+void ServiceEntryPointMock::run(transport::SessionHandle session) {
     Message inMessage;
     while (true) {
         {
@@ -100,16 +100,12 @@ void ServiceEntryPointMock::run(transport::Session&& session) {
         }
 
         // sourceMessage()
-        auto sourceTicket = _tl->sourceMessage(session, &inMessage);
-        auto sourceRes = _tl->wait(std::move(sourceTicket));
-        if (!sourceRes.isOK()) {
+        if (!session->sourceMessage(&inMessage).wait().isOK()) {
             break;
         }
 
         // sinkMessage()
-        auto sinkTicket = _tl->sinkMessage(session, _outMessage);
-        auto sinkRes = _tl->wait(std::move(sinkTicket));
-        if (!sinkRes.isOK()) {
+        if (!session->sinkMessage(_outMessage).wait().isOK()) {
             break;
         }
     }

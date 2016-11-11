@@ -32,6 +32,7 @@
 
 #include "mongo/platform/atomic_word.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace transport {
@@ -42,45 +43,30 @@ AtomicUInt64 sessionIdCounter(0);
 
 }  // namespace
 
-Session::Session(HostAndPort remote, HostAndPort local, TransportLayer* tl)
-    : _id(sessionIdCounter.addAndFetch(1)), _remote(remote), _local(local), _tl(tl) {}
+Session::Session() : _id(sessionIdCounter.addAndFetch(1)), _tags(kEmptyTagMask) {}
 
-Session::~Session() {
-    if (_tl != nullptr) {
-        invariant(_tl);
-        _tl->end(*this);
-    }
+Ticket Session::sourceMessage(Message* message, Date_t expiration) {
+    return getTransportLayer()->sourceMessage(shared_from_this(), message, expiration);
 }
 
-Session::Session(Session&& other)
-    : _id(other._id),
-      _remote(std::move(other._remote)),
-      _local(std::move(other._local)),
-      _tl(other._tl) {
-    // We do not want to call tl->end() on moved-from Sessions.
-    other._tl = nullptr;
+Ticket Session::sinkMessage(const Message& message, Date_t expiration) {
+    return getTransportLayer()->sinkMessage(shared_from_this(), message, expiration);
 }
 
-Session& Session::operator=(Session&& other) {
-    _id = other._id;
-    _remote = std::move(other._remote);
-    _local = std::move(other._local);
-    _tl = other._tl;
-    _tl = nullptr;
-
-    return *this;
+SSLPeerInfo Session::getX509PeerInfo() const {
+    return getTransportLayer()->getX509PeerInfo(shared_from_this());
 }
 
-Session::SessionId Session::id() const {
-    return _id;
+void Session::replaceTags(TagMask tags) {
+    _tags = tags;
 }
 
-const HostAndPort& Session::remote() const {
-    return _remote;
+Session::TagMask Session::getTags() const {
+    return _tags;
 }
 
-const HostAndPort& Session::local() const {
-    return _local;
+MessageCompressorManager& Session::getCompressorManager() {
+    return _messageCompressorManager;
 }
 
 }  // namespace transport

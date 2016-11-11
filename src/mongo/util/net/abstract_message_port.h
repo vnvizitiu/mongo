@@ -32,8 +32,10 @@
 
 #include "mongo/config.h"
 #include "mongo/logger/log_severity.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/sockaddr.h"
+#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -85,7 +87,12 @@ public:
     /**
      * Sends the message.
      */
-    virtual void say(Message& toSend, int responseTo = 0) = 0;
+    virtual void say(Message& toSend, int responseTo) = 0;
+
+    /**
+     * Sends the message (does not set headers).
+     */
+    virtual void say(const Message& toSend) = 0;
 
     /**
      * Sends the data over the socket.
@@ -149,14 +156,14 @@ public:
     virtual long long getBytesOut() const = 0;
 
     /**
-     * Set the x509 subject name (used for SSL).
+     * Set the x509 peer information (used for SSL).
      */
-    virtual void setX509SubjectName(const std::string& x509SubjectName) = 0;
+    virtual void setX509PeerInfo(SSLPeerInfo x509PeerInfo) = 0;
 
     /**
-     * Get the current x509 subject name (used for SSL).
+     * Get the current x509 peer information (used for SSL).
      */
-    virtual std::string getX509SubjectName() const = 0;
+    virtual const SSLPeerInfo& getX509PeerInfo() const = 0;
 
     /**
      * Set the connection ID.

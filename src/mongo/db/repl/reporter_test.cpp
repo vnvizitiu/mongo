@@ -46,6 +46,8 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
+using ResponseStatus = mongo::executor::TaskExecutor::ResponseStatus;
+
 class MockProgressManager {
 public:
     void updateMap(int memberId, const OpTime& lastDurableOpTime, const OpTime& lastAppliedOpTime) {
@@ -120,8 +122,7 @@ public:
      */
     BSONObj processNetworkResponse(const BSONObj& obj,
                                    bool expectReadyRequestsAfterProcessing = false);
-    BSONObj processNetworkResponse(ErrorCodes::Error code,
-                                   const std::string& reason,
+    BSONObj processNetworkResponse(const ResponseStatus rs,
                                    bool expectReadyRequestsAfterProcessing = false);
 
     void runUntil(Date_t when, bool expectReadyRequestsAfterAdvancingClock = false);
@@ -210,12 +211,11 @@ BSONObj ReporterTest::processNetworkResponse(const BSONObj& obj,
     return cmdObj;
 }
 
-BSONObj ReporterTest::processNetworkResponse(ErrorCodes::Error code,
-                                             const std::string& reason,
+BSONObj ReporterTest::processNetworkResponse(const ResponseStatus rs,
                                              bool expectReadyRequestsAfterProcessing) {
     auto net = getNet();
     net->enterNetwork();
-    auto cmdObj = net->scheduleErrorResponse({code, reason}).cmdObj;
+    auto cmdObj = net->scheduleErrorResponse(rs).cmdObj;
     net->runReadyNetworkOperations();
     ASSERT_EQUALS(expectReadyRequestsAfterProcessing, net->hasReadyRequests());
     net->exitNetwork();
@@ -320,7 +320,7 @@ TEST_F(ReporterTest, TaskExecutorAndNetworkErrorsStopTheReporter) {
     ASSERT_TRUE(reporter->isActive());
     ASSERT_TRUE(reporter->isWaitingToSendReport());
 
-    processNetworkResponse(ErrorCodes::NoSuchKey, "waaaah");
+    processNetworkResponse({ErrorCodes::NoSuchKey, "waaaah", Milliseconds(0)});
 
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, reporter->join());
     assertReporterDone();
@@ -397,7 +397,7 @@ TEST_F(
         processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::BadValue) << "errmsg"
                                          << "Unexpected field durableOpTime in UpdateInfoArgs"),
                                true);
-    ASSERT_EQUALS(expectedNewStyleCommandRequest, commandRequest);
+    ASSERT_BSONOBJ_EQ(expectedNewStyleCommandRequest, commandRequest);
 
     // Update command object should match old style (pre-3.2.4).
     auto expectedOldStyleCommandRequest = unittest::assertGet(prepareReplSetUpdatePositionCommandFn(
@@ -408,7 +408,7 @@ TEST_F(
                   << "newer config"
                   << "configVersion"
                   << posUpdater->getConfigVersion() + 1));
-    ASSERT_EQUALS(expectedOldStyleCommandRequest, commandRequest);
+    ASSERT_BSONOBJ_EQ(expectedOldStyleCommandRequest, commandRequest);
 
     ASSERT_TRUE(reporter->isActive());
 }
@@ -543,7 +543,7 @@ TEST_F(ReporterTest,
         processNetworkResponse(BSON("ok" << 0 << "code" << int(ErrorCodes::BadValue) << "errmsg"
                                          << "Unexpected field durableOpTime in UpdateInfoArgs"),
                                true);
-    ASSERT_EQUALS(expectedNewStyleCommandRequest, commandRequest);
+    ASSERT_BSONOBJ_EQ(expectedNewStyleCommandRequest, commandRequest);
 
     auto expectedOldStyleCommandRequest = unittest::assertGet(prepareReplSetUpdatePositionCommandFn(
         ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
@@ -551,8 +551,8 @@ TEST_F(ReporterTest,
     commandRequest = processNetworkResponse(BSON("ok" << 1));
 
     // Update command object should match old style (pre-3.2.2).
-    ASSERT_NOT_EQUALS(expectedNewStyleCommandRequest, expectedOldStyleCommandRequest);
-    ASSERT_EQUALS(expectedOldStyleCommandRequest, commandRequest);
+    ASSERT_BSONOBJ_NE(expectedNewStyleCommandRequest, expectedOldStyleCommandRequest);
+    ASSERT_BSONOBJ_EQ(expectedOldStyleCommandRequest, commandRequest);
 
     reporter->shutdown();
 
@@ -561,7 +561,7 @@ TEST_F(ReporterTest,
 }
 
 TEST_F(ReporterTest, FailedUpdateShouldNotRescheduleUpdate) {
-    processNetworkResponse(ErrorCodes::OperationFailed, "update failed");
+    processNetworkResponse({ErrorCodes::OperationFailed, "update failed", Milliseconds(0)});
 
     ASSERT_EQUALS(ErrorCodes::OperationFailed, reporter->join());
     assertReporterDone();
@@ -576,7 +576,7 @@ TEST_F(ReporterTest, SuccessfulUpdateShouldRescheduleUpdate) {
 
     runUntil(until, true);
 
-    processNetworkResponse(ErrorCodes::OperationFailed, "update failed");
+    processNetworkResponse({ErrorCodes::OperationFailed, "update failed", Milliseconds(0)});
 
     ASSERT_EQUALS(ErrorCodes::OperationFailed, reporter->join());
     assertReporterDone();

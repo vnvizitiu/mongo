@@ -32,13 +32,11 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/index_create.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/task_runner.h"
-#include "mongo/util/concurrency/old_thread_pool.h"
 
 namespace mongo {
 namespace repl {
@@ -50,6 +48,7 @@ public:
     static const char kDefaultMinValidNamespace[];
     static const char kInitialSyncFlagFieldName[];
     static const char kBeginFieldName[];
+    static const char kOplogDeleteFromPointFieldName[];
 
     StorageInterfaceImpl();
     explicit StorageInterfaceImpl(const NamespaceString& minValidNss);
@@ -69,13 +68,13 @@ public:
 
     void clearInitialSyncFlag(OperationContext* txn) override;
 
-    BatchBoundaries getMinValid(OperationContext* txn) const override;
-
-    void setMinValid(OperationContext* ctx,
-                     const OpTime& endOpTime,
-                     const DurableRequirement durReq) override;
-
-    void setMinValid(OperationContext* ctx, const BatchBoundaries& boundaries) override;
+    OpTime getMinValid(OperationContext* txn) const override;
+    void setMinValid(OperationContext* txn, const OpTime& minValid) override;
+    void setMinValidToAtLeast(OperationContext* txn, const OpTime& endOpTime) override;
+    void setOplogDeleteFromPoint(OperationContext* txn, const Timestamp& timestamp) override;
+    Timestamp getOplogDeleteFromPoint(OperationContext* txn) override;
+    void setAppliedThrough(OperationContext* txn, const OpTime& optime) override;
+    OpTime getAppliedThrough(OperationContext* txn) override;
 
     /**
      *  Allocates a new TaskRunner for use by the passed in collection.
@@ -97,6 +96,7 @@ public:
     Status dropReplicatedDatabases(OperationContext* txn) override;
 
     Status createOplog(OperationContext* txn, const NamespaceString& nss) override;
+    StatusWith<size_t> getOplogMaxSize(OperationContext* txn, const NamespaceString& nss) override;
 
     Status createCollection(OperationContext* txn,
                             const NamespaceString& nss,
@@ -104,29 +104,30 @@ public:
 
     Status dropCollection(OperationContext* txn, const NamespaceString& nss) override;
 
-    StatusWith<BSONObj> findOne(OperationContext* txn,
-                                const NamespaceString& nss,
-                                const BSONObj& indexKeyPattern,
-                                ScanDirection scanDirection) override;
+    StatusWith<std::vector<BSONObj>> findDocuments(OperationContext* txn,
+                                                   const NamespaceString& nss,
+                                                   boost::optional<StringData> indexName,
+                                                   ScanDirection scanDirection,
+                                                   const BSONObj& startKey,
+                                                   BoundInclusion boundInclusion,
+                                                   std::size_t limit) override;
 
-    StatusWith<BSONObj> deleteOne(OperationContext* txn,
-                                  const NamespaceString& nss,
-                                  const BSONObj& indexKeyPattern,
-                                  ScanDirection scanDirection) override;
+    StatusWith<std::vector<BSONObj>> deleteDocuments(OperationContext* txn,
+                                                     const NamespaceString& nss,
+                                                     boost::optional<StringData> indexName,
+                                                     ScanDirection scanDirection,
+                                                     const BSONObj& startKey,
+                                                     BoundInclusion boundInclusion,
+                                                     std::size_t limit) override;
 
     Status isAdminDbValid(OperationContext* txn) override;
 
 private:
-    // One thread per collection/TaskRunner
-    std::unique_ptr<OldThreadPool> _bulkLoaderThreads;
+    // Returns empty document if not present.
+    BSONObj getMinValidDocument(OperationContext* txn) const;
+    void updateMinValidDocument(OperationContext* txn, const BSONObj& updateSpec);
+
     const NamespaceString _minValidNss;
-
-    // This mutex protects _runners vector.
-    stdx::mutex _runnersMutex;
-
-    // Each runner services a single collection and holds on to the OperationContext (and thread)
-    // until it is done with the collection (CollectionBulkLoaderImpl::commit/abort is called).
-    std::vector<std::pair<const NamespaceString&, std::unique_ptr<TaskRunner>>> _runners;
 };
 
 }  // namespace repl

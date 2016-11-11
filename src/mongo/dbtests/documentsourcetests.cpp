@@ -39,6 +39,8 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
@@ -92,7 +94,6 @@ protected:
     void createSource(boost::optional<BSONObj> hint = boost::none) {
         // clean up first if this was called before
         _source.reset();
-        _exec.reset();
 
         OldClientWriteContext ctx(&_opCtx, nss.ns());
 
@@ -103,13 +104,13 @@ protected:
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
             &_opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions()));
 
-        _exec = uassertStatusOK(
+        auto exec = uassertStatusOK(
             getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::YIELD_MANUAL));
 
-        _exec->saveState();
-        _exec->registerExec(ctx.getCollection());
+        exec->saveState();
+        exec->registerExec(ctx.getCollection());
 
-        _source = DocumentSourceCursor::create(nss.ns(), _exec, _ctx);
+        _source = DocumentSourceCursor::create(nss.ns(), std::move(exec), _ctx);
     }
 
     intrusive_ptr<ExpressionContext> ctx() {
@@ -122,7 +123,6 @@ protected:
 
 private:
     // It is important that these are ordered to ensure correct destruction order.
-    std::shared_ptr<PlanExecutor> _exec;
     intrusive_ptr<ExpressionContext> _ctx;
     intrusive_ptr<DocumentSourceCursor> _source;
 };
@@ -135,7 +135,7 @@ public:
         // The DocumentSourceCursor doesn't hold a read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         // The collection is empty, so the source produces no results.
-        ASSERT(!source()->getNext());
+        ASSERT(source()->getNext().isEOF());
         // Exhausting the source releases the read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
     }
@@ -150,11 +150,11 @@ public:
         // The DocumentSourceCursor doesn't hold a read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         // The cursor will produce the expected result.
-        boost::optional<Document> next = source()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        auto next = source()->getNext();
+        ASSERT(next.isAdvanced());
+        ASSERT_VALUE_EQ(Value(1), next.getDocument().getField("a"));
         // There are no more results.
-        ASSERT(!source()->getNext());
+        ASSERT(source()->getNext().isEOF());
         // Exhausting the source releases the read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
     }
@@ -171,7 +171,7 @@ public:
         // Releasing the cursor releases the read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         // The source is marked as exhausted.
-        ASSERT(!source()->getNext());
+        ASSERT(source()->getNext().isEOF());
     }
 };
 
@@ -184,20 +184,20 @@ public:
         client.insert(nss.ns(), BSON("a" << 3));
         createSource();
         // The result is as expected.
-        boost::optional<Document> next = source()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(Value(1), next->getField("a"));
+        auto next = source()->getNext();
+        ASSERT(next.isAdvanced());
+        ASSERT_VALUE_EQ(Value(1), next.getDocument().getField("a"));
         // The next result is as expected.
         next = source()->getNext();
-        ASSERT(bool(next));
-        ASSERT_EQUALS(Value(2), next->getField("a"));
+        ASSERT(next.isAdvanced());
+        ASSERT_VALUE_EQ(Value(2), next.getDocument().getField("a"));
         // The DocumentSourceCursor doesn't hold a read lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         source()->dispose();
         // Disposing of the source releases the lock.
         ASSERT(!_opCtx.lockState()->isReadLocked());
         // The source cannot be advanced further.
-        ASSERT(!source()->getNext());
+        ASSERT(source()->getNext().isEOF());
     }
 };
 
@@ -258,9 +258,9 @@ public:
         ASSERT_EQUALS(source()->getLimit(), 2);
 
         // The cursor allows exactly 2 documents through
-        ASSERT(bool(source()->getNext()));
-        ASSERT(bool(source()->getNext()));
-        ASSERT(!source()->getNext());
+        ASSERT(source()->getNext().isAdvanced());
+        ASSERT(source()->getNext().isAdvanced());
+        ASSERT(source()->getNext().isEOF());
     }
 };
 

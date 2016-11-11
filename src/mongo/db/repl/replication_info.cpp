@@ -25,6 +25,7 @@
 *    exception statement from all source files in the program, then also delete
 *    it in the license file.
 */
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -45,10 +46,15 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/map_util.h"
 
 namespace mongo {
 
@@ -234,24 +240,71 @@ public:
         // Tag connections to avoid closing them on stepdown.
         auto hangUpElement = cmdObj["hangUpOnStepDown"];
         if (!hangUpElement.eoo() && !hangUpElement.trueValue()) {
-            AbstractMessagingPort* mp = txn->getClient()->port();
-            if (mp) {
-                mp->setTag(mp->getTag() | executor::NetworkInterface::kMessagingPortKeepOpen);
+            auto session = txn->getClient()->session();
+            if (session) {
+                session->replaceTags(session->getTags() |
+                                     executor::NetworkInterface::kMessagingPortKeepOpen);
             }
         }
+
+        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(txn->getClient());
+        bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
+        if (!seenIsMaster) {
+            clientMetadataIsMasterState.setSeenIsMaster();
+        }
+
+        BSONElement element = cmdObj[kMetadataDocumentName];
+        if (!element.eoo()) {
+            if (seenIsMaster) {
+                return Command::appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::ClientMetadataCannotBeMutated,
+                           "The client metadata document may only be sent in the first isMaster"));
+            }
+
+            auto swParseClientMetadata = ClientMetadata::parse(element);
+
+            if (!swParseClientMetadata.getStatus().isOK()) {
+                return Command::appendCommandStatus(result, swParseClientMetadata.getStatus());
+            }
+
+            invariant(swParseClientMetadata.getValue());
+
+            swParseClientMetadata.getValue().get().logClientMetadata(txn->getClient());
+
+            clientMetadataIsMasterState.setClientMetadata(
+                txn->getClient(), std::move(swParseClientMetadata.getValue()));
+        }
+
         appendReplicationInfo(txn, result, 0);
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            result.append("configsvr", 1);
+            // If we have feature compatibility version 3.4, use a config server mode that 3.2
+            // mongos won't understand. This should prevent a 3.2 mongos from joining the cluster or
+            // making a connection to the config servers.
+            int configServerModeNumber = (serverGlobalParams.featureCompatibility.version.load() ==
+                                          ServerGlobalParams::FeatureCompatibility::Version::k34)
+                ? 2
+                : 1;
+            result.append("configsvr", configServerModeNumber);
         }
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
         result.appendNumber("maxWriteBatchSize", BatchedCommandRequest::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
-        result.append("maxWireVersion", WireSpec::instance().maxWireVersionIncoming);
-        result.append("minWireVersion", WireSpec::instance().minWireVersionIncoming);
+        result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
+        result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
         result.append("readOnly", storageGlobalParams.readOnly);
+
+        const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
+                                                  "automationServiceDescriptor",
+                                                  static_cast<ServerParameter*>(nullptr));
+        if (parameter)
+            parameter->append(txn, result, "automationServiceDescriptor");
+
+        txn->getClient()->session()->getCompressorManager().serverNegotiate(cmdObj, &result);
+
         return true;
     }
 } cmdismaster;

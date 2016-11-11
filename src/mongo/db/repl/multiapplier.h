@@ -61,19 +61,16 @@ public:
     using OperationPtrs = std::vector<const OplogEntry*>;
 
     /**
-     * Callback function to report final status of applying operations along with
-     * list of operations (if applicable) that were not successfully applied.
-     * On success, returns the timestamp of the last operation applied together with an empty
-     * list of operations.
+     * Callback function to report final status of applying operations.
      */
-    using CallbackFn = stdx::function<void(const StatusWith<Timestamp>&, const Operations&)>;
+    using CallbackFn = stdx::function<void(const Status&)>;
 
     /**
      * Type of function to to apply a single operation. In production, this function
-     * would have the same outcome as calling SyncTail::syncApply() ('convertUpdatesToUpserts'
+     * would have the same outcome as calling SyncTail::syncApply() ('inSteadyStateReplication'
      * value will be embedded in the function implementation).
      */
-    using ApplyOperationFn = stdx::function<void(OperationPtrs*)>;
+    using ApplyOperationFn = stdx::function<Status(OperationPtrs*)>;
 
     using MultiApplyFn = stdx::function<StatusWith<OpTime>(
         OperationContext*, MultiApplier::Operations, MultiApplier::ApplyOperationFn)>;
@@ -108,6 +105,11 @@ public:
     std::string getDiagnosticString() const;
 
     /**
+     * Returns an informational string.
+     */
+    std::string toString() const;
+
+    /**
      * Returns true if the applier has been started (but has not completed).
      */
     bool isActive() const;
@@ -115,7 +117,7 @@ public:
     /**
      * Starts applier by scheduling initial db work to be run by the executor.
      */
-    Status start();
+    Status startup();
 
     /**
      * Cancels current db work request.
@@ -123,20 +125,20 @@ public:
      *
      * Callback function may be invoked with an ErrorCodes::CallbackCanceled status.
      */
-    void cancel();
+    void shutdown();
 
     /**
      * Waits for active database worker to complete.
      * Returns immediately if applier is not active.
      */
-    void wait();
+    void join();
 
 private:
     /**
      * DB worker callback function - applies all operations.
      */
     void _callback(const executor::TaskExecutor::CallbackArgs& cbd);
-    void _finishCallback(const StatusWith<Timestamp>& result, const Operations& operations);
+    void _finishCallback(const Status& result);
 
     // Not owned by us.
     executor::TaskExecutor* _executor;
@@ -156,29 +158,6 @@ private:
 
     executor::TaskExecutor::CallbackHandle _dbWorkCallbackHandle;
 };
-
-
-/**
- * Applies operations (sorted by timestamp) up to and including 'lastTimestampToApply'.
- * If 'lastTimestampToApply' is found in  'operations':
- *     - The applier will be given a subset of 'operations' (includes 'lastTimestampToApply').
- *     - On success, the applier will invoke the 'pause' function just before reporting
- *       completion status.
- * Otherwise, all entries in 'operations' before 'lastTimestampToApply' will be forwarded to
- * the applier and the 'pause' function will be ignored.
- * If the applier is successfully created, returns the applier and a list of operations that
- * are skipped (operations with 'ts' field value after 'lastTimestampToApply).
- */
-using PauseDataReplicatorFn = stdx::function<void()>;
-
-StatusWith<std::pair<std::unique_ptr<MultiApplier>, MultiApplier::Operations>> applyUntilAndPause(
-    executor::TaskExecutor* executor,
-    const MultiApplier::Operations& operations,
-    const MultiApplier::ApplyOperationFn& applyOperation,
-    const MultiApplier::ApplyOperationFn& multiApply,
-    const Timestamp& lastTimestampToApply,
-    const PauseDataReplicatorFn& pauseDataReplicator,
-    const MultiApplier::CallbackFn& onCompletion);
 
 }  // namespace repl
 }  // namespace mongo

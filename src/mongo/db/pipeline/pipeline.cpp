@@ -33,9 +33,6 @@
 #include "mongo/db/pipeline/pipeline_optimizations.h"
 
 #include "mongo/base/error_codes.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/jsobj.h"
@@ -43,6 +40,11 @@
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_geo_near.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_out.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/util/mongoutils/str.h"
@@ -128,74 +130,17 @@ void Pipeline::optimizePipeline() {
     stitch();
 }
 
-Status Pipeline::checkAuthForCommand(ClientBasic* client,
-                                     const std::string& db,
-                                     const BSONObj& cmdObj) {
-    NamespaceString inputNs(db, cmdObj.firstElement().str());
-    auto inputResource = ResourcePattern::forExactNamespace(inputNs);
-    uassert(17138,
-            mongoutils::str::stream() << "Invalid input namespace, " << inputNs.ns(),
-            inputNs.isValid());
-
-    std::vector<Privilege> privileges;
-
-    if (dps::extractElementAtPath(cmdObj, "pipeline.0.$indexStats")) {
-        Privilege::addPrivilegeToPrivilegeVector(
-            &privileges,
-            Privilege(ResourcePattern::forAnyNormalResource(), ActionType::indexStats));
-    } else if (dps::extractElementAtPath(cmdObj, "pipeline.0.$collStats")) {
-        Privilege::addPrivilegeToPrivilegeVector(&privileges,
-                                                 Privilege(inputResource, ActionType::collStats));
-    } else {
-        // If no source requiring an alternative permission scheme is specified then default to
-        // requiring find() privileges on the given namespace.
-        Privilege::addPrivilegeToPrivilegeVector(&privileges,
-                                                 Privilege(inputResource, ActionType::find));
-    }
-
-    BSONObj pipeline = cmdObj.getObjectField("pipeline");
-    BSONForEach(stageElem, pipeline) {
-        BSONObj stage = stageElem.embeddedObjectUserCheck();
-        StringData stageName = stage.firstElementFieldName();
-        if (stageName == "$out" && stage.firstElementType() == String) {
-            NamespaceString outputNs(db, stage.firstElement().str());
-            uassert(17139,
-                    mongoutils::str::stream() << "Invalid $out target namespace, " << outputNs.ns(),
-                    outputNs.isValid());
-
-            ActionSet actions;
-            actions.addAction(ActionType::remove);
-            actions.addAction(ActionType::insert);
-            if (shouldBypassDocumentValidationForCommand(cmdObj)) {
-                actions.addAction(ActionType::bypassDocumentValidation);
-            }
-            Privilege::addPrivilegeToPrivilegeVector(
-                &privileges, Privilege(ResourcePattern::forExactNamespace(outputNs), actions));
-        } else if (stageName == "$lookup" && stage.firstElementType() == Object) {
-            NamespaceString fromNs(db, stage.firstElement()["from"].str());
-            Privilege::addPrivilegeToPrivilegeVector(
-                &privileges,
-                Privilege(ResourcePattern::forExactNamespace(fromNs), ActionType::find));
-        } else if (stageName == "$graphLookup" && stage.firstElementType() == Object) {
-            NamespaceString fromNs(db, stage.firstElement()["from"].str());
-            Privilege::addPrivilegeToPrivilegeVector(
-                &privileges,
-                Privilege(ResourcePattern::forExactNamespace(fromNs), ActionType::find));
-        }
-    }
-
-    if (AuthorizationSession::get(client)->isAuthorizedForPrivileges(privileges))
-        return Status::OK();
-    return Status(ErrorCodes::Unauthorized, "unauthorized");
-}
-
 bool Pipeline::aggSupportsWriteConcern(const BSONObj& cmd) {
-    if (cmd.hasField("pipeline") == false) {
+    auto pipelineElement = cmd["pipeline"];
+    if (pipelineElement.type() != BSONType::Array) {
         return false;
     }
 
-    auto stages = cmd["pipeline"].Array();
-    for (auto stage : stages) {
+    for (auto stage : pipelineElement.Obj()) {
+        if (stage.type() != BSONType::Object) {
+            return false;
+        }
+
         if (stage.Obj().hasField("$out")) {
             return true;
         }
@@ -213,7 +158,6 @@ void Pipeline::detachFromOperationContext() {
 }
 
 void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
-    invariant(pCtx->opCtx == nullptr);
     pCtx->opCtx = opCtx;
 
     for (auto&& source : _sources) {
@@ -221,11 +165,11 @@ void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
     }
 }
 
-void Pipeline::setCollator(std::unique_ptr<CollatorInterface> collator) {
-    pCtx->collator = std::move(collator);
-
-    // TODO SERVER-23349: If the pipeline has any DocumentSourceMatch sources, ask them to
-    // re-parse their predicates.
+void Pipeline::injectExpressionContext(const intrusive_ptr<ExpressionContext>& expCtx) {
+    pCtx = expCtx;
+    for (auto&& stage : _sources) {
+        stage->injectExpressionContext(pCtx);
+    }
 }
 
 intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
@@ -280,7 +224,10 @@ void Pipeline::Optimizations::Sharded::moveFinalUnwindFromShardsToMerger(Pipelin
 
 void Pipeline::Optimizations::Sharded::limitFieldsSentFromShardsToMerger(Pipeline* shardPipe,
                                                                          Pipeline* mergePipe) {
-    DepsTracker mergeDeps = mergePipe->getDependencies(shardPipe->getInitialQuery());
+    DepsTracker mergeDeps(
+        mergePipe->getDependencies(DocumentSourceMatch::isTextQuery(shardPipe->getInitialQuery())
+                                       ? DepsTracker::MetadataAvailable::kTextScore
+                                       : DepsTracker::MetadataAvailable::kNoMetadata));
     if (mergeDeps.needWholeDocument)
         return;  // the merge needs all fields, so nothing we can do.
 
@@ -290,7 +237,7 @@ void Pipeline::Optimizations::Sharded::limitFieldsSentFromShardsToMerger(Pipelin
 
     // Remove metadata from dependencies since it automatically flows through projection and we
     // don't want to project it in to the document.
-    mergeDeps.needTextScore = false;
+    mergeDeps.setNeedTextScore(false);
 
     // HEURISTIC: only apply optimization if none of the shard stages have an exhaustive list of
     // field dependencies. While this may not be 100% ideal in all cases, it is simple and
@@ -307,8 +254,9 @@ void Pipeline::Optimizations::Sharded::limitFieldsSentFromShardsToMerger(Pipelin
             return;
     }
     // if we get here, add the project.
-    shardPipe->_sources.push_back(DocumentSourceProject::createFromBson(
-        BSON("$project" << mergeDeps.toProjection()).firstElement(), shardPipe->pCtx));
+    boost::intrusive_ptr<DocumentSource> project = DocumentSourceProject::createFromBson(
+        BSON("$project" << mergeDeps.toProjection()).firstElement(), shardPipe->pCtx);
+    shardPipe->_sources.push_back(project);
 }
 
 BSONObj Pipeline::getInitialQuery() const {
@@ -376,13 +324,12 @@ void Pipeline::run(BSONObjBuilder& result) {
     // the array in which the aggregation results reside
     // cant use subArrayStart() due to error handling
     BSONArrayBuilder resultArray;
-    DocumentSource* finalSource = _sources.back().get();
-    while (boost::optional<Document> next = finalSource->getNext()) {
-        // add the document to the result set
+    while (auto next = getNext()) {
+        // Add the document to the result set.
         BSONObjBuilder documentBuilder(resultArray.subobjStart());
         next->toBson(&documentBuilder);
         documentBuilder.doneFast();
-        // object will be too large, assert. the extra 1KB is for headers
+        // Object will be too large, assert. The extra 1KB is for headers.
         uassert(16389,
                 str::stream() << "aggregation result exceeds maximum document size ("
                               << BSONObjMaxUserSize / (1024 * 1024)
@@ -392,6 +339,16 @@ void Pipeline::run(BSONObjBuilder& result) {
 
     resultArray.done();
     result.appendArray("result", resultArray.arr());
+}
+
+boost::optional<Document> Pipeline::getNext() {
+    invariant(!_sources.empty());
+    auto nextResult = _sources.back()->getNext();
+    while (nextResult.isPaused()) {
+        nextResult = _sources.back()->getNext();
+    }
+    return nextResult.isEOF() ? boost::none
+                              : boost::optional<Document>{nextResult.releaseDocument()};
 }
 
 vector<Value> Pipeline::writeExplainOps() const {
@@ -409,12 +366,12 @@ void Pipeline::addInitialSource(intrusive_ptr<DocumentSource> source) {
     _sources.push_front(source);
 }
 
-DepsTracker Pipeline::getDependencies(const BSONObj& initialQuery) const {
-    DepsTracker deps;
+DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const {
+    DepsTracker deps(metadataAvailable);
     bool knowAllFields = false;
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
-        DepsTracker localDeps;
+        DepsTracker localDeps(deps.getMetadataAvailable());
         DocumentSource::GetDepsReturn status = source->getDependencies(&localDeps);
 
         if (status == DocumentSource::NOT_SUPPORTED) {
@@ -432,8 +389,8 @@ DepsTracker Pipeline::getDependencies(const BSONObj& initialQuery) const {
         }
 
         if (!knowAllMeta) {
-            if (localDeps.needTextScore)
-                deps.needTextScore = true;
+            if (localDeps.getNeedTextScore())
+                deps.setNeedTextScore(true);
 
             knowAllMeta = status & DocumentSource::EXHAUSTIVE_META;
         }
@@ -446,17 +403,17 @@ DepsTracker Pipeline::getDependencies(const BSONObj& initialQuery) const {
     if (!knowAllFields)
         deps.needWholeDocument = true;  // don't know all fields we need
 
-    // NOTE This code assumes that textScore can only be generated by the initial query.
-    if (DocumentSourceMatch::isTextQuery(initialQuery)) {
-        // If doing a text query, assume we need the score if we can't prove we don't.
+    if (metadataAvailable & DepsTracker::MetadataAvailable::kTextScore) {
+        // If there is a text score, assume we need to keep it if we can't prove we don't. If we are
+        // the first half of a pipeline which has been split, future stages might need it.
         if (!knowAllMeta)
-            deps.needTextScore = true;
+            deps.setNeedTextScore(true);
     } else {
-        // If we aren't doing a text query, then we don't need to ask for the textScore since we
-        // know it will be missing anyway.
-        deps.needTextScore = false;
+        // If there is no text score available, then we don't need to ask for it.
+        deps.setNeedTextScore(false);
     }
 
     return deps;
 }
+
 }  // namespace mongo

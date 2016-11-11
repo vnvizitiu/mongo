@@ -46,6 +46,10 @@ namespace ValidateTests {
 
 using std::unique_ptr;
 
+namespace {
+const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
+}  // namespace
+
 static const char* const _ns = "unittests.validate_tests";
 
 /**
@@ -175,6 +179,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a" << 1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false));
 
@@ -236,6 +242,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a" << 1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false));
 
@@ -369,6 +377,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a.b" << 1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false));
 
@@ -433,6 +443,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a" << 1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false
                                                         << "sparse"
@@ -491,6 +503,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a" << 1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false
                                                         << "partialFilterExpression"
@@ -511,6 +525,65 @@ public:
             wunit.commit();
         }
 
+        ASSERT_TRUE(checkValid());
+    }
+};
+
+class ValidatePartialIndexOnCollectionWithNonIndexableFields : public ValidateBase {
+public:
+    ValidatePartialIndexOnCollectionWithNonIndexableFields() : ValidateBase(true) {}
+
+    void run() {
+        // Create a new collection and insert a record that has a non-indexable value on the indexed
+        // field.
+        Database* db = _ctx.db();
+        OpDebug* const nullOpDebug = nullptr;
+        Collection* coll;
+        RecordId id1;
+        {
+            WriteUnitOfWork wunit(&_txn);
+            ASSERT_OK(db->dropCollection(&_txn, _ns));
+            coll = db->createCollection(&_txn, _ns);
+            ASSERT_OK(coll->insertDocument(
+                &_txn, BSON("_id" << 1 << "x" << 1 << "a" << 2), nullOpDebug, true));
+            wunit.commit();
+        }
+
+        // Create a partial geo index that indexes the document. This should throw an error.
+        ASSERT_THROWS(dbtests::createIndexFromSpec(&_txn,
+                                                   coll->ns().ns(),
+                                                   BSON("name"
+                                                        << "partial_index"
+                                                        << "ns"
+                                                        << coll->ns().ns()
+                                                        << "key"
+                                                        << BSON("x"
+                                                                << "2dsphere")
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
+                                                        << "background"
+                                                        << false
+                                                        << "partialFilterExpression"
+                                                        << BSON("a" << BSON("$eq" << 2)))),
+                      UserException);
+
+        // Create a partial geo index that does not index the document.
+        auto status = dbtests::createIndexFromSpec(&_txn,
+                                                   coll->ns().ns(),
+                                                   BSON("name"
+                                                        << "partial_index"
+                                                        << "ns"
+                                                        << coll->ns().ns()
+                                                        << "key"
+                                                        << BSON("x"
+                                                                << "2dsphere")
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
+                                                        << "background"
+                                                        << false
+                                                        << "partialFilterExpression"
+                                                        << BSON("a" << BSON("$eq" << 1))));
+        ASSERT_OK(status);
         ASSERT_TRUE(checkValid());
     }
 };
@@ -551,6 +624,8 @@ public:
                                                         << coll->ns().ns()
                                                         << "key"
                                                         << BSON("a" << 1 << "b" << -1)
+                                                        << "v"
+                                                        << static_cast<int>(kIndexVersion)
                                                         << "background"
                                                         << false));
         ASSERT_OK(status);
@@ -563,6 +638,8 @@ public:
                                                    << coll->ns().ns()
                                                    << "key"
                                                    << BSON("a" << -1 << "b" << 1)
+                                                   << "v"
+                                                   << static_cast<int>(kIndexVersion)
                                                    << "background"
                                                    << false));
 
@@ -611,7 +688,8 @@ public:
         auto status = dbtests::createIndexFromSpec(
             &_txn,
             coll->ns().ns(),
-            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1)
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "v"
+                        << static_cast<int>(kIndexVersion)
                         << "background"
                         << false));
 
@@ -672,7 +750,8 @@ public:
         auto status = dbtests::createIndexFromSpec(
             &_txn,
             coll->ns().ns(),
-            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1)
+            BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "v"
+                        << static_cast<int>(kIndexVersion)
                         << "background"
                         << false));
 
@@ -707,6 +786,7 @@ public:
         add<ValidateSparseIndex>();
         add<ValidateCompoundIndex>();
         add<ValidatePartialIndex>();
+        add<ValidatePartialIndexOnCollectionWithNonIndexableFields>();
 
         // Tests for index validation.
         add<ValidateIndexEntry>();

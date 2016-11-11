@@ -28,9 +28,12 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
 #include <vector>
 
+#include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 
@@ -50,9 +53,13 @@ public:
 
     virtual ~BtreeKeyGenerator() {}
 
-    void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const;
+    static std::unique_ptr<BtreeKeyGenerator> make(IndexDescriptor::IndexVersion indexVersion,
+                                                   std::vector<const char*> fieldNames,
+                                                   std::vector<BSONElement> fixed,
+                                                   bool isSparse,
+                                                   const CollatorInterface* collator);
 
-    static const int ParallelArraysCode;
+    void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const;
 
 protected:
     // These are used by the getKeysImpl(s) below.

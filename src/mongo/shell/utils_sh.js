@@ -55,9 +55,9 @@ sh._writeBalancerStateDeprecated = function(onOrNot) {
 
 sh.help = function() {
     print("\tsh.addShard( host )                       server:port OR setname/server:port");
-    print("\tsh.addShardTag(shard,tag)                 adds the tag to the shard");
-    print(
-        "\tsh.addTagRange(fullName,min,max,tag)      tags the specified range of the given collection");
+    print("\tsh.addShardToZone(shard,zone)             adds the shard to the zone");
+    print("\tsh.updateZoneKeyRange(fullName,min,max,zone)      " +
+          "assigns the specified range of the given collection to a zone");
     print("\tsh.disableBalancing(coll)                 disable balancing on one collection");
     print("\tsh.enableBalancing(coll)                  re-enable balancing on one collection");
     print("\tsh.enableSharding(dbname)                 enables sharding on the database dbname");
@@ -66,9 +66,9 @@ sh.help = function() {
         "\tsh.isBalancerRunning()                    return true if the balancer has work in progress on any mongos");
     print(
         "\tsh.moveChunk(fullName,find,to)            move the chunk where 'find' is to 'to' (name of shard)");
-    print("\tsh.removeShardTag(shard,tag)              removes the tag from the shard");
+    print("\tsh.removeShardFromZone(shard,zone)      removes the shard from zone");
     print(
-        "\tsh.removeTagRange(fullName,min,max,tag)   removes the tagged range of the given collection");
+        "\tsh.removeRangeFromZone(fullName,min,max)   removes the range of the given collection from any zone");
     print("\tsh.shardCollection(fullName,key,unique)   shards the collection");
     print(
         "\tsh.splitAt(fullName,middle)               splits the chunk that middle is in at middle");
@@ -79,6 +79,9 @@ sh.help = function() {
     print("\tsh.status()                               prints a general overview of the cluster");
     print(
         "\tsh.stopBalancer()                         stops the balancer so chunks are not balanced automatically");
+    print("\tsh.disableAutoSplit()                   disable autoSplit on one collection");
+    print("\tsh.enableAutoSplit()                    re-eable autoSplit on one colleciton");
+    print("\tsh.getShouldAutoSplit()                 returns whether autosplit is enabled");
 };
 
 sh.status = function(verbose, configDB) {
@@ -142,6 +145,12 @@ sh.getBalancerState = function(configDB) {
 sh.isBalancerRunning = function(configDB) {
     if (configDB === undefined)
         configDB = sh._getConfigDB();
+
+    var result = configDB.adminCommand({balancerStatus: 1});
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return assert.commandWorked(result).inBalancerRound;
+    }
+
     var x = configDB.locks.findOne({_id: "balancer"});
     if (x == null) {
         print("config.locks collection empty or missing. be sure you are connected to a mongos");
@@ -158,8 +167,13 @@ sh.getBalancerHost = function(configDB) {
         print(
             "config.locks collection does not contain balancer lock. be sure you are connected to a mongos");
         return "";
+    } else if (x.process.match(/ConfigServer/)) {
+        print("getBalancerHost is deprecated starting version 3.4. The balancer is running on " +
+              "the config server primary host.");
+        return "";
+    } else {
+        return x.process.match(/[^:]+:[^:]+/)[0];
     }
-    return x.process.match(/[^:]+:[^:]+/)[0];
 };
 
 sh.stopBalancer = function(timeoutMs, interval) {
@@ -177,6 +191,8 @@ sh.stopBalancer = function(timeoutMs, interval) {
 };
 
 sh.startBalancer = function(timeoutMs, interval) {
+    timeoutMs = timeoutMs || 60000;
+
     var result = db.adminCommand({balancerStart: 1, maxTimeMS: timeoutMs});
     if (result.code === ErrorCodes.CommandNotFound) {
         // For backwards compatibility, use the legacy balancer start method
@@ -186,6 +202,34 @@ sh.startBalancer = function(timeoutMs, interval) {
     }
 
     return assert.commandWorked(result);
+};
+
+sh.enableAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    return assert.writeOK(
+        configDB.settings.update({_id: 'autosplit'},
+                                 {$set: {enabled: true}},
+                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+};
+
+sh.disableAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    return assert.writeOK(
+        configDB.settings.update({_id: 'autosplit'},
+                                 {$set: {enabled: false}},
+                                 {upsert: true, writeConcern: {w: 'majority', wtimeout: 30000}}));
+};
+
+sh.getShouldAutoSplit = function(configDB) {
+    if (configDB === undefined)
+        configDB = sh._getConfigDB();
+    var autosplit = configDB.settings.findOne({_id: 'autosplit'});
+    if (autosplit == null) {
+        return true;
+    }
+    return autosplit.enabled;
 };
 
 sh._waitForDLock = function(lockId, onOrNot, timeout, interval) {
@@ -314,7 +358,9 @@ sh.disableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": true}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": true}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.enableBalancing = function(coll) {
@@ -329,7 +375,9 @@ sh.enableBalancing = function(coll) {
     }
 
     return assert.writeOK(dbase.getSisterDB("config").collections.update(
-        {_id: coll + ""}, {$set: {"noBalance": false}}, {writeConcern: {w: 'majority'}}));
+        {_id: coll + ""},
+        {$set: {"noBalance": false}},
+        {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 /*
@@ -380,24 +428,39 @@ sh._lastMigration = function(ns) {
 };
 
 sh.addShardTag = function(shard, tag) {
+    var result = sh.addShardToZone(shard, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
     return assert.writeOK(config.shards.update(
-        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+        {_id: shard}, {$addToSet: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeShardTag = function(shard, tag) {
+    var result = sh.removeShardFromZone(shard, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     if (config.shards.findOne({_id: shard}) == null) {
         throw Error("can't find a shard with name: " + shard);
     }
-    return assert.writeOK(
-        config.shards.update({_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority'}}));
+    return assert.writeOK(config.shards.update(
+        {_id: shard}, {$pull: {tags: tag}}, {writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.addTagRange = function(ns, min, max, tag) {
+    var result = sh.updateZoneKeyRange(ns, min, max, tag);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     if (bsonWoCompare(min, max) == 0) {
         throw new Error("min and max cannot be the same");
     }
@@ -406,10 +469,15 @@ sh.addTagRange = function(ns, min, max, tag) {
     return assert.writeOK(
         config.tags.update({_id: {ns: ns, min: min}},
                            {_id: {ns: ns, min: min}, ns: ns, min: min, max: max, tag: tag},
-                           {upsert: true, writeConcern: {w: 'majority'}}));
+                           {upsert: true, writeConcern: {w: 'majority', wtimeout: 60000}}));
 };
 
 sh.removeTagRange = function(ns, min, max, tag) {
+    var result = sh.removeRangeFromZone(ns, min, max);
+    if (result.code != ErrorCodes.CommandNotFound) {
+        return result;
+    }
+
     var config = sh._getConfigDB();
     // warn if the namespace does not exist, even dropped
     if (config.collections.findOne({_id: ns}) == null) {
@@ -422,7 +490,24 @@ sh.removeTagRange = function(ns, min, max, tag) {
     // max and tag criteria not really needed, but including them avoids potentially unexpected
     // behavior.
     return assert.writeOK(config.tags.remove({_id: {ns: ns, min: min}, max: max, tag: tag},
-                                             {writeConcern: {w: 'majority'}}));
+                                             {writeConcern: {w: 'majority', wtimeout: 60000}}));
+};
+
+sh.addShardToZone = function(shardName, zoneName) {
+    return sh._getConfigDB().adminCommand({addShardToZone: shardName, zone: zoneName});
+};
+
+sh.removeShardFromZone = function(shardName, zoneName) {
+    return sh._getConfigDB().adminCommand({removeShardFromZone: shardName, zone: zoneName});
+};
+
+sh.updateZoneKeyRange = function(ns, min, max, zoneName) {
+    return sh._getConfigDB().adminCommand(
+        {updateZoneKeyRange: ns, min: min, max: max, zone: zoneName});
+};
+
+sh.removeRangeFromZone = function(ns, min, max) {
+    return sh._getConfigDB().adminCommand({updateZoneKeyRange: ns, min: min, max: max, zone: null});
 };
 
 sh.getBalancerLockDetails = function(configDB) {
@@ -611,6 +696,11 @@ function printShardingStatus(configDB, verbose) {
                 });
         }
     }
+
+    output(" autosplit:");
+
+    // Is autosplit currently enabled
+    output("\tCurrently enabled: " + (sh.getShouldAutoSplit(configDB) ? "yes" : "no"));
 
     output("  balancer:");
 

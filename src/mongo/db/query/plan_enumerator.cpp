@@ -329,7 +329,6 @@ bool PlanEnumerator::getNext(MatchExpression** tree) {
 
     *tree = _root->shallowClone().release();
     tagForSort(*tree);
-    sortUsingTags(*tree);
 
     _root->resetTag();
     LOG(5) << "Enumerator: memo just before moving:" << endl << dumpMemo();
@@ -1442,7 +1441,7 @@ void PlanEnumerator::compound(const vector<MatchExpression*>& tryCompound,
 //
 
 void PlanEnumerator::tagMemo(size_t id) {
-    LOG(5) << "Tagging memoID " << id << endl;
+    LOG(5) << "Tagging memoID " << id;
     NodeAssignment* assign = _memo[id];
     verify(NULL != assign);
 

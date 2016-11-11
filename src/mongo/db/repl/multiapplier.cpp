@@ -26,13 +26,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/multiapplier.h"
-
-#include <algorithm>
 
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
@@ -62,19 +58,26 @@ MultiApplier::MultiApplier(executor::TaskExecutor* executor,
             str::stream() << "'ts' in last operation not a timestamp: " << operations.back().raw,
             BSONType::bsonTimestamp == operations.back().raw.getField("ts").type());
     uassert(ErrorCodes::BadValue, "apply operation function cannot be null", applyOperation);
+    uassert(ErrorCodes::BadValue, "multi apply function cannot be null", multiApply);
     uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
 }
 
 MultiApplier::~MultiApplier() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
+}
+
+std::string MultiApplier::toString() const {
+    return getDiagnosticString();
 }
 
 std::string MultiApplier::getDiagnosticString() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     str::stream output;
     output << "MultiApplier";
-    output << " executor: " << _executor->getDiagnosticString();
     output << " active: " << _active;
+    output << ", ops: " << _operations.front().ts.timestamp().toString();
+    output << " - " << _operations.back().ts.timestamp().toString();
+    output << ", executor: " << _executor->getDiagnosticString();
     return output;
 }
 
@@ -83,7 +86,7 @@ bool MultiApplier::isActive() const {
     return _active;
 }
 
-Status MultiApplier::start() {
+Status MultiApplier::startup() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     if (_active) {
@@ -102,7 +105,7 @@ Status MultiApplier::start() {
     return Status::OK();
 }
 
-void MultiApplier::cancel() {
+void MultiApplier::shutdown() {
     executor::TaskExecutor::CallbackHandle dbWorkCallbackHandle;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -119,7 +122,7 @@ void MultiApplier::cancel() {
     }
 }
 
-void MultiApplier::wait() {
+void MultiApplier::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     while (_active) {
@@ -127,107 +130,30 @@ void MultiApplier::wait() {
     }
 }
 
-// TODO change the passed in function to be multiapply instead of apply inlock
 void MultiApplier::_callback(const executor::TaskExecutor::CallbackArgs& cbd) {
     if (!cbd.status.isOK()) {
-        _finishCallback(cbd.status, _operations);
+        _finishCallback(cbd.status);
         return;
     }
 
-    auto txn = cc().makeOperationContext();
-
-    // Refer to multiSyncApply() and multiInitialSyncApply() in sync_tail.cpp.
-    txn->setReplicatedWrites(false);
-
-    // allow us to get through the magic barrier
-    txn->lockState()->setIsBatchWriter(true);
+    invariant(!_operations.empty());
 
     StatusWith<OpTime> applyStatus(ErrorCodes::InternalError, "not mutated");
-
-    invariant(!_operations.empty());
     try {
-        // TODO restructure to support moving _operations into this call. Can't do it today since
-        // _finishCallback gets _operations on failure.
+        auto txn = cc().makeOperationContext();
         applyStatus = _multiApply(txn.get(), _operations, _applyOperation);
     } catch (...) {
         applyStatus = exceptionToStatus();
     }
-    if (!applyStatus.isOK()) {
-        _finishCallback(applyStatus.getStatus(), _operations);
-        return;
-    }
-    _finishCallback(applyStatus.getValue().getTimestamp(), Operations());
+    _finishCallback(applyStatus.getStatus());
 }
 
-void MultiApplier::_finishCallback(const StatusWith<Timestamp>& result,
-                                   const Operations& operations) {
-    _onCompletion(result, operations);
+void MultiApplier::_finishCallback(const Status& result) {
+    _onCompletion(result);
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _active = false;
     _condition.notify_all();
-}
-
-namespace {
-
-void pauseBeforeCompletion(const StatusWith<Timestamp>& result,
-                           const MultiApplier::Operations& operationsOnCompletion,
-                           const PauseDataReplicatorFn& pauseDataReplicator,
-                           const MultiApplier::CallbackFn& onCompletion) {
-    if (result.isOK()) {
-        pauseDataReplicator();
-    }
-    onCompletion(result, operationsOnCompletion);
-};
-
-}  // namespace
-
-StatusWith<std::pair<std::unique_ptr<MultiApplier>, MultiApplier::Operations>> applyUntilAndPause(
-    executor::TaskExecutor* executor,
-    const MultiApplier::Operations& operations,
-    const MultiApplier::ApplyOperationFn& applyOperation,
-    const MultiApplier::MultiApplyFn& multiApply,
-    const Timestamp& lastTimestampToApply,
-    const PauseDataReplicatorFn& pauseDataReplicator,
-    const MultiApplier::CallbackFn& onCompletion) {
-    try {
-        auto comp = [](const OplogEntry& left, const OplogEntry& right) {
-            uassert(ErrorCodes::FailedToParse,
-                    str::stream() << "Operation missing 'ts' field': " << left.raw,
-                    left.raw.hasField("ts"));
-            uassert(ErrorCodes::FailedToParse,
-                    str::stream() << "Operation missing 'ts' field': " << right.raw,
-                    right.raw.hasField("ts"));
-            return left.raw["ts"].timestamp() < right.raw["ts"].timestamp();
-        };
-        auto wrapped = OplogEntry(BSON("ts" << lastTimestampToApply));
-        auto i = std::lower_bound(operations.cbegin(), operations.cend(), wrapped, comp);
-        bool found = i != operations.cend() && !comp(wrapped, *i);
-        auto j = found ? i + 1 : i;
-        MultiApplier::Operations operationsInRange(operations.cbegin(), j);
-        MultiApplier::Operations operationsNotInRange(j, operations.cend());
-        if (!found) {
-            return std::make_pair(
-                std::unique_ptr<MultiApplier>(new MultiApplier(
-                    executor, operationsInRange, applyOperation, multiApply, onCompletion)),
-                operationsNotInRange);
-        }
-
-        return std::make_pair(
-            std::unique_ptr<MultiApplier>(new MultiApplier(executor,
-                                                           operationsInRange,
-                                                           applyOperation,
-                                                           multiApply,
-                                                           stdx::bind(pauseBeforeCompletion,
-                                                                      stdx::placeholders::_1,
-                                                                      stdx::placeholders::_2,
-                                                                      pauseDataReplicator,
-                                                                      onCompletion))),
-            operationsNotInRange);
-    } catch (...) {
-        return exceptionToStatus();
-    }
-    MONGO_UNREACHABLE;
-    return Status(ErrorCodes::InternalError, "unreachable");
 }
 
 }  // namespace repl

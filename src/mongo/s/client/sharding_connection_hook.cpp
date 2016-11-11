@@ -77,9 +77,11 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
             return _egressHook->readReplyMetadata(target, metadataObj);
         });
     }
-    conn->setRequestMetadataWriter([this](BSONObjBuilder* metadataBob, StringData hostStringData) {
-        return _egressHook->writeRequestMetadata(_shardedConnections, hostStringData, metadataBob);
-    });
+    conn->setRequestMetadataWriter(
+        [this](OperationContext* txn, BSONObjBuilder* metadataBob, StringData hostStringData) {
+            return _egressHook->writeRequestMetadata(
+                _shardedConnections, txn, hostStringData, metadataBob);
+        });
 
 
     if (conn->type() == ConnectionString::MASTER) {
@@ -97,10 +99,17 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
             return;
         }
 
+        const long long minKnownConfigServerMode = 1;
+        const long long maxKnownConfigServerMode = 2;
         uassert(28785,
-                str::stream() << "Unrecognized configsvr version number: " << configServerModeNumber
-                              << ". Expected either 0 or 1",
-                configServerModeNumber == 0 || configServerModeNumber == 1);
+                str::stream() << "Unrecognized configsvr mode number: " << configServerModeNumber
+                              << ". Range of known configsvr mode numbers is: ["
+                              << minKnownConfigServerMode
+                              << ", "
+                              << maxKnownConfigServerMode
+                              << "]",
+                configServerModeNumber >= minKnownConfigServerMode &&
+                    configServerModeNumber <= maxKnownConfigServerMode);
 
         uassertStatusOK(status);
     }

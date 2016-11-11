@@ -34,6 +34,7 @@
 #include <boost/intrusive_ptr.hpp>
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
@@ -41,12 +42,10 @@
 namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
-class ClientBasic;
 class CollatorInterface;
-struct DepsTracker;
 class DocumentSource;
-struct ExpressionContext;
 class OperationContext;
+struct ExpressionContext;
 
 /**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
@@ -60,6 +59,10 @@ public:
      * Parses a Pipeline from a BSONElement representing a list of DocumentSources. Returns a non-OK
      * status if it failed to parse. The returned pipeline is not optimized, but the caller may
      * convert it to an optimized pipeline by calling optimizePipeline().
+     *
+     * It is illegal to create a pipeline using an ExpressionContext which contains a collation that
+     * will not be used during execution of the pipeline. Doing so may cause comparisons made during
+     * parse-time to return the wrong results.
      */
     static StatusWith<boost::intrusive_ptr<Pipeline>> parse(
         const std::vector<BSONObj>& rawPipeline,
@@ -73,13 +76,6 @@ public:
      */
     static StatusWith<boost::intrusive_ptr<Pipeline>> create(
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Helper to implement Command::checkAuthForCommand.
-     */
-    static Status checkAuthForCommand(ClientBasic* client,
-                                      const std::string& dbname,
-                                      const BSONObj& cmdObj);
 
     /**
      * Returns true if the provided aggregation command has a $out stage.
@@ -105,15 +101,6 @@ public:
      * any storage-engine state of the DocumentSourceCursor that may be present in '_sources'.
      */
     void reattachToOperationContext(OperationContext* opCtx);
-
-    /**
-     * Sets the collator on this Pipeline. parseCommand() will return a Pipeline with its collator
-     * already set from the parsed request (if applicable), but this setter method can be used to
-     * later override the Pipeline's original collator.
-     *
-     * The Pipeline's collator can be retrieved with getContext()->collator.
-     */
-    void setCollator(std::unique_ptr<CollatorInterface> collator);
 
     /**
       Split the current Pipeline into a Pipeline for each shard, and
@@ -142,6 +129,12 @@ public:
     void optimizePipeline();
 
     /**
+     * Propagates a reference to the ExpressionContext to all of the pipeline's contained stages and
+     * expressions.
+     */
+    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
      * Returns any other collections involved in the pipeline in addition to the collection the
      * aggregation is run on.
      */
@@ -162,11 +155,10 @@ public:
     /// The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
 
-    /// The source that represents the output. Returns a non-owning pointer.
-    DocumentSource* output() {
-        invariant(!_sources.empty());
-        return _sources.back().get();
-    }
+    /**
+     * Returns the next result from the pipeline, or boost::none if there are no more results.
+     */
+    boost::optional<Document> getNext();
 
     /**
      * Write the pipeline's operators to a std::vector<Value>, with the
@@ -175,12 +167,10 @@ public:
     std::vector<Value> writeExplainOps() const;
 
     /**
-     * Returns the dependencies needed by this pipeline.
-     *
-     * initialQuery is used as a fallback for metadata dependency detection. The assumption is
-     * that any metadata produced by the query is needed unless we can prove it isn't.
+     * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
+     * metadata is present on documents that are input to the front of the pipeline.
      */
-    DepsTracker getDependencies(const BSONObj& initialQuery) const;
+    DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
 
     const SourceContainer& getSources() {
         return _sources;
@@ -200,14 +190,12 @@ public:
 private:
     class Optimizations {
     public:
-        // These contain static functions that optimize pipelines in various ways.
-        // They are classes rather than namespaces so that they can be friends of Pipeline.
-        // Classes are defined in pipeline_optimizations.h.
-        class Local;
+        // This contains static functions that optimize pipelines in various ways.
+        // This is a class rather than a namespace so that it can be a friend of Pipeline.
+        // It is defined in pipeline_optimizations.h.
         class Sharded;
     };
 
-    friend class Optimizations::Local;
     friend class Optimizations::Sharded;
 
     Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);

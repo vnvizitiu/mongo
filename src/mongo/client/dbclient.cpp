@@ -44,6 +44,7 @@
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
@@ -54,6 +55,7 @@
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/rpc/request_builder_interface.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
@@ -73,6 +75,7 @@
 #include "mongo/util/password_digest.h"
 #include "mongo/util/represent_as.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
@@ -182,7 +185,8 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     metadataBob.appendElements(metadata);
 
     if (_metadataWriter) {
-        uassertStatusOK(_metadataWriter(&metadataBob, host));
+        uassertStatusOK(_metadataWriter(
+            (haveClient() ? cc().getOperationContext() : nullptr), &metadataBob, host));
     }
 
     auto requestBuilder = rpc::makeRequestBuilder(getClientRPCProtocols(), getServerRPCProtocols());
@@ -232,10 +236,16 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     return rpc::UniqueReply(std::move(replyMsg), std::move(commandReply));
 }
 
-bool DBClientWithCommands::runCommand(const string& dbname,
-                                      const BSONObj& cmd,
-                                      BSONObj& info,
-                                      int options) {
+std::tuple<rpc::UniqueReply, DBClientWithCommands*>
+DBClientWithCommands::runCommandWithMetadataAndTarget(StringData database,
+                                                      StringData command,
+                                                      const BSONObj& metadata,
+                                                      const BSONObj& commandArgs) {
+    return std::make_tuple(runCommandWithMetadata(database, command, metadata, commandArgs), this);
+}
+
+std::tuple<bool, DBClientWithCommands*> DBClientWithCommands::runCommandWithTarget(
+    const string& dbname, const BSONObj& cmd, BSONObj& info, int options) {
     BSONObj upconvertedCmd;
     BSONObj upconvertedMetadata;
 
@@ -247,12 +257,23 @@ bool DBClientWithCommands::runCommand(const string& dbname,
 
     auto commandName = upconvertedCmd.firstElementFieldName();
 
-    auto result = runCommandWithMetadata(dbname, commandName, upconvertedMetadata, upconvertedCmd);
+    auto resultTuple =
+        runCommandWithMetadataAndTarget(dbname, commandName, upconvertedMetadata, upconvertedCmd);
+    auto result = std::move(std::get<0>(resultTuple));
 
     info = result->getCommandReply().getOwned();
 
-    return isOk(info);
+    return std::make_tuple(isOk(info), std::get<1>(resultTuple));
 }
+
+bool DBClientWithCommands::runCommand(const string& dbname,
+                                      const BSONObj& cmd,
+                                      BSONObj& info,
+                                      int options) {
+    auto res = runCommandWithTarget(dbname, cmd, info, options);
+    return std::get<0>(res);
+}
+
 
 /* note - we build a bson obj here -- for something that is super common like getlasterror you
           should have that object prebuilt as that would be faster.
@@ -443,8 +464,7 @@ void DBClientWithCommands::_auth(const BSONObj& params) {
                 Milliseconds millis(Date_t::now() - start);
 
                 // Hand control back to authenticateClient()
-                handler(StatusWith<RemoteCommandResponse>(
-                    RemoteCommandResponse(data, metadata, millis)));
+                handler({data, metadata, millis});
 
             } catch (...) {
                 handler(exceptionToStatus());
@@ -461,7 +481,7 @@ bool DBClientWithCommands::authenticateInternalUser() {
     }
 
     try {
-        auth(getInternalUserAuthParamsWithFallback());
+        auth(getInternalUserAuthParams());
         return true;
     } catch (const UserException& ex) {
         if (!serverGlobalParams.quiet) {
@@ -577,15 +597,6 @@ list<string> DBClientWithCommands::getDatabaseNames() {
         names.push_back(i.next().embeddedObjectUserCheck()["name"].valuestr());
     }
 
-    return names;
-}
-
-list<string> DBClientWithCommands::getCollectionNames(const string& db) {
-    list<BSONObj> infos = getCollectionInfos(db);
-    list<string> names;
-    for (list<BSONObj>::iterator it = infos.begin(); it != infos.end(); ++it) {
-        names.push_back(db + "." + (*it)["name"].valuestr());
-    }
     return names;
 }
 
@@ -711,7 +722,8 @@ private:
 /**
 * Initializes the wire version of conn, and returns the isMaster reply.
 */
-StatusWith<executor::RemoteCommandResponse> initWireVersion(DBClientConnection* conn) {
+executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
+                                                StringData applicationName) {
     try {
         // We need to force the usage of OP_QUERY on this command, even if we have previously
         // detected support for OP_COMMAND on a connection. This is necessary to handle the case
@@ -730,6 +742,20 @@ StatusWith<executor::RemoteCommandResponse> initWireVersion(DBClientConnection* 
             bob.append("hostInfo", sb.str());
         }
 
+        auto versionString = VersionInfoInterface::instance().version();
+
+        Status serializeStatus = ClientMetadata::serialize(
+            "MongoDB Internal Client", versionString, applicationName, &bob);
+        if (!serializeStatus.isOK()) {
+            return serializeStatus;
+        }
+
+        conn->getCompressorManager().clientBegin(&bob);
+
+        if (WireSpec::instance().isInternalClient) {
+            WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+        }
+
         Date_t start{Date_t::now()};
         auto result =
             conn->runCommandWithMetadata("admin", "isMaster", rpc::makeEmptyMetadata(), bob.done());
@@ -743,6 +769,8 @@ StatusWith<executor::RemoteCommandResponse> initWireVersion(DBClientConnection* 
             conn->setWireVersions(minWireVersion, maxWireVersion);
         }
 
+        conn->getCompressorManager().clientFinish(isMasterObj);
+
         return executor::RemoteCommandResponse{
             std::move(isMasterObj), result->getMetadata().getOwned(), finish - start};
 
@@ -753,8 +781,10 @@ StatusWith<executor::RemoteCommandResponse> initWireVersion(DBClientConnection* 
 
 }  // namespace
 
-bool DBClientConnection::connect(const HostAndPort& server, std::string& errmsg) {
-    auto connectStatus = connect(server);
+bool DBClientConnection::connect(const HostAndPort& server,
+                                 StringData applicationName,
+                                 std::string& errmsg) {
+    auto connectStatus = connect(server, applicationName);
     if (!connectStatus.isOK()) {
         errmsg = connectStatus.reason();
         return false;
@@ -762,42 +792,56 @@ bool DBClientConnection::connect(const HostAndPort& server, std::string& errmsg)
     return true;
 }
 
-Status DBClientConnection::connect(const HostAndPort& serverAddress) {
+Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData applicationName) {
     auto connectStatus = connectSocketOnly(serverAddress);
     if (!connectStatus.isOK()) {
         return connectStatus;
     }
 
-    auto swIsMasterReply = initWireVersion(this);
+    // NOTE: If the 'applicationName' parameter is a view of the '_applicationName' member, as
+    // happens, for instance, in the call to DBClientConnection::connect from
+    // DBClientConnection::_checkConnection then the following line will invalidate the
+    // 'applicationName' parameter, since the memory that it views within _applicationName will be
+    // freed. Do not reference the 'applicationName' parameter after this line. If you need to
+    // access the application name, do it through the _applicationName member.
+    _applicationName = applicationName.toString();
+
+    auto swIsMasterReply = initWireVersion(this, _applicationName);
     if (!swIsMasterReply.isOK()) {
         _failed = true;
-        return swIsMasterReply.getStatus();
+        return swIsMasterReply.status;
     }
 
     // Ensure that the isMaster response is "ok:1".
-    auto isMasterStatus = getStatusFromCommandResult(swIsMasterReply.getValue().data);
+    auto isMasterStatus = getStatusFromCommandResult(swIsMasterReply.data);
     if (!isMasterStatus.isOK()) {
         return isMasterStatus;
     }
 
-    auto swProtocolSet = rpc::parseProtocolSetFromIsMasterReply(swIsMasterReply.getValue().data);
+    auto swProtocolSet = rpc::parseProtocolSetFromIsMasterReply(swIsMasterReply.data);
     if (!swProtocolSet.isOK()) {
         return swProtocolSet.getStatus();
     }
 
-    _setServerRPCProtocols(swProtocolSet.getValue());
+    auto validateStatus =
+        rpc::validateWireVersion(WireSpec::instance().outgoing, swProtocolSet.getValue().version);
+    if (!validateStatus.isOK()) {
+        warning() << "remote host has incompatible wire version: " << validateStatus;
 
-    auto negotiatedProtocol =
-        rpc::negotiate(getServerRPCProtocols(),
-                       rpc::computeProtocolSet(WireSpec::instance().minWireVersionOutgoing,
-                                               WireSpec::instance().maxWireVersionOutgoing));
+        return validateStatus;
+    }
+
+    _setServerRPCProtocols(swProtocolSet.getValue().protocolSet);
+
+    auto negotiatedProtocol = rpc::negotiate(
+        getServerRPCProtocols(), rpc::computeProtocolSet(WireSpec::instance().outgoing));
 
     if (!negotiatedProtocol.isOK()) {
         return negotiatedProtocol.getStatus();
     }
 
     if (_hook) {
-        auto validationStatus = _hook(swIsMasterReply.getValue());
+        auto validationStatus = _hook(swIsMasterReply);
         if (!validationStatus.isOK()) {
             // Disconnect and mark failed.
             _failed = true;
@@ -857,8 +901,24 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     }
 
 #ifdef MONGO_CONFIG_SSL
-    int sslModeVal = sslGlobalParams.sslMode.load();
-    if (sslModeVal == SSLParams::SSLMode_preferSSL || sslModeVal == SSLParams::SSLMode_requireSSL) {
+    // Prefer to get SSL mode directly from our URI, but if it is not set, fall back to
+    // checking global SSL params. DBClientConnections create through the shell will have a
+    // meaningful URI set, but DBClientConnections created from within the server may not.
+    int sslMode;
+    auto options = _uri.getOptions();
+    auto iter = options.find("ssl");
+    if (iter != options.end()) {
+        if (iter->second == "true") {
+            sslMode = SSLParams::SSLMode_requireSSL;
+        } else {
+            sslMode = SSLParams::SSLMode_disabled;
+        }
+    } else {
+        sslMode = sslGlobalParams.sslMode.load();
+    }
+
+    if (sslMode == SSLParams::SSLMode_preferSSL || sslMode == SSLParams::SSLMode_requireSSL) {
+        uassert(40312, "SSL is not enabled; cannot create an SSL connection", sslManager());
         if (!_port->secure(sslManager(), serverAddress.host())) {
             return Status(ErrorCodes::SSLHandshakeFailed, "Failed to initialize SSL on connection");
         }
@@ -902,7 +962,7 @@ void DBClientConnection::_checkConnection() {
     LOG(_logLevel) << "trying reconnect to " << toString() << endl;
     string errmsg;
     _failed = false;
-    auto connectStatus = connect(_serverAddress);
+    auto connectStatus = connect(_serverAddress, _applicationName);
     if (!connectStatus.isOK()) {
         _failed = true;
         LOG(_logLevel) << "reconnect " << toString() << " failed " << errmsg << endl;
@@ -1161,7 +1221,7 @@ list<BSONObj> DBClientWithCommands::getIndexSpecs(const string& ns, int options)
         const long long id = cursorObj["id"].Long();
 
         if (id != 0) {
-            const std::string ns = cursorObj["ns"].String();
+            invariant(ns == cursorObj["ns"].String());
             unique_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
             while (cursor->more()) {
                 specs.push_back(cursor->nextSafe().getOwned());
@@ -1256,19 +1316,23 @@ void DBClientWithCommands::createIndex(StringData ns, const IndexSpec& descripto
 
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,
+                                       MongoURI uri,
                                        const HandshakeValidationHook& hook)
     : _failed(false),
       autoReconnect(_autoReconnect),
       autoReconnectBackoff(1000, 2000),
       _so_timeout(so_timeout),
-      _hook(hook) {
+      _hook(hook),
+      _uri(std::move(uri)) {
     _numConnections.fetchAndAdd(1);
 }
 
 void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer) {
     checkConnection();
     try {
-        port().say(toSend);
+        auto swm = _compressorManager.compressMessage(toSend);
+        uassertStatusOK(swm.getStatus());
+        port().say(swm.getValue());
     } catch (SocketException&) {
         _failed = true;
         throw;
@@ -1276,12 +1340,18 @@ void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer
 }
 
 bool DBClientConnection::recv(Message& m) {
-    if (port().recv(m)) {
-        return true;
+    if (!port().recv(m)) {
+        _failed = true;
+        return false;
     }
 
-    _failed = true;
-    return false;
+    if (m.operation() == dbCompressed) {
+        auto swm = _compressorManager.decompressMessage(m);
+        uassertStatusOK(swm.getStatus());
+        m = std::move(swm.getValue());
+    }
+
+    return true;
 }
 
 bool DBClientConnection::call(Message& toSend,
@@ -1294,13 +1364,22 @@ bool DBClientConnection::call(Message& toSend,
     */
     checkConnection();
     try {
-        if (!port().call(toSend, response)) {
+        auto swm = _compressorManager.compressMessage(toSend);
+        uassertStatusOK(swm.getStatus());
+
+        if (!port().call(swm.getValue(), response)) {
             _failed = true;
             if (assertOk)
                 uasserted(10278,
                           str::stream() << "dbclient error communicating with server: "
                                         << getServerAddress());
             return false;
+        }
+
+        if (response.operation() == dbCompressed) {
+            auto swm = _compressorManager.decompressMessage(response);
+            uassertStatusOK(swm.getStatus());
+            response = std::move(swm.getValue());
         }
     } catch (SocketException&) {
         _failed = true;
@@ -1355,12 +1434,13 @@ void DBClientConnection::handleNotMasterResponse(const BSONElement& elemToCheck)
         return;
     }
 
-    MONGO_LOG_COMPONENT(1, logger::LogComponent::kReplication)
-        << "got not master from: " << _serverAddress << " of repl set: " << _parentReplSetName;
-
     ReplicaSetMonitorPtr monitor = ReplicaSetMonitor::get(_parentReplSetName);
     if (monitor) {
-        monitor->failedHost(_serverAddress);
+        monitor->failedHost(_serverAddress,
+                            {ErrorCodes::NotMaster,
+                             str::stream() << "got not master from: " << _serverAddress
+                                           << " of repl set: "
+                                           << _parentReplSetName});
     }
 
     _failed = true;

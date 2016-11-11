@@ -31,6 +31,7 @@
 #include "mongo/db/query/query_solution.h"
 
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/collation/collation_index_key.h"
@@ -51,31 +52,33 @@ OrderedIntervalList buildStringBoundsOil(const std::string& keyName) {
     BSONObjBuilder strBob;
     strBob.appendMinForType("", BSONType::String);
     strBob.appendMaxForType("", BSONType::String);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(strBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(strBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     BSONObjBuilder objBob;
     objBob.appendMinForType("", BSONType::Object);
     objBob.appendMaxForType("", BSONType::Object);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(objBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(objBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     BSONObjBuilder arrBob;
     arrBob.appendMinForType("", BSONType::Array);
     arrBob.appendMaxForType("", BSONType::Array);
-    ret.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(arrBob.obj(), true, false));
+    ret.intervals.push_back(
+        IndexBoundsBuilder::makeRangeInterval(arrBob.obj(), BoundInclusion::kIncludeStartKeyOnly));
 
     return ret;
 }
 
 bool rangeCanContainString(const BSONElement& startKey,
                            const BSONElement& endKey,
-                           bool endKeyInclusive) {
+                           BoundInclusion boundInclusion) {
     OrderedIntervalList stringBoundsOil = buildStringBoundsOil("");
     OrderedIntervalList rangeOil;
     BSONObjBuilder bob;
     bob.appendAs(startKey, "");
     bob.appendAs(endKey, "");
-    rangeOil.intervals.push_back(
-        IndexBoundsBuilder::makeRangeInterval(bob.obj(), true, endKeyInclusive));
+    rangeOil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(bob.obj(), boundInclusion));
 
     IndexBoundsBuilder::intersectize(rangeOil, &stringBoundsOil);
     return !stringBoundsOil.intervals.empty();
@@ -182,7 +185,9 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "TEXT\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
+    *ss << "name = " << index.name << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addIndent(ss, indent + 1);
     *ss << "query = " << ftsQuery->getQuery() << '\n';
     addIndent(ss, indent + 1);
@@ -201,11 +206,10 @@ void TextNode::appendToString(mongoutils::str::stream* ss, int indent) const {
 }
 
 QuerySolutionNode* TextNode::clone() const {
-    TextNode* copy = new TextNode();
+    TextNode* copy = new TextNode(this->index);
     cloneBaseData(copy);
 
     copy->_sort = this->_sort;
-    copy->indexKeyPattern = this->indexKeyPattern;
     copy->ftsQuery = this->ftsQuery->clone();
     copy->indexPrefix = this->indexPrefix;
 
@@ -216,7 +220,11 @@ QuerySolutionNode* TextNode::clone() const {
 // CollectionScanNode
 //
 
-CollectionScanNode::CollectionScanNode() : tailable(false), direction(1), maxScan(0) {}
+CollectionScanNode::CollectionScanNode()
+    : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+      tailable(false),
+      direction(1),
+      maxScan(0) {}
 
 void CollectionScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
@@ -247,7 +255,7 @@ QuerySolutionNode* CollectionScanNode::clone() const {
 // AndHashNode
 //
 
-AndHashNode::AndHashNode() {}
+AndHashNode::AndHashNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
 
 AndHashNode::~AndHashNode() {}
 
@@ -301,7 +309,7 @@ QuerySolutionNode* AndHashNode::clone() const {
 // AndSortedNode
 //
 
-AndSortedNode::AndSortedNode() {}
+AndSortedNode::AndSortedNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
 
 AndSortedNode::~AndSortedNode() {}
 
@@ -351,7 +359,7 @@ QuerySolutionNode* AndSortedNode::clone() const {
 // OrNode
 //
 
-OrNode::OrNode() : dedup(true) {}
+OrNode::OrNode() : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), dedup(true) {}
 
 OrNode::~OrNode() {}
 
@@ -411,7 +419,8 @@ QuerySolutionNode* OrNode::clone() const {
 // MergeSortNode
 //
 
-MergeSortNode::MergeSortNode() : dedup(true) {}
+MergeSortNode::MergeSortNode()
+    : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), dedup(true) {}
 
 MergeSortNode::~MergeSortNode() {}
 
@@ -472,7 +481,7 @@ QuerySolutionNode* MergeSortNode::clone() const {
 // FetchNode
 //
 
-FetchNode::FetchNode() {}
+FetchNode::FetchNode() : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
 
 void FetchNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
@@ -503,19 +512,20 @@ QuerySolutionNode* FetchNode::clone() const {
 // IndexScanNode
 //
 
-IndexScanNode::IndexScanNode()
-    : indexIsMultiKey(false),
+IndexScanNode::IndexScanNode(IndexEntry index)
+    : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+      index(std::move(index)),
       direction(1),
       maxScan(0),
       addKeyMetadata(false),
-      indexCollator(nullptr),
       queryCollator(nullptr) {}
 
 void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) const {
     addIndent(ss, indent);
     *ss << "IXSCAN\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern << '\n';
+    *ss << "indexName = " << index.name << '\n';
+    *ss << "keyPattern = " << index.keyPattern << '\n';
     if (NULL != filter) {
         addIndent(ss, indent + 1);
         *ss << "filter = " << filter->toString();
@@ -530,17 +540,26 @@ void IndexScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
 bool IndexScanNode::hasField(const string& field) const {
     // There is no covering in a multikey index because you don't know whether or not the field
     // in the key was extracted from an array in the original document.
-    if (indexIsMultiKey) {
+    if (index.multikey) {
         return false;
     }
 
     // Custom index access methods may return non-exact key data - this function is currently
     // used for covering exact key data only.
-    if (IndexNames::BTREE != IndexNames::findPluginName(indexKeyPattern)) {
+    if (IndexNames::BTREE != IndexNames::findPluginName(index.keyPattern)) {
         return false;
     }
 
-    BSONObjIterator it(indexKeyPattern);
+    // If the index has a non-simple collation and we have collation keys inside 'field', then this
+    // index scan does not provide that field (and the query cannot be covered).
+    if (index.collator) {
+        std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, index.keyPattern);
+        if (collatedFields.find(field) != collatedFields.end()) {
+            return false;
+        }
+    }
+
+    BSONObjIterator it(index.keyPattern);
     while (it.more()) {
         if (field == it.next().fieldName()) {
             return true;
@@ -556,7 +575,7 @@ bool IndexScanNode::sortedByDiskLoc() const {
 
     // If it's a simple range query, it's easy to determine if the range is a point.
     if (bounds.isSimpleRange) {
-        return 0 == bounds.startKey.woCompare(bounds.endKey, indexKeyPattern);
+        return 0 == bounds.startKey.woCompare(bounds.endKey, index.keyPattern);
     }
 
     // If it's a more complex bounds query, we make sure that each field is a point.
@@ -587,9 +606,13 @@ std::set<StringData> IndexScanNode::getFieldsWithStringBounds(const IndexBounds&
         while (keyPatternIterator.more() && startKeyIterator.more() && endKeyIterator.more()) {
             BSONElement startKey = startKeyIterator.next();
             BSONElement endKey = endKeyIterator.next();
-            if (startKey != endKey || CollationIndexKey::isCollatableType(startKey.type())) {
-                if (!rangeCanContainString(
-                        startKey, endKey, (startKeyIterator.more() || bounds.endKeyInclusive))) {
+            if (SimpleBSONElementComparator::kInstance.evaluate(startKey != endKey) ||
+                CollationIndexKey::isCollatableType(startKey.type())) {
+                BoundInclusion boundInclusion = bounds.boundInclusion;
+                if (startKeyIterator.more()) {
+                    boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
+                }
+                if (!rangeCanContainString(startKey, endKey, boundInclusion)) {
                     // If the first non-point range cannot contain strings, we don't need to
                     // add it to the return set.
                     keyPatternIterator.next();
@@ -627,7 +650,7 @@ std::set<StringData> IndexScanNode::getFieldsWithStringBounds(const IndexBounds&
 void IndexScanNode::computeProperties() {
     _sorts.clear();
 
-    BSONObj sortPattern = QueryPlannerAnalysis::getSortPattern(indexKeyPattern);
+    BSONObj sortPattern = QueryPlannerAnalysis::getSortPattern(index.keyPattern);
     if (direction == -1) {
         sortPattern = QueryPlannerCommon::reverseSortObj(sortPattern);
     }
@@ -668,12 +691,13 @@ void IndexScanNode::computeProperties() {
             equalityFields.insert(oil.name);
         }
     } else {
-        BSONObjIterator keyIter(indexKeyPattern);
+        BSONObjIterator keyIter(index.keyPattern);
         BSONObjIterator startIter(bounds.startKey);
         BSONObjIterator endIter(bounds.endKey);
         while (keyIter.more() && startIter.more() && endIter.more()) {
             BSONElement key = keyIter.next();
-            if (startIter.next() == endIter.next()) {
+            if (SimpleBSONElementComparator::kInstance.evaluate(startIter.next() ==
+                                                                endIter.next())) {
                 equalityFields.insert(key.fieldName());
             }
         }
@@ -683,9 +707,9 @@ void IndexScanNode::computeProperties() {
         addEqualityFieldSorts(sortPattern, equalityFields, &_sorts);
     }
 
-    if (!CollatorInterface::collatorsMatch(queryCollator, indexCollator)) {
+    if (!CollatorInterface::collatorsMatch(queryCollator, index.collator)) {
         // Prune sorts containing fields that don't match the collation.
-        std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, indexKeyPattern);
+        std::set<StringData> collatedFields = getFieldsWithStringBounds(bounds, index.keyPattern);
         auto sortsIt = _sorts.begin();
         while (sortsIt != _sorts.end()) {
             bool matched = false;
@@ -705,17 +729,14 @@ void IndexScanNode::computeProperties() {
 }
 
 QuerySolutionNode* IndexScanNode::clone() const {
-    IndexScanNode* copy = new IndexScanNode();
+    IndexScanNode* copy = new IndexScanNode(this->index);
     cloneBaseData(copy);
 
     copy->_sorts = this->_sorts;
-    copy->indexKeyPattern = this->indexKeyPattern;
-    copy->indexIsMultiKey = this->indexIsMultiKey;
     copy->direction = this->direction;
     copy->maxScan = this->maxScan;
     copy->addKeyMetadata = this->addKeyMetadata;
     copy->bounds = this->bounds;
-    copy->indexCollator = this->indexCollator;
     copy->queryCollator = this->queryCollator;
 
     return copy;
@@ -736,8 +757,7 @@ bool filtersAreEquivalent(const MatchExpression* lhs, const MatchExpression* rhs
 }  // namespace
 
 bool IndexScanNode::operator==(const IndexScanNode& other) const {
-    return filtersAreEquivalent(filter.get(), other.filter.get()) &&
-        indexKeyPattern == other.indexKeyPattern && indexIsMultiKey == other.indexIsMultiKey &&
+    return filtersAreEquivalent(filter.get(), other.filter.get()) && index == other.index &&
         direction == other.direction && maxScan == other.maxScan &&
         addKeyMetadata == other.addKeyMetadata && bounds == other.bounds;
 }
@@ -916,7 +936,9 @@ void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2D\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
+    *ss << "name = " << index.name << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
     *ss << "nearQuery = " << nq->toString() << '\n';
     if (NULL != filter) {
@@ -926,13 +948,12 @@ void GeoNear2DNode::appendToString(mongoutils::str::stream* ss, int indent) cons
 }
 
 QuerySolutionNode* GeoNear2DNode::clone() const {
-    GeoNear2DNode* copy = new GeoNear2DNode();
+    GeoNear2DNode* copy = new GeoNear2DNode(this->index);
     cloneBaseData(copy);
 
     copy->_sorts = this->_sorts;
     copy->nq = this->nq;
     copy->baseBounds = this->baseBounds;
-    copy->indexKeyPattern = this->indexKeyPattern;
     copy->addPointMeta = this->addPointMeta;
     copy->addDistMeta = this->addDistMeta;
 
@@ -947,7 +968,9 @@ void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent
     addIndent(ss, indent);
     *ss << "GEO_NEAR_2DSPHERE\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern.toString() << '\n';
+    *ss << "name = " << index.name << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "keyPattern = " << index.keyPattern.toString() << '\n';
     addCommon(ss, indent);
     *ss << "baseBounds = " << baseBounds.toString() << '\n';
     addIndent(ss, indent + 1);
@@ -959,13 +982,12 @@ void GeoNear2DSphereNode::appendToString(mongoutils::str::stream* ss, int indent
 }
 
 QuerySolutionNode* GeoNear2DSphereNode::clone() const {
-    GeoNear2DSphereNode* copy = new GeoNear2DSphereNode();
+    GeoNear2DSphereNode* copy = new GeoNear2DSphereNode(this->index);
     cloneBaseData(copy);
 
     copy->_sorts = this->_sorts;
     copy->nq = this->nq;
     copy->baseBounds = this->baseBounds;
-    copy->indexKeyPattern = this->indexKeyPattern;
     copy->addPointMeta = this->addPointMeta;
     copy->addDistMeta = this->addDistMeta;
 
@@ -1035,7 +1057,9 @@ void DistinctNode::appendToString(mongoutils::str::stream* ss, int indent) const
     addIndent(ss, indent);
     *ss << "DISTINCT\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern << '\n';
+    *ss << "name = " << index.name << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);
     *ss << "direction = " << direction << '\n';
     addIndent(ss, indent + 1);
@@ -1043,11 +1067,10 @@ void DistinctNode::appendToString(mongoutils::str::stream* ss, int indent) const
 }
 
 QuerySolutionNode* DistinctNode::clone() const {
-    DistinctNode* copy = new DistinctNode();
+    DistinctNode* copy = new DistinctNode(this->index);
     cloneBaseData(copy);
 
     copy->sorts = this->sorts;
-    copy->indexKeyPattern = this->indexKeyPattern;
     copy->direction = this->direction;
     copy->bounds = this->bounds;
     copy->fieldNo = this->fieldNo;
@@ -1063,7 +1086,9 @@ void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
     addIndent(ss, indent);
     *ss << "COUNT\n";
     addIndent(ss, indent + 1);
-    *ss << "keyPattern = " << indexKeyPattern << '\n';
+    *ss << "name = " << index.name << '\n';
+    addIndent(ss, indent + 1);
+    *ss << "keyPattern = " << index.keyPattern << '\n';
     addIndent(ss, indent + 1);
     *ss << "startKey = " << startKey << '\n';
     addIndent(ss, indent + 1);
@@ -1071,11 +1096,10 @@ void CountScanNode::appendToString(mongoutils::str::stream* ss, int indent) cons
 }
 
 QuerySolutionNode* CountScanNode::clone() const {
-    CountScanNode* copy = new CountScanNode();
+    CountScanNode* copy = new CountScanNode(this->index);
     cloneBaseData(copy);
 
     copy->sorts = this->sorts;
-    copy->indexKeyPattern = this->indexKeyPattern;
     copy->startKey = this->startKey;
     copy->startKeyInclusive = this->startKeyInclusive;
     copy->endKey = this->endKey;

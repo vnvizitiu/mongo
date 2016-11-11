@@ -33,6 +33,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/index_spec.h"
+#include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/jsobj.h"
@@ -42,6 +43,7 @@
 #include "mongo/rpc/protocol.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
@@ -418,6 +420,19 @@ public:
                                                     const BSONObj& metadata,
                                                     const BSONObj& commandArgs);
 
+    /*
+     * This wraps up the runCommandWithMetadata function above, but returns the DBClient that
+     * actually ran the command. When called against a replica set, this will return the specific
+     * replica set member the command ran against.
+     *
+     * This is used in the shell so that cursors can send getMore through the correct connection.
+     */
+    virtual std::tuple<rpc::UniqueReply, DBClientWithCommands*> runCommandWithMetadataAndTarget(
+        StringData database,
+        StringData command,
+        const BSONObj& metadata,
+        const BSONObj& commandArgs);
+
     /** Run a database command.  Database commands are represented as BSON objects.  Common database
         commands have prebuilt helper functions -- see below.  If a helper is not available you can
         directly call runCommand.
@@ -435,6 +450,18 @@ public:
                             const BSONObj& cmd,
                             BSONObj& info,
                             int options = 0);
+
+    /*
+     * This wraps up the runCommand function avove, but returns the DBClient that actually ran
+     * the command. When called against a replica set, this will return the specific
+     * replica set member the command ran against.
+     *
+     * This is used in the shell so that cursors can send getMore through the correct connection.
+     */
+    virtual std::tuple<bool, DBClientWithCommands*> runCommandWithTarget(const std::string& dbname,
+                                                                         const BSONObj& cmd,
+                                                                         BSONObj& info,
+                                                                         int options = 0);
 
     /**
     * Authenticates to another cluster member using appropriate authentication data.
@@ -689,12 +716,6 @@ public:
        throws on error
      */
     std::list<std::string> getDatabaseNames();
-
-    /**
-     * Get a list of all the current collections in db.
-     * Returns fully qualified names.
-     */
-    std::list<std::string> getCollectionNames(const std::string& db);
 
     /**
      * { name : "<short collection name>",
@@ -959,6 +980,7 @@ public:
      */
     DBClientConnection(bool _autoReconnect = false,
                        double so_timeout = 0,
+                       MongoURI uri = {},
                        const HandshakeValidationHook& hook = HandshakeValidationHook());
 
     virtual ~DBClientConnection() {
@@ -975,7 +997,9 @@ public:
      * @param errmsg any relevant error message will appended to the string
      * @return false if fails to connect.
      */
-    virtual bool connect(const HostAndPort& server, std::string& errmsg);
+    virtual bool connect(const HostAndPort& server,
+                         StringData applicationName,
+                         std::string& errmsg);
 
     /**
      * Semantically equivalent to the previous connect method, but returns a Status
@@ -986,7 +1010,7 @@ public:
      * @param a hook to validate the 'isMaster' reply received during connection. If the hook
      * fails, the connection will be terminated and a non-OK status will be returned.
      */
-    Status connect(const HostAndPort& server);
+    Status connect(const HostAndPort& server, StringData applicationName);
 
     /**
      * This version of connect does not run 'isMaster' after creating a TCP connection to the
@@ -1117,6 +1141,10 @@ public:
 
     uint64_t getSockCreationMicroSec() const;
 
+    MessageCompressorManager& getCompressorManager() {
+        return _compressorManager;
+    }
+
 protected:
     int _minWireVersion{0};
     int _maxWireVersion{0};
@@ -1131,6 +1159,7 @@ protected:
 
     HostAndPort _serverAddress;
     std::string _resolvedAddress;
+    std::string _applicationName;
 
     void _checkConnection();
 
@@ -1159,6 +1188,10 @@ private:
 
     // Hook ran on every call to connect()
     HandshakeValidationHook _hook;
+
+    MessageCompressorManager _compressorManager;
+
+    MongoURI _uri;
 };
 
 BSONElement getErrField(const BSONObj& result);

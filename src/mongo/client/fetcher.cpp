@@ -179,14 +179,14 @@ Fetcher::Fetcher(executor::TaskExecutor* executor,
       _timeout(timeout),
       _firstRemoteCommandScheduler(
           _executor,
-          RemoteCommandRequest(_source, _dbname, _cmdObj, _metadata, _timeout),
+          RemoteCommandRequest(_source, _dbname, _cmdObj, _metadata, nullptr, _timeout),
           stdx::bind(&Fetcher::_callback, this, stdx::placeholders::_1, kFirstBatchFieldName),
           std::move(firstCommandRetryPolicy)) {
     uassert(ErrorCodes::BadValue, "callback function cannot be null", work);
 }
 
 Fetcher::~Fetcher() {
-    DESTRUCTOR_GUARD(cancel(); wait(););
+    DESTRUCTOR_GUARD(shutdown(); join(););
 }
 
 HostAndPort Fetcher::getSource() const {
@@ -205,17 +205,29 @@ Milliseconds Fetcher::getTimeout() const {
     return _timeout;
 }
 
+std::string Fetcher::toString() const {
+    return getDiagnosticString();
+}
+
 std::string Fetcher::getDiagnosticString() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     str::stream output;
     output << "Fetcher";
-    output << " executor: " << _executor->getDiagnosticString();
     output << " source: " << _source.toString();
     output << " database: " << _dbname;
     output << " query: " << _cmdObj;
     output << " query metadata: " << _metadata;
     output << " active: " << _active;
     output << " timeout: " << _timeout;
+    output << " inShutdown: " << _inShutdown;
+    output << " first: " << _first;
+    output << " firstCommandScheduler: " << _firstRemoteCommandScheduler.toString();
+
+    if (_getMoreCallbackHandle.isValid()) {
+        output << " getMoreHandle.valid: " << _getMoreCallbackHandle.isValid();
+        output << " getMoreHandle.cancelled: " << _getMoreCallbackHandle.isCanceled();
+    }
+
     return output;
 }
 
@@ -239,10 +251,11 @@ Status Fetcher::schedule() {
     return Status::OK();
 }
 
-void Fetcher::cancel() {
+void Fetcher::shutdown() {
     executor::TaskExecutor::CallbackHandle handle;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _inShutdown = true;
 
         if (!_active) {
             return;
@@ -260,22 +273,35 @@ void Fetcher::cancel() {
     _executor->cancel(handle);
 }
 
-void Fetcher::wait() {
+void Fetcher::join() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     _condition.wait(lk, [this]() { return !_active; });
 }
 
+bool Fetcher::inShutdown_forTest() const {
+    return _isInShutdown();
+}
+
+bool Fetcher::_isInShutdown() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _inShutdown;
+}
+
 Status Fetcher::_scheduleGetMore(const BSONObj& cmdObj) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_inShutdown) {
+        return Status(ErrorCodes::CallbackCanceled,
+                      "fetcher was shut down after previous batch was processed");
+    }
     StatusWith<executor::TaskExecutor::CallbackHandle> scheduleResult =
         _executor->scheduleRemoteCommand(
-            RemoteCommandRequest(_source, _dbname, cmdObj, _metadata, _timeout),
+            RemoteCommandRequest(_source, _dbname, cmdObj, _metadata, nullptr, _timeout),
             stdx::bind(&Fetcher::_callback, this, stdx::placeholders::_1, kNextBatchFieldName));
 
     if (!scheduleResult.isOK()) {
         return scheduleResult.getStatus();
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _getMoreCallbackHandle = scheduleResult.getValue();
 
     return Status::OK();
@@ -283,12 +309,18 @@ Status Fetcher::_scheduleGetMore(const BSONObj& cmdObj) {
 
 void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batchFieldName) {
     if (!rcbd.response.isOK()) {
-        _work(StatusWith<Fetcher::QueryResponse>(rcbd.response.getStatus()), nullptr, nullptr);
+        _work(StatusWith<Fetcher::QueryResponse>(rcbd.response.status), nullptr, nullptr);
         _finishCallback();
         return;
     }
 
-    const BSONObj& queryResponseObj = rcbd.response.getValue().data;
+    if (_isInShutdown()) {
+        _work(Status(ErrorCodes::CallbackCanceled, "fetcher shutting down"), nullptr, nullptr);
+        _finishCallback();
+        return;
+    }
+
+    const BSONObj& queryResponseObj = rcbd.response.data;
     Status status = getStatusFromCommandResult(queryResponseObj);
     if (!status.isOK()) {
         _work(StatusWith<Fetcher::QueryResponse>(status), nullptr, nullptr);
@@ -304,8 +336,8 @@ void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batch
         return;
     }
 
-    batchData.otherFields.metadata = std::move(rcbd.response.getValue().metadata);
-    batchData.elapsedMillis = rcbd.response.getValue().elapsedMillis;
+    batchData.otherFields.metadata = std::move(rcbd.response.metadata);
+    batchData.elapsedMillis = rcbd.response.elapsedMillis.value_or(Milliseconds{0});
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         batchData.first = _first;
@@ -356,19 +388,20 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
     if (id) {
         auto logKillCursorsResult = [](const RemoteCommandCallbackArgs& args) {
             if (!args.response.isOK()) {
-                warning() << "killCursors command task failed: " << args.response.getStatus();
+                warning() << "killCursors command task failed: " << redact(args.response.status);
                 return;
             }
-            auto status = getStatusFromCommandResult(args.response.getValue().data);
+            auto status = getStatusFromCommandResult(args.response.data);
             if (!status.isOK()) {
-                warning() << "killCursors command failed: " << status;
+                warning() << "killCursors command failed: " << redact(status);
             }
         };
         auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
         auto scheduleResult = _executor->scheduleRemoteCommand(
-            RemoteCommandRequest(_source, _dbname, cmdObj), logKillCursorsResult);
+            RemoteCommandRequest(_source, _dbname, cmdObj, nullptr), logKillCursorsResult);
         if (!scheduleResult.isOK()) {
-            warning() << "failed to schedule killCursors command: " << scheduleResult.getStatus();
+            warning() << "failed to schedule killCursors command: "
+                      << redact(scheduleResult.getStatus());
         }
     }
 }

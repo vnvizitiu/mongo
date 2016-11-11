@@ -340,6 +340,10 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
             }
 
             if (scope->getProto<DBPointerInfo>().getJSClass() == jsclass) {
+                uassert(ErrorCodes::BadValue,
+                        "can't serialize DBPointer prototype",
+                        scope->getProto<DBPointerInfo>().getProto() != obj);
+
                 JS::RootedValue id(_context);
                 o.getValue("id", &id);
 
@@ -350,6 +354,8 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
 
             if (scope->getProto<BinDataInfo>().getJSClass() == jsclass) {
                 auto str = static_cast<std::string*>(JS_GetPrivate(obj));
+
+                uassert(ErrorCodes::BadValue, "Cannot call getter on BinData prototype", str);
 
                 auto binData = base64::decode(*str);
 
@@ -382,7 +388,7 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
             }
         }
 
-        auto protoKey = JS::IdentifyStandardInstance(obj);
+        auto protoKey = JS::IdentifyStandardInstanceOrPrototype(obj);
 
         switch (protoKey) {
             case JSProto_Function: {
@@ -407,10 +413,15 @@ void ValueWriter::_writeObject(BSONObjBuilder* b,
                 return;
             }
             case JSProto_Date: {
-                JS::RootedValue dateval(_context);
-                o.callMethod("getTime", &dateval);
+                Date_t d;
+                if (JS::IdentifyStandardPrototype(obj) == JSProto_Date) {
+                    d = Date_t::fromMillisSinceEpoch(0);
+                } else {
+                    JS::RootedValue dateval(_context);
+                    o.callMethod("getTime", &dateval);
+                    d = Date_t::fromMillisSinceEpoch(ValueWriter(_context, dateval).toInt64());
+                }
 
-                auto d = Date_t::fromMillisSinceEpoch(ValueWriter(_context, dateval).toInt64());
                 b->appendDate(sd, d);
 
                 return;

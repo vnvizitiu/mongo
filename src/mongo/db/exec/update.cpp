@@ -375,7 +375,7 @@ inline Status validate(const BSONObj& original,
             }
 
             // If we have both (old and new), compare them. If we just have new we are good
-            if (oldElem.ok() && newElem.compareWithBSONElement(oldElem, false) != 0) {
+            if (oldElem.ok() && newElem.compareWithBSONElement(oldElem, nullptr, false) != 0) {
                 return Status(ErrorCodes::ImmutableField,
                               mongoutils::str::stream()
                                   << "After applying the update to the document {"
@@ -436,8 +436,7 @@ bool shouldRestartUpdateIfNoLongerMatches(const UpdateStageParams& params) {
 };
 
 const std::vector<FieldRef*>* getImmutableFields(OperationContext* txn, const NamespaceString& ns) {
-    std::shared_ptr<CollectionMetadata> metadata =
-        CollectionShardingState::get(txn, ns)->getMetadata();
+    auto metadata = CollectionShardingState::get(txn, ns)->getMetadata();
     if (metadata) {
         const std::vector<FieldRef*>& fields = metadata->getKeyPatternFields();
         // Return shard-keys as immutable for the update system.
@@ -1011,7 +1010,7 @@ Status UpdateStage::restoreUpdateState() {
         !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nsString);
 
     if (userInitiatedWritesAndNotPrimary) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::PrimarySteppedDown,
                       str::stream() << "Demoted from primary while performing update on "
                                     << nsString.ns());
     }

@@ -34,6 +34,8 @@
 #include <set>
 #include <vector>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/audit.h"
@@ -41,20 +43,20 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer/balancer.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_write.h"
+#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/config.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
 #include "mongo/s/shard_util.h"
@@ -92,7 +94,7 @@ public:
              << "   { enablesharding : \"<dbname>\" }\n";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -205,7 +207,8 @@ public:
         // The rest of the checks require a connection to the primary db
         ConnectionString shardConnString;
         {
-            const auto shard = grid.shardRegistry()->getShard(txn, config->getPrimaryId());
+            const auto shard =
+                uassertStatusOK(grid.shardRegistry()->getShard(txn, config->getPrimaryId()));
             shardConnString = shard->getConnString();
         }
 
@@ -222,27 +225,74 @@ public:
             }
         }
 
-        BSONObj collectionOptions;
-        if (res["options"].type() == BSONType::Object) {
-            collectionOptions = res["options"].Obj();
-        }
+        BSONObj defaultCollation;
 
-        // Check that collection is not capped.
-        if (collectionOptions["capped"].trueValue()) {
-            errmsg = "can't shard capped collection";
-            conn.done();
-            return false;
-        }
+        if (!res.isEmpty()) {
+            // Check that namespace is not a view.
+            {
+                std::string namespaceType;
+                auto status = bsonExtractStringField(res, "type", &namespaceType);
+                if (!status.isOK()) {
+                    conn.done();
+                    return appendCommandStatus(result, status);
+                }
 
-        // If the collection has a non-simple default collation but the user did not specify the
-        // simple collation explicitly, return an error.
-        if (collectionOptions["collation"] && !simpleCollationSpecified) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::BadValue,
-                                        str::stream()
-                                            << "Collection has default collation: "
-                                            << collectionOptions["collation"]
-                                            << ". Must specify collation {locale: 'simple'}"});
+                if (namespaceType == "view") {
+                    conn.done();
+                    return appendCommandStatus(
+                        result,
+                        {ErrorCodes::CommandNotSupportedOnView, "Views cannot be sharded."});
+                }
+            }
+
+            BSONObj collectionOptions;
+            if (res["options"].type() == BSONType::Object) {
+                collectionOptions = res["options"].Obj();
+            }
+
+            // Check that collection is not capped.
+            if (collectionOptions["capped"].trueValue()) {
+                errmsg = "can't shard capped collection";
+                conn.done();
+                return false;
+            }
+
+            // Get collection default collation.
+            {
+                BSONElement collationElement;
+                auto status = bsonExtractTypedField(
+                    collectionOptions, "collation", BSONType::Object, &collationElement);
+                if (status.isOK()) {
+                    defaultCollation = collationElement.Obj().getOwned();
+                    if (defaultCollation.isEmpty()) {
+                        conn.done();
+                        return appendCommandStatus(
+                            result,
+                            {ErrorCodes::BadValue,
+                             "Default collation in collection metadata cannot be empty."});
+                    }
+                } else if (status != ErrorCodes::NoSuchKey) {
+                    conn.done();
+                    return appendCommandStatus(
+                        result,
+                        {status.code(),
+                         str::stream()
+                             << "Could not parse default collation in collection metadata "
+                             << causedBy(status)});
+                }
+            }
+
+            // If the collection has a non-simple default collation but the user did not specify the
+            // simple collation explicitly, return an error.
+            if (!defaultCollation.isEmpty() && !simpleCollationSpecified) {
+                conn.done();
+                return appendCommandStatus(result,
+                                           {ErrorCodes::BadValue,
+                                            str::stream()
+                                                << "Collection has default collation: "
+                                                << collectionOptions["collation"]
+                                                << ". Must specify collation {locale: 'simple'}"});
+            }
         }
 
         // The proposed shard key must be validated against the set of existing indexes.
@@ -300,7 +350,7 @@ public:
             BSONObj currentKey = idx["key"].embeddedObject();
             // Check 2.i. and 2.ii.
             if (!idx["sparse"].trueValue() && idx["filter"].eoo() && idx["collation"].eoo() &&
-                proposedKey.isPrefixOf(currentKey)) {
+                proposedKey.isPrefixOf(currentKey, SimpleBSONElementComparator::kInstance)) {
                 // We can't currently use hashed indexes with a non-default hash seed
                 // Check v.
                 // Note that this means that, for sharding, we only support one hashed index
@@ -327,7 +377,8 @@ public:
 
             for (list<BSONObj>::iterator it = indexes.begin(); it != indexes.end(); ++it) {
                 BSONObj idx = *it;
-                if (idx["key"].embeddedObject() == proposedKey) {
+                if (SimpleBSONObjComparator::kInstance.evaluate(idx["key"].embeddedObject() ==
+                                                                proposedKey)) {
                     eqQueryResult = idx;
                     break;
                 }
@@ -375,7 +426,12 @@ public:
             // 5. If no useful index exists, and collection empty, create one on proposedKey.
             //    Only need to call ensureIndex on primary shard, since indexes get copied to
             //    receiving shard whenever a migrate occurs.
-            Status status = clusterCreateIndex(txn, nss.ns(), proposedKey, careAboutUnique);
+            //    If the collection has a default collation, explicitly send the simple
+            //    collation as part of the createIndex request.
+            BSONObj collationArg =
+                !defaultCollation.isEmpty() ? CollationSpec::kSimpleSpec : BSONObj();
+            Status status =
+                clusterCreateIndex(txn, nss.ns(), proposedKey, collationArg, careAboutUnique);
             if (!status.isOK()) {
                 errmsg = str::stream() << "ensureIndex failed to create index on "
                                        << "primary shard: " << status.reason();
@@ -427,7 +483,9 @@ public:
                 current += intervalSize;
             }
 
-            sort(allSplits.begin(), allSplits.end());
+            sort(allSplits.begin(),
+                 allSplits.end(),
+                 SimpleBSONObjComparator::kInstance.makeLessThan());
 
             // 1. the initial splits define the "big chunks" that we will subdivide later
             int lastIndex = -1;
@@ -450,11 +508,15 @@ public:
 
         LOG(0) << "CMD: shardcollection: " << cmdObj;
 
-        audit::logShardCollection(
-            ClientBasic::getCurrent(), nss.ns(), proposedKey, careAboutUnique);
+        audit::logShardCollection(Client::getCurrent(), nss.ns(), proposedKey, careAboutUnique);
 
-        Status status = grid.catalogClient(txn)->shardCollection(
-            txn, nss.ns(), proposedShardKey, careAboutUnique, initSplits, std::set<ShardId>{});
+        Status status = grid.catalogClient(txn)->shardCollection(txn,
+                                                                 nss.ns(),
+                                                                 proposedShardKey,
+                                                                 defaultCollation,
+                                                                 careAboutUnique,
+                                                                 initSplits,
+                                                                 std::set<ShardId>{});
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -476,10 +538,11 @@ public:
             int i = 0;
             for (ChunkMap::const_iterator c = chunkMap.begin(); c != chunkMap.end(); ++c, ++i) {
                 const ShardId& shardId = shardIds[i % numShards];
-                const auto to = grid.shardRegistry()->getShard(txn, shardId);
-                if (!to) {
+                const auto toStatus = grid.shardRegistry()->getShard(txn, shardId);
+                if (!toStatus.isOK()) {
                     continue;
                 }
+                const auto to = toStatus.getValue();
 
                 shared_ptr<Chunk> chunk = c->second;
 
@@ -495,7 +558,7 @@ public:
                 chunkType.setShard(chunk->getShardId());
                 chunkType.setVersion(chunkManager->getVersion());
 
-                Status moveStatus = Balancer::get(txn)->moveSingleChunk(
+                Status moveStatus = configsvr_client::moveChunk(
                     txn,
                     chunkType,
                     to->getId(),
@@ -504,8 +567,9 @@ public:
                         MigrationSecondaryThrottleOptions::kOff),
                     true);
                 if (!moveStatus.isOK()) {
-                    warning() << "couldn't move chunk " << chunk->toString() << " to shard " << *to
-                              << " while sharding collection " << nss.ns() << causedBy(moveStatus);
+                    warning() << "couldn't move chunk " << redact(chunk->toString()) << " to shard "
+                              << *to << " while sharding collection " << nss.ns()
+                              << causedBy(redact(moveStatus));
                 }
             }
 
@@ -518,7 +582,8 @@ public:
 
             // 3. Subdivide the big chunks by splitting at each of the points in "allSplits"
             //    that we haven't already split by.
-            shared_ptr<Chunk> currentChunk = chunkManager->findIntersectingChunk(txn, allSplits[0]);
+            shared_ptr<Chunk> currentChunk =
+                chunkManager->findIntersectingChunkWithSimpleCollation(txn, allSplits[0]);
 
             vector<BSONObj> subSplits;
             for (unsigned i = 0; i <= allSplits.size(); i++) {
@@ -532,18 +597,20 @@ public:
                             chunkManager->getVersion(),
                             currentChunk->getMin(),
                             currentChunk->getMax(),
+                            currentChunk->getLastmod(),
                             subSplits);
                         if (!splitStatus.isOK()) {
-                            warning() << "couldn't split chunk " << currentChunk->toString()
+                            warning() << "couldn't split chunk " << redact(currentChunk->toString())
                                       << " while sharding collection " << nss.ns()
-                                      << causedBy(splitStatus.getStatus());
+                                      << causedBy(redact(splitStatus.getStatus()));
                         }
 
                         subSplits.clear();
                     }
 
                     if (i < allSplits.size()) {
-                        currentChunk = chunkManager->findIntersectingChunk(txn, allSplits[i]);
+                        currentChunk = chunkManager->findIntersectingChunkWithSimpleCollation(
+                            txn, allSplits[i]);
                     }
                 } else {
                     BSONObj splitPoint(allSplits[i]);

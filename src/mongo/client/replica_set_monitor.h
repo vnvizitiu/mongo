@@ -36,6 +36,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -80,11 +81,11 @@ public:
      *   wait for one to become available for up to the specified time and periodically refresh
      *   the view of the set. The call may return with an error earlier than the specified value,
      *   if none of the known hosts for the set are reachable within some number of attempts.
+     *   Note that if a maxWait of 0ms is specified, this method may still attempt to contact
+     *   every host in the replica set up to one time.
      *
      * Known errors are:
      *  FailedToSatisfyReadPreference, if node cannot be found, which matches the read preference.
-     *  ReplicaSetNotFound, if none of the known hosts for the replica set are reachable within
-     *      maxConsecutiveFailedChecks number of attempts.
      */
     StatusWith<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
                                              Milliseconds maxWait = kDefaultFindHostTimeout);
@@ -106,12 +107,14 @@ public:
     Refresher startOrContinueRefresh();
 
     /**
-     * Notifies this Monitor that a host has failed and should be considered down.
+     * Notifies this Monitor that a host has failed because of the specified error 'status' and
+     * should be considered down.
      *
-     * Call this when you get a connection error. If you get an error while trying to refresh
-     * our view of a host, call Refresher::hostFailed() instead.
+     * Call this when you get a connection error. If you get an error while trying to refresh our
+     * view of a host, call Refresher::failedHost instead because it bypasses taking the monitor's
+     * mutex.
      */
-    void failedHost(const HostAndPort& host);
+    void failedHost(const HostAndPort& host, const Status& status);
 
     /**
      * Returns true if this node is the master based ONLY on local data. Be careful, return may
@@ -134,13 +137,6 @@ public:
      * Returns the maximum wire version supported across the replica set.
      */
     int getMaxWireVersion() const;
-
-    /**
-     * This call will return false if this monitor ever enters a state where none of the nodes could
-     * be contacted for some amount of attempts. Such monitors will be removed from the periodic
-     * refresh thread.
-     */
-    bool isSetUsable() const;
 
     /**
      * The name of the set.
@@ -169,9 +165,15 @@ public:
     bool isKnownToHaveGoodPrimary() const;
 
     /**
+     * Marks the instance as removed to exit refresh sooner.
+     */
+    void markAsRemoved();
+
+    /**
      * Creates a new ReplicaSetMonitor, if it doesn't already exist.
      */
-    static void createIfNeeded(const std::string& name, const std::set<HostAndPort>& servers);
+    static std::shared_ptr<ReplicaSetMonitor> createIfNeeded(const std::string& name,
+                                                             const std::set<HostAndPort>& servers);
 
     /**
      * gets a cached Monitor per name. If the monitor is not found and createFromSeed is false,
@@ -213,9 +215,14 @@ public:
     /**
      * Permanently stops all monitoring on replica sets and clears all cached information
      * as well. As a consequence, NEVER call this if you have other threads that have a
-     * DBClientReplicaSet instance.
+     * DBClientReplicaSet instance. This method should be used for unit test only.
      */
     static void cleanup();
+
+    /**
+     * Permanently stops all monitoring on replica sets.
+     */
+    static void shutdown();
 
     //
     // internal types (defined in replica_set_monitor_internal.h)
@@ -232,13 +239,6 @@ public:
      */
     explicit ReplicaSetMonitor(const SetStatePtr& initialState) : _state(initialState) {}
     ~ReplicaSetMonitor();
-
-    /**
-     * If a ReplicaSetMonitor has been refreshed more than this many times in a row without
-     * finding any live nodes claiming to be in the set, the ReplicaSetMonitor will stop
-     * periodic background refreshes of this set.
-     */
-    static std::atomic<int> maxConsecutiveFailedChecks;  // NOLINT
 
     /**
      * The default timeout, which will be used for finding a replica set host if the caller does
@@ -268,6 +268,7 @@ private:
 
     const SetStatePtr _state;
     executor::TaskExecutor* _executor;
+    AtomicBool _isRemovedFromManager{false};
 };
 
 
@@ -347,7 +348,7 @@ public:
     /**
      * Call this if a host returned from getNextStep failed to reply to an isMaster call.
      */
-    void failedHost(const HostAndPort& host);
+    void failedHost(const HostAndPort& host, const Status& status);
 
     /**
      * True if this Refresher started a new full scan rather than joining an existing one.
@@ -363,15 +364,17 @@ public:
 
 private:
     /**
-     * First, checks that the "reply" is not from a stale primary by
-     * comparing the electionId of "reply" to the maxElectionId recorded by the SetState.
-     * Returns true if "reply" belongs to a non-stale primary.
+     * First, checks that the "reply" is not from a stale primary by comparing the electionId of
+     * "reply" to the maxElectionId recorded by the SetState and returns OK status if "reply"
+     * belongs to a non-stale primary. Otherwise returns a failed status.
+     *
+     * The 'from' parameter specifies the node from which the response is received.
      *
      * Updates _set and _scan based on set-membership information from a master.
      * Applies _scan->unconfirmedReplies to confirmed nodes.
      * Does not update this host's node in _set->nodes.
      */
-    bool receivedIsMasterFromMaster(const IsMasterReply& reply);
+    Status receivedIsMasterFromMaster(const HostAndPort& from, const IsMasterReply& reply);
 
     /**
      * Adjusts the _scan work queue based on information from this host.

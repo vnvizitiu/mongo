@@ -14,6 +14,8 @@
 #define HAVE_HYPOT 1
 #define HAVE_LOCALECONV 1
 #define HAVE_LOCALECONV 1
+// Define HAVE_LOG2 manually until we regenerate the config as part of SERVER-25464.
+#define HAVE_LOG2 1
 #define HAVE_MALLOC_H 1
 #define HAVE_SNPRINTF 1
 #define HAVE__GETC_NOLOCK 1
@@ -28,10 +30,10 @@
 #define MALLOC_H <malloc.h>
 #define MALLOC_USABLE_SIZE_CONST_PTR const
 #define MOZILLA_UAVERSION "45.0"
-#define MOZILLA_VERSION "45.0.1"
-#define MOZILLA_VERSION_U 45.0.1
+#define MOZILLA_VERSION "45.4.0"
+#define MOZILLA_VERSION_U 45.4.0
 #define MOZJS_MAJOR_VERSION 45
-#define MOZJS_MINOR_VERSION 0
+#define MOZJS_MINOR_VERSION 4
 #define MOZ_DEBUG_SYMBOLS 1
 #define MOZ_DLL_SUFFIX ".dll"
 #define MOZ_MEMORY 1

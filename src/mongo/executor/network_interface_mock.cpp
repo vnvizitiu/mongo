@@ -112,7 +112,7 @@ std::string NetworkInterfaceMock::getHostName() {
 }
 
 Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
-                                          const RemoteCommandRequest& request,
+                                          RemoteCommandRequest& request,
                                           const RemoteCommandCompletionFn& onFinish) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceMock shutdown in progress"};
@@ -149,15 +149,20 @@ void NetworkInterfaceMock::cancelCommand(const CallbackHandle& cbHandle) {
     invariant(!inShutdown());
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    ResponseStatus response(ErrorCodes::CallbackCanceled, "Network operation canceled");
-    _cancelCommand_inlock(cbHandle, response);
+    ResponseStatus rs(ErrorCodes::CallbackCanceled, "Network operation canceled", Milliseconds(0));
+
+    // We mimic the real NetworkInterface by only delivering the CallbackCanceled status if the
+    // operation has not already received a response (i.e., is not already in the _scheduled queue).
+    std::vector<NetworkOperationList*> queuesToCheck{&_unscheduled, &_blackHoled, &_processing};
+    _interruptWithResponse_inlock(cbHandle, queuesToCheck, rs);
 }
 
-
-void NetworkInterfaceMock::_cancelCommand_inlock(const CallbackHandle& cbHandle,
-                                                 const ResponseStatus& response) {
+void NetworkInterfaceMock::_interruptWithResponse_inlock(
+    const CallbackHandle& cbHandle,
+    const std::vector<NetworkOperationList*> queuesToCheck,
+    const ResponseStatus& response) {
     auto matchFn = stdx::bind(&NetworkOperation::isForCallback, stdx::placeholders::_1, cbHandle);
-    for (auto list : {&_unscheduled, &_blackHoled, &_scheduled}) {
+    for (auto list : queuesToCheck) {
         auto noi = std::find_if(list->begin(), list->end(), matchFn);
         if (noi == list->end()) {
             continue;
@@ -166,7 +171,6 @@ void NetworkInterfaceMock::_cancelCommand_inlock(const CallbackHandle& cbHandle,
         noi->setResponse(_now_inlock(), response);
         return;
     }
-    // No not-in-progress network command matched cbHandle.  Oh, well.
 }
 
 Status NetworkInterfaceMock::setAlarm(const Date_t when, const stdx::function<void()>& action) {
@@ -216,7 +220,7 @@ void NetworkInterfaceMock::shutdown() {
     lk.unlock();
     for (NetworkOperationIterator iter = todo.begin(); iter != todo.end(); ++iter) {
         iter->setResponse(
-            now, ResponseStatus(ErrorCodes::ShutdownInProgress, "Shutting down mock network"));
+            now, {ErrorCodes::ShutdownInProgress, "Shutting down mock network", Milliseconds(0)});
         iter->finishResponse();
     }
     lk.lock();
@@ -298,7 +302,7 @@ void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
     // If no RemoteCommandResponse was returned (for example, on a simulated network error), then
     // do not attempt to run the metadata hook, since there is no returned metadata.
     if (_metadataHook && response.isOK()) {
-        _metadataHook->readReplyMetadata(noi->getRequest().target, response.getValue().metadata);
+        _metadataHook->readReplyMetadata(noi->getRequest().target, response.metadata);
     }
 
     noi->setResponse(when, response);
@@ -307,7 +311,7 @@ void NetworkInterfaceMock::scheduleResponse(NetworkOperationIterator noi,
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleSuccessfulResponse(const BSONObj& response) {
     BSONObj metadata;
-    return scheduleSuccessfulResponse(RemoteCommandResponse(response, metadata));
+    return scheduleSuccessfulResponse(RemoteCommandResponse(response, metadata, Milliseconds(0)));
 }
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleSuccessfulResponse(
@@ -328,6 +332,12 @@ RemoteCommandRequest NetworkInterfaceMock::scheduleSuccessfulResponse(
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleErrorResponse(const Status& response) {
     return scheduleErrorResponse(getNextReadyRequest(), response);
+}
+
+RemoteCommandRequest NetworkInterfaceMock::scheduleErrorResponse(const ResponseStatus response) {
+    auto noi = getNextReadyRequest();
+    scheduleResponse(noi, now(), response);
+    return noi->getRequest();
 }
 
 RemoteCommandRequest NetworkInterfaceMock::scheduleErrorResponse(NetworkOperationIterator noi,
@@ -426,9 +436,13 @@ void NetworkInterfaceMock::_enqueueOperation_inlock(
 
     if (op.getRequest().timeout != RemoteCommandRequest::kNoTimeout) {
         invariant(op.getRequest().timeout >= Milliseconds(0));
-        ResponseStatus response(ErrorCodes::NetworkTimeout, "Network timeout");
-        auto action = stdx::bind(
-            &NetworkInterfaceMock::_cancelCommand_inlock, this, op.getCallbackHandle(), response);
+        ResponseStatus rs(ErrorCodes::NetworkTimeout, "Network timeout", Milliseconds(0));
+        std::vector<NetworkOperationList*> queuesToCheck{&_unscheduled, &_blackHoled, &_scheduled};
+        auto action = stdx::bind(&NetworkInterfaceMock::_interruptWithResponse_inlock,
+                                 this,
+                                 op.getCallbackHandle(),
+                                 queuesToCheck,
+                                 rs);
         _alarms.emplace(_now_inlock() + op.getRequest().timeout, action);
     }
 }
@@ -470,17 +484,15 @@ void NetworkInterfaceMock::_connectThenEnqueueOperation_inlock(const HostAndPort
     }
 
     // The completion handler for the postconnect command schedules the original command.
-    auto postconnectCompletionHandler = [this,
-                                         op](StatusWith<RemoteCommandResponse> response) mutable {
+    auto postconnectCompletionHandler = [this, op](ResponseStatus rs) mutable {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (!response.isOK()) {
-            op.setResponse(_now_inlock(), response.getStatus());
+        if (!rs.isOK()) {
+            op.setResponse(_now_inlock(), rs);
             op.finishResponse();
             return;
         }
 
-        auto handleStatus =
-            _hook->handleReply(op.getRequest().target, std::move(response.getValue()));
+        auto handleStatus = _hook->handleReply(op.getRequest().target, std::move(rs));
 
         if (!handleStatus.isOK()) {
             op.setResponse(_now_inlock(), handleStatus);
@@ -585,8 +597,8 @@ bool NetworkInterfaceMock::_isExecutorThreadRunnable_inlock() {
     return _waitingToRunMask & kExecutorThread;
 }
 
-static const StatusWith<RemoteCommandResponse> kUnsetResponse(
-    ErrorCodes::InternalError, "NetworkOperation::_response never set");
+static const ResponseStatus kUnsetResponse(ErrorCodes::InternalError,
+                                           "NetworkOperation::_response never set");
 
 NetworkInterfaceMock::NetworkOperation::NetworkOperation()
     : _requestDate(),
@@ -612,9 +624,8 @@ NetworkInterfaceMock::NetworkOperation::~NetworkOperation() {}
 
 std::string NetworkInterfaceMock::NetworkOperation::getDiagnosticString() const {
     return str::stream() << "NetworkOperation -- request:'" << _request.toString()
-                         << "', responseStatus: '" << _response.getStatus().toString()
-                         << "', responseBody: '"
-                         << (_response.getStatus().isOK() ? _response.getValue().toString() : "")
+                         << "', responseStatus: '" << _response.status.toString()
+                         << "', responseBody: '" << (_response.isOK() ? _response.toString() : "")
                          << "', reqDate: " << _requestDate.toString()
                          << ", nextConsiderDate: " << _nextConsiderationDate.toString()
                          << ", respDate: " << _responseDate.toString();
@@ -651,6 +662,15 @@ void NetworkInterfaceMock::InNetworkGuard::dismiss() {
 NetworkInterfaceMock::InNetworkGuard::~InNetworkGuard() {
     if (_callExitNetwork)
         _net->exitNetwork();
+}
+
+NetworkInterfaceMock* NetworkInterfaceMock::InNetworkGuard::operator->() const {
+    return _net;
+}
+
+NetworkInterfaceMockClockSource::NetworkInterfaceMockClockSource(NetworkInterfaceMock* net)
+    : _net(net) {
+    _tracksSystemClock = false;
 }
 
 }  // namespace executor

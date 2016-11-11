@@ -45,6 +45,8 @@ public:
 
     executor::TaskExecutor* getTaskExecutor() const override;
 
+    OldThreadPool* getDbWorkThreadPool() const override;
+
     OpTimeWithTerm getCurrentTermAndLastCommittedOpTime() override;
 
     void processMetadata(const rpc::ReplSetMetadata& metadata) override;
@@ -60,6 +62,9 @@ public:
 
     // Task executor. Not owned by us.
     executor::TaskExecutor* taskExecutor = nullptr;
+
+    // DB worker thread pool. Not owned by us.
+    OldThreadPool* dbWorkThreadPool = nullptr;
 
     // Returned by getCurrentTermAndLastCommittedOpTime.
     long long currentTerm = OpTime::kUninitializedTerm;
@@ -86,10 +91,11 @@ private:
                                    MultiApplier::Operations ops,
                                    MultiApplier::ApplyOperationFn applyOperation) override;
 
-    void _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
+    Status _multiSyncApply(MultiApplier::OperationPtrs* ops) override;
 
-    void _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                const HostAndPort& source) override;
+    Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                  const HostAndPort& source,
+                                  AtomicUInt32* fetchCount) override;
 };
 
 

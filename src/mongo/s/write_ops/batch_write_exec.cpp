@@ -170,16 +170,14 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                     continue;
 
                 // Figure out what host we need to dispatch our targeted batch
-                bool resolvedHost = true;
                 const ReadPreferenceSetting readPref(ReadPreference::PrimaryOnly, TagSet());
-                auto shard =
-                    grid.shardRegistry()->getShard(txn, nextBatch->getEndpoint().shardName);
+                auto shardStatus = Grid::get(txn)->shardRegistry()->getShard(
+                    txn, nextBatch->getEndpoint().shardName);
 
-                if (!shard) {
-                    Status status = Status(ErrorCodes::ShardNotFound,
-                                           str::stream() << "unknown shard name "
-                                                         << nextBatch->getEndpoint().shardName);
-                    resolvedHost = false;
+                bool resolvedHost = false;
+                ConnectionString shardHost;
+                if (!shardStatus.isOK()) {
+                    Status status(std::move(shardStatus.getStatus()));
 
                     // Record a resolve failure
                     // TODO: It may be necessary to refresh the cache if stale, or maybe just
@@ -189,20 +187,25 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                     LOG(4) << "unable to send write batch to " << nextBatch->getEndpoint().shardName
                            << causedBy(status);
                     batchOp.noteBatchError(*nextBatch, error);
-                }
+                } else {
+                    auto shard = shardStatus.getValue();
 
-                auto swHostAndPort = shard->getTargeter()->findHost(readPref);
-                if (!swHostAndPort.isOK()) {
-                    resolvedHost = false;
+                    auto swHostAndPort = shard->getTargeter()->findHostNoWait(readPref);
+                    if (!swHostAndPort.isOK()) {
 
-                    // Record a resolve failure
-                    // TODO: It may be necessary to refresh the cache if stale, or maybe just
-                    // cancel and retarget the batch
-                    WriteErrorDetail error;
-                    buildErrorFrom(swHostAndPort.getStatus(), &error);
-                    LOG(4) << "unable to send write batch to " << nextBatch->getEndpoint().shardName
-                           << causedBy(swHostAndPort.getStatus());
-                    batchOp.noteBatchError(*nextBatch, error);
+                        // Record a resolve failure
+                        // TODO: It may be necessary to refresh the cache if stale, or maybe just
+                        // cancel and retarget the batch
+                        WriteErrorDetail error;
+                        buildErrorFrom(swHostAndPort.getStatus(), &error);
+                        LOG(4) << "unable to send write batch to "
+                               << nextBatch->getEndpoint().shardName
+                               << causedBy(swHostAndPort.getStatus());
+                        batchOp.noteBatchError(*nextBatch, error);
+                    } else {
+                        shardHost = ConnectionString(std::move(swHostAndPort.getValue()));
+                        resolvedHost = true;
+                    }
                 }
 
                 if (!resolvedHost) {
@@ -215,8 +218,6 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                     --numToSend;
                     continue;
                 }
-
-                ConnectionString shardHost(swHostAndPort.getValue());
 
                 // If we already have a batch for this host, wait until the next time
                 OwnedHostBatchMap::MapType::iterator pendingIt = pendingBatches.find(shardHost);
@@ -236,7 +237,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                 request.setNS(nss);
 
                 LOG(4) << "sending write batch to " << shardHost.toString() << ": "
-                       << request.toString();
+                       << redact(request.toString());
 
                 _dispatcher->addCommand(shardHost, nss.db(), request.toBSON());
 
@@ -273,7 +274,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                     trackedErrors.startTracking(ErrorCodes::StaleShardVersion);
 
                     LOG(4) << "write results received from " << shardHost.toString() << ": "
-                           << response.toString();
+                           << redact(response.toString());
 
                     // Dispatch was ok, note response
                     batchOp.noteBatchResponse(*batch, response, &trackedErrors);
@@ -305,7 +306,7 @@ void BatchWriteExec::executeBatch(OperationContext* txn,
                     buildErrorFrom(Status(ErrorCodes::RemoteResultsUnavailable, msg.str()), &error);
 
                     LOG(4) << "unable to receive write results from " << shardHost.toString()
-                           << causedBy(dispatchStatus.toString());
+                           << causedBy(redact(dispatchStatus.toString()));
 
                     batchOp.noteBatchError(*batch, error);
                 }

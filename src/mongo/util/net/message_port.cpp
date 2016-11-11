@@ -63,41 +63,6 @@ using std::string;
 
 /* messagingport -------------------------------------------------------------- */
 
-class Ports {
-    std::set<MessagingPort*> ports;
-    stdx::mutex m;
-
-public:
-    Ports() : ports() {}
-    void closeAll(AbstractMessagingPort::Tag skip_mask) {
-        stdx::lock_guard<stdx::mutex> bl(m);
-        for (std::set<MessagingPort*>::iterator i = ports.begin(); i != ports.end(); i++) {
-            if ((*i)->getTag() & skip_mask) {
-                LOG(3) << "Skip closing connection # " << (*i)->connectionId();
-                continue;
-            }
-            LOG(3) << "Closing connection # " << (*i)->connectionId();
-            (*i)->shutdown();
-        }
-    }
-    void insert(MessagingPort* p) {
-        stdx::lock_guard<stdx::mutex> bl(m);
-        ports.insert(p);
-    }
-    void erase(MessagingPort* p) {
-        stdx::lock_guard<stdx::mutex> bl(m);
-        ports.erase(p);
-    }
-};
-
-// we "new" this so it is still be around when other automatic global vars
-// are being destructed during termination.
-Ports& ports = *(new Ports());
-
-void MessagingPort::closeSockets(AbstractMessagingPort::Tag skipMask) {
-    ports.closeAll(skipMask);
-}
-
 MessagingPort::MessagingPort(int fd, const SockAddr& remote)
     : MessagingPort(std::make_shared<Socket>(fd, remote)) {}
 
@@ -105,10 +70,9 @@ MessagingPort::MessagingPort(double timeout, logger::LogSeverity ll)
     : MessagingPort(std::make_shared<Socket>(timeout, ll)) {}
 
 MessagingPort::MessagingPort(std::shared_ptr<Socket> sock)
-    : _x509SubjectName(), _connectionId(), _tag(), _psock(std::move(sock)) {
+    : _x509PeerInfo(), _connectionId(), _tag(), _psock(std::move(sock)) {
     SockAddr sa = _psock->remoteAddr();
     _remoteParsed = HostAndPort(sa.getAddr(), sa.getPort());
-    ports.insert(this);
 }
 
 void MessagingPort::setTimeout(Milliseconds millis) {
@@ -122,7 +86,6 @@ void MessagingPort::shutdown() {
 
 MessagingPort::~MessagingPort() {
     shutdown();
-    ports.erase(this);
 }
 
 bool MessagingPort::recv(Message& m) {
@@ -131,8 +94,7 @@ bool MessagingPort::recv(Message& m) {
     again:
 #endif
         MSGHEADER::Value header;
-        int headerLen = sizeof(MSGHEADER::Value);
-        _psock->recv((char*)&header, headerLen);
+        _psock->recv((char*)&header, sizeof(header));
         int len = header.constView().getMessageLength();
 
         if (len == 542393671) {
@@ -164,9 +126,12 @@ bool MessagingPort::recv(Message& m) {
                 uassert(17132,
                         "SSL handshake received but server is started without SSL support",
                         sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled);
-                setX509SubjectName(
+                setX509PeerInfo(
                     _psock->doSSLHandshake(reinterpret_cast<const char*>(&header), sizeof(header)));
+                LOG(1) << "new ssl connection, SNI server name [" << _psock->getSNIServerName()
+                       << "]";
                 _psock->setHandshakeReceived();
+
                 goto again;
             }
             uassert(17189,
@@ -174,22 +139,22 @@ bool MessagingPort::recv(Message& m) {
                     sslGlobalParams.sslMode.load() != SSLParams::SSLMode_requireSSL);
 #endif  // MONGO_CONFIG_SSL
         }
-        if (static_cast<size_t>(len) < sizeof(MSGHEADER::Value) ||
+        if (static_cast<size_t>(len) < sizeof(header) ||
             static_cast<size_t>(len) > MaxMessageSizeBytes) {
             LOG(0) << "recv(): message len " << len << " is invalid. "
-                   << "Min " << sizeof(MSGHEADER::Value) << " Max: " << MaxMessageSizeBytes;
+                   << "Min " << sizeof(header) << " Max: " << MaxMessageSizeBytes;
             return false;
         }
 
         _psock->setHandshakeReceived();
-        int z = (len + 1023) & 0xfffffc00;
-        verify(z >= len);
-        auto buf = SharedBuffer::allocate(z);
-        MsgData::View md = buf.get();
-        memcpy(md.view2ptr(), &header, headerLen);
-        int left = len - headerLen;
 
-        _psock->recv(md.data(), left);
+        auto buf = SharedBuffer::allocate(len);
+        MsgData::View md = buf.get();
+        memcpy(md.view2ptr(), &header, sizeof(header));
+
+        const int left = len - sizeof(header);
+        if (left)
+            _psock->recv(md.data(), left);
 
         m.setData(std::move(buf));
         return true;
@@ -216,6 +181,7 @@ bool MessagingPort::call(Message& toSend, Message& response) {
     say(toSend);
     bool success = recv(response);
     if (success) {
+        invariant(!response.empty());
         if (response.header().getResponseToMsgId() != toSend.header().getId()) {
             response.reset();
             uasserted(40134, "Response ID did not match the sent message ID.");
@@ -225,9 +191,15 @@ bool MessagingPort::call(Message& toSend, Message& response) {
 }
 
 void MessagingPort::say(Message& toSend, int responseTo) {
-    verify(!toSend.empty());
+    invariant(!toSend.empty());
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(responseTo);
+
+    return say(const_cast<const Message&>(toSend));
+}
+
+void MessagingPort::say(const Message& toSend) {
+    invariant(!toSend.empty());
     auto buf = toSend.buf();
     if (buf) {
         send(buf, MsgData::ConstView(buf).getLen(), "say");
@@ -246,12 +218,12 @@ SockAddr MessagingPort::localAddr() const {
     return _psock->localAddr();
 }
 
-void MessagingPort::setX509SubjectName(const std::string& x509SubjectName) {
-    _x509SubjectName = x509SubjectName;
+void MessagingPort::setX509PeerInfo(SSLPeerInfo x509PeerInfo) {
+    _x509PeerInfo = std::move(x509PeerInfo);
 }
 
-std::string MessagingPort::getX509SubjectName() const {
-    return _x509SubjectName;
+const SSLPeerInfo& MessagingPort::getX509PeerInfo() const {
+    return _x509PeerInfo;
 }
 
 void MessagingPort::setConnectionId(const long long connectionId) {

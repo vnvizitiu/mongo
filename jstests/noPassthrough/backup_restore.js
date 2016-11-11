@@ -226,12 +226,12 @@
             rst.start(secondary.nodeId, {}, true);
         }
 
-        // Wait up to 60 seconds until restarted node is in state secondary
-        rst.waitForState(rst.getSecondaries(), ReplSetTest.State.SECONDARY, 60 * 1000);
+        // Wait up to 5 minutes until restarted node is in state secondary.
+        rst.waitForState(rst.getSecondaries(), ReplSetTest.State.SECONDARY);
 
         // Add new hidden node to replSetTest
         var hiddenCfg =
-            {restart: true, oplogSize: 1024, dbpath: hiddenDbpath, replSet: replSetName};
+            {noCleanData: true, oplogSize: 1024, dbpath: hiddenDbpath, replSet: replSetName};
         rst.add(hiddenCfg);
         var hiddenHost = rst.nodes[numNodes].host;
 
@@ -259,10 +259,9 @@
         assert.commandWorked(primary.adminCommand({replSetReconfig: rsConfig}),
                              testName + ' failed to reconfigure replSet ' + tojson(rsConfig));
 
-        // Wait up to 60 seconds until the new hidden node is in state RECOVERING.
+        // Wait up to 5 minutes until the new hidden node is in state RECOVERING.
         rst.waitForState(rst.nodes[numNodes],
-                         [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY],
-                         60 * 1000);
+                         [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY]);
 
         // Stop CRUD client and FSM client.
         assert(checkProgram(crudPid), testName + ' CRUD client was not running at end of test');
@@ -270,10 +269,11 @@
         stopMongoProgramByPid(crudPid);
         stopMongoProgramByPid(fsmPid);
 
-        // Wait up to 60 seconds until the new hidden node is in state SECONDARY.
-        rst.waitForState(rst.nodes[numNodes], ReplSetTest.State.SECONDARY, 60 * 1000);
+        // Wait up to 5 minutes until the new hidden node is in state SECONDARY.
+        rst.waitForState(rst.nodes[numNodes], ReplSetTest.State.SECONDARY);
 
         // Wait for secondaries to finish catching up before shutting down.
+        primary = rst.getPrimary();
         assert.writeOK(primary.getDB("test").foo.insert(
             {}, {writeConcern: {w: rst.nodes.length, wtimeout: 10 * 60 * 1000}}));
 

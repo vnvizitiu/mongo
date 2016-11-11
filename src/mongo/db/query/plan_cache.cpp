@@ -36,6 +36,7 @@
 #include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_solution.h"
@@ -57,6 +58,7 @@ const char kEncodeChildrenEnd = ']';
 const char kEncodeChildrenSeparator = ',';
 const char kEncodeSortSection = '~';
 const char kEncodeProjectionSection = '|';
+const char kEncodeCollationSection = '#';
 
 /**
  * Encode user-provided string. Cache key delimiters seen in the
@@ -73,6 +75,7 @@ void encodeUserString(StringData s, StringBuilder* keyBuilder) {
             case kEncodeChildrenSeparator:
             case kEncodeSortSection:
             case kEncodeProjectionSection:
+            case kEncodeCollationSection:
             case '\\':
                 *keyBuilder << '\\';
             // Fall through to default case.
@@ -309,6 +312,7 @@ CachedSolution::CachedSolution(const PlanCacheKey& key, const PlanCacheEntry& en
       query(entry.query.getOwned()),
       sort(entry.sort.getOwned()),
       projection(entry.projection.getOwned()),
+      collation(entry.collation.getOwned()),
       decisionWorks(entry.decision->stats[0]->common.works) {
     // CachedSolution should not having any references into
     // cache entry. All relevant data should be cloned/copied.
@@ -369,6 +373,7 @@ PlanCacheEntry* PlanCacheEntry::clone() const {
     entry->query = query.getOwned();
     entry->sort = sort.getOwned();
     entry->projection = projection.getOwned();
+    entry->collation = collation.getOwned();
 
     // Copy performance stats.
     for (size_t i = 0; i < feedback.size(); ++i) {
@@ -383,6 +388,7 @@ PlanCacheEntry* PlanCacheEntry::clone() const {
 std::string PlanCacheEntry::toString() const {
     return str::stream() << "(query: " << query.toString() << ";sort: " << sort.toString()
                          << ";projection: " << projection.toString()
+                         << ";collation: " << collation.toString()
                          << ";solutions: " << plannerData.size() << ")";
 }
 
@@ -500,13 +506,13 @@ void PlanCache::encodeKeyForMatch(const MatchExpression* tree, StringBuilder* ke
     }
 
     // Encode indexability.
-    const IndexabilityDiscriminators& discriminators =
+    const IndexToDiscriminatorMap& discriminators =
         _indexabilityState.getDiscriminators(tree->path());
     if (!discriminators.empty()) {
         *keyBuilder << kEncodeDiscriminatorsBegin;
         // For each discriminator on this path, append the character '0' or '1'.
-        for (const IndexabilityDiscriminator& discriminator : discriminators) {
-            *keyBuilder << discriminator(tree);
+        for (auto&& indexAndDiscriminatorPair : discriminators) {
+            *keyBuilder << indexAndDiscriminatorPair.second.isMatchCompatibleWithIndex(tree);
         }
         *keyBuilder << kEncodeDiscriminatorsEnd;
     }
@@ -599,7 +605,7 @@ void PlanCache::encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuild
          ++i) {
         const BSONElement& elt = (*i).second;
 
-        if (elt.isSimpleType()) {
+        if (elt.type() != BSONType::Object) {
             // For inclusion/exclusion projections, we encode as "i" or "e".
             *keyBuilder << (elt.trueValue() ? "i" : "e");
         } else {
@@ -639,6 +645,9 @@ Status PlanCache::add(const CanonicalQuery& query,
     const QueryRequest& qr = query.getQueryRequest();
     entry->query = qr.getFilter().getOwned();
     entry->sort = qr.getSort().getOwned();
+    if (query.getCollator()) {
+        entry->collation = query.getCollator()->getSpec().toBSON();
+    }
 
     // Strip projections on $-prefixed fields, as these are added by internal callers of the query
     // system and are not considered part of the user projection.
@@ -656,7 +665,7 @@ Status PlanCache::add(const CanonicalQuery& query,
 
     if (NULL != evictedEntry.get()) {
         LOG(1) << _ns << ": plan cache maximum size exceeded - "
-               << "removed least recently used entry " << evictedEntry->toString();
+               << "removed least recently used entry " << redact(evictedEntry->toString());
     }
 
     return Status::OK();

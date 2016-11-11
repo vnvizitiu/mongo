@@ -50,6 +50,7 @@
 
 namespace mongo {
 
+using repl::UnreplicatedWritesBlock;
 using std::endl;
 using std::string;
 using std::stringstream;
@@ -81,7 +82,7 @@ public:
                      string& errmsg,
                      BSONObjBuilder& result) {
         string coll = cmdObj["godinsert"].valuestrsafe();
-        log() << "test only command godinsert invoked coll:" << coll << endl;
+        log() << "test only command godinsert invoked coll:" << coll;
         uassert(13049, "godinsert must specify a collection", !coll.empty());
         string ns = dbname + "." + coll;
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
@@ -92,7 +93,7 @@ public:
         Database* db = ctx.db();
 
         WriteUnitOfWork wunit(txn);
-        txn->setReplicatedWrites(false);
+        UnreplicatedWritesBlock unreplicatedWritesBlock(txn);
         Collection* collection = db->getCollection(ns);
         if (!collection) {
             collection = db->createCollection(txn, ns);
@@ -160,7 +161,7 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        log() << "test only command sleep invoked" << endl;
+        log() << "test only command sleep invoked";
         long long millis = 0;
 
         if (cmdObj["secs"] || cmdObj["millis"]) {
@@ -237,6 +238,12 @@ public:
         Collection* collection = ctx.getCollection();
 
         if (!collection) {
+            if (ctx.db()->getViewCatalog()->lookup(txn, fullNs.ns())) {
+                return appendCommandStatus(
+                    result,
+                    {ErrorCodes::CommandNotSupportedOnView,
+                     str::stream() << "captrunc not supported on views: " << fullNs.ns()});
+            }
             return appendCommandStatus(
                 result,
                 {ErrorCodes::NamespaceNotFound,

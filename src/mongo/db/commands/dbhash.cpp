@@ -126,7 +126,8 @@ public:
                                                                             "system.new_users",
                                                                             "system.roles",
                                                                             "system.users",
-                                                                            "system.version"};
+                                                                            "system.version",
+                                                                            "system.views"};
 
 
         BSONObjBuilder bb(result.subobjStart("collections"));
@@ -223,7 +224,7 @@ private:
                                               desc,
                                               BSONObj(),
                                               BSONObj(),
-                                              false,  // endKeyInclusive
+                                              BoundInclusion::kIncludeStartKeyOnly,
                                               PlanExecutor::YIELD_MANUAL,
                                               InternalPlanner::FORWARD,
                                               InternalPlanner::IXSCAN_FETCH);

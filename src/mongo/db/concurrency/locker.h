@@ -49,6 +49,18 @@ public:
     virtual ~Locker() {}
 
     /**
+     * Returns true if this is an instance of LockerNoop. Because LockerNoop doesn't implement many
+     * methods, some users may need to check this first to find out what is safe to call. LockerNoop
+     * is only used in unittests and for a brief period at startup, so you can assume you hold the
+     * equivalent of a MODE_X lock when using it.
+     *
+     * TODO get rid of this once we kill LockerNoop.
+     */
+    virtual bool isNoop() const {
+        return false;
+    }
+
+    /**
      * Require global lock attempts to obtain tickets from 'reading' (for MODE_S and MODE_IS),
      * and from 'writing' (for MODE_IX), which must have static lifetimes. There is no throttling
      * for MODE_X, as there can only ever be a single locker using this mode. The throttling is
@@ -302,12 +314,24 @@ public:
      */
     virtual bool hasLockPending() const = 0;
 
-    // Used for the replication parallel log op application threads
-    virtual void setIsBatchWriter(bool newValue) = 0;
-    virtual bool isBatchWriter() const = 0;
+    /**
+     * If set to false, this opts out of conflicting with replication's use of the
+     * ParallelBatchWriterMode lock. Code that opts-out must be ok with seeing an inconsistent view
+     * of data because within a batch, secondaries apply operations in a different order than on the
+     * primary. User operations should *never* opt out.
+     */
+    void setShouldConflictWithSecondaryBatchApplication(bool newValue) {
+        _shouldConflictWithSecondaryBatchApplication = newValue;
+    }
+    bool shouldConflictWithSecondaryBatchApplication() const {
+        return _shouldConflictWithSecondaryBatchApplication;
+    }
 
 protected:
     Locker() {}
+
+private:
+    bool _shouldConflictWithSecondaryBatchApplication = true;
 };
 
 }  // namespace mongo

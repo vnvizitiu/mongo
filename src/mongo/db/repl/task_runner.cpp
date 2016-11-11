@@ -65,7 +65,7 @@ TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
     try {
         return task(txn, status);
     } catch (...) {
-        log() << "Unhandled exception in task runner: " << exceptionToStatus();
+        log() << "Unhandled exception in task runner: " << redact(exceptionToStatus());
     }
     return TaskRunner::NextAction::kCancel;
 }
@@ -83,9 +83,7 @@ TaskRunner::TaskRunner(OldThreadPool* threadPool)
 }
 
 TaskRunner::~TaskRunner() {
-    DESTRUCTOR_GUARD(UniqueLock lk(_mutex); if (!_active) { return; } _cancelRequested = true;
-                     _condition.notify_all();
-                     while (_active) { _condition.wait(lk); });
+    DESTRUCTOR_GUARD(cancel(); join(););
 }
 
 std::string TaskRunner::getDiagnosticString() const {
@@ -125,6 +123,11 @@ void TaskRunner::cancel() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _cancelRequested = true;
     _condition.notify_all();
+}
+
+void TaskRunner::join() {
+    UniqueLock lk(_mutex);
+    _condition.wait(lk, [this]() { return !_active; });
 }
 
 void TaskRunner::_runTasks() {
@@ -224,12 +227,10 @@ Status TaskRunner::runSynchronousTask(SynchronousTask func, TaskRunner::NextActi
         } else {
             // Run supplied function.
             try {
-                log() << "starting to run synchronous task on runner.";
                 returnStatus = func(txn);
-                log() << "done running the synchronous task.";
             } catch (...) {
                 returnStatus = exceptionToStatus();
-                error() << "Exception thrown in runSynchronousTask: " << returnStatus;
+                error() << "Exception thrown in runSynchronousTask: " << redact(returnStatus);
             }
         }
 

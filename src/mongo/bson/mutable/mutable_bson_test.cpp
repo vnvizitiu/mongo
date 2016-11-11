@@ -807,13 +807,13 @@ TEST(Serialization, RoundTrip) {
     obj = mongo::fromjson(jsonSampleWithDecimal);
     mmb::Document doc(obj.copy());
     mongo::BSONObj built = doc.getObject();
-    ASSERT_EQUALS(obj, built);
+    ASSERT_BSONOBJ_EQ(obj, built);
 }
 
 TEST(Documentation, Example1) {
     // Create a new document
     mmb::Document doc;
-    ASSERT_EQUALS(mongo::fromjson("{}"), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{}"), doc.getObject());
 
     // Get the root of the document.
     mmb::Element root = doc.root();
@@ -822,41 +822,41 @@ TEST(Documentation, Example1) {
     // everything, then push that Element into the root object, making it a child of root.
     mmb::Element e0 = doc.makeElementInt("ltuae", 42);
     ASSERT_OK(root.pushBack(e0));
-    ASSERT_EQUALS(mongo::fromjson("{ ltuae : 42 }"), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ ltuae : 42 }"), doc.getObject());
 
     // Create a new empty mongo::Object-typed Element named 'magic', and push it back as a
     // child of the root, making it a sibling of e0.
     mmb::Element e1 = doc.makeElementObject("magic");
     ASSERT_OK(root.pushBack(e1));
-    ASSERT_EQUALS(mongo::fromjson("{ ltuae : 42, magic : {} }"), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ ltuae : 42, magic : {} }"), doc.getObject());
 
     // Create a new mongo::NumberDouble typed Element to represent Pi, and insert it as child
     // of the new object we just created.
     mmb::Element e3 = doc.makeElementDouble("pi", 3.14);
     ASSERT_OK(e1.pushBack(e3));
-    ASSERT_EQUALS(mongo::fromjson("{ ltuae : 42, magic : { pi : 3.14 } }"), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ ltuae : 42, magic : { pi : 3.14 } }"), doc.getObject());
 
     // Create a new mongo::NumberDouble to represent Plancks constant in electrovolt
     // micrometers, and add it as a child of the 'magic' object.
     mmb::Element e4 = doc.makeElementDouble("hbar", 1.239);
     ASSERT_OK(e1.pushBack(e4));
-    ASSERT_EQUALS(mongo::fromjson("{ ltuae : 42, magic : { pi : 3.14, hbar : 1.239 } }"),
-                  doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ ltuae : 42, magic : { pi : 3.14, hbar : 1.239 } }"),
+                      doc.getObject());
 
     // Rename the parent element of 'hbar' to be 'constants'.
     ASSERT_OK(e4.parent().rename("constants"));
-    ASSERT_EQUALS(mongo::fromjson("{ ltuae : 42, constants : { pi : 3.14, hbar : 1.239 } }"),
-                  doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ ltuae : 42, constants : { pi : 3.14, hbar : 1.239 } }"),
+                      doc.getObject());
 
     // Rename 'ltuae' to 'answer' by accessing it as the root objects left child.
     ASSERT_OK(doc.root().leftChild().rename("answer"));
-    ASSERT_EQUALS(mongo::fromjson("{ answer : 42, constants : { pi : 3.14, hbar : 1.239 } }"),
-                  doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ answer : 42, constants : { pi : 3.14, hbar : 1.239 } }"),
+                      doc.getObject());
 
     // Sort the constants by name.
     mmb::sortChildren(doc.root().rightChild(), mmb::FieldNameLessThan());
-    ASSERT_EQUALS(mongo::fromjson("{ answer : 42, constants : { hbar : 1.239, pi : 3.14 } }"),
-                  doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ answer : 42, constants : { hbar : 1.239, pi : 3.14 } }"),
+                      doc.getObject());
 }
 
 TEST(Documentation, Example2) {
@@ -919,7 +919,7 @@ TEST(Documentation, Example2) {
 
     mongo::BSONObjBuilder builder;
     doc.writeTo(&builder);
-    ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), doc.getObject());
 }
 
 namespace {
@@ -943,7 +943,7 @@ TEST(Documentation, Example2InPlaceWithDamageVector) {
     // Make the object, and make a copy for reference.
     mongo::BSONObj obj = mongo::fromjson(inJson);
     const mongo::BSONObj copyOfObj = obj.getOwned();
-    ASSERT_EQUALS(obj, copyOfObj);
+    ASSERT_BSONOBJ_EQ(obj, copyOfObj);
 
     // Create a new document representing BSONObj with the above contents.
     mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
@@ -984,7 +984,7 @@ TEST(Documentation, Example2InPlaceWithDamageVector) {
     // Demonstrate that while the document has changed, the underlying BSONObj has not yet
     // changed.
     ASSERT_FALSE(obj == doc);
-    ASSERT_EQUALS(copyOfObj, obj);
+    ASSERT_BSONOBJ_EQ(copyOfObj, obj);
 
     // Ensure that in-place updates are still enabled.
     ASSERT_EQUALS(mmb::Document::kInPlaceEnabled, doc.getCurrentInPlaceMode());
@@ -1011,7 +1011,7 @@ TEST(Documentation, Example2InPlaceWithDamageVector) {
 
     mongo::BSONObjBuilder builder;
     doc.writeTo(&builder);
-    ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), doc.getObject());
 }
 
 TEST(Documentation, Example3) {
@@ -1041,7 +1041,7 @@ TEST(Documentation, Example3) {
         "  'xs': { 'x' : 'x', 'X' : 'X' },"
         "  'ys': { 'y' : 'y', 'Y' : 'Y', 'why' : ['not'] }"
         "}";
-    ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), outObj);
 }
 
 TEST(Document, LifecycleConstructDefault) {
@@ -1159,7 +1159,7 @@ TEST(Document, RenameDeserialization) {
         "{"
         "  'a' : { 'b' : { 'C' : { 'd' : 4 } } }"
         "}";
-    ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), outObj);
 }
 
 TEST(Document, CantRenameRootElement) {
@@ -1189,7 +1189,7 @@ TEST(Document, RemoveElementWithOpaqueRightSibling) {
         "  'b' : 2, 'c' : 3"
         "}";
     mongo::BSONObj outObj = doc.getObject();
-    ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), outObj);
 }
 
 TEST(Document, AddRightSiblingToElementWithOpaqueRightSibling) {
@@ -1214,7 +1214,7 @@ TEST(Document, AddRightSiblingToElementWithOpaqueRightSibling) {
         "  'a' : 1, 'X' : 'X', 'b' : 2, 'c' : 3"
         "}";
     mongo::BSONObj outObj = doc.getObject();
-    ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), outObj);
 }
 
 TEST(Document, ArrayIndexedAccessFromJson) {
@@ -1422,7 +1422,7 @@ TEST(Document, ArraySerialization) {
         "}";
 
     const mongo::BSONObj outObj = doc.getObject();
-    ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), outObj);
 }
 
 TEST(Document, SetValueBSONElementFieldNameHandling) {
@@ -1441,7 +1441,7 @@ TEST(Document, SetValueBSONElementFieldNameHandling) {
     a.setValueBSONElement(b);
 
     static const char outJson[] = "{ a : 5 }";
-    ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), doc.getObject());
 }
 
 TEST(Document, SetValueElementFromSeparateDocument) {
@@ -1455,10 +1455,10 @@ TEST(Document, SetValueElementFromSeparateDocument) {
     auto setFrom = doc2.root().leftChild();
     ASSERT_OK(setTo.setValueElement(setFrom));
 
-    ASSERT_EQ(mongo::fromjson("{ a : 5 }"), doc1.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ a : 5 }"), doc1.getObject());
 
     // Doc containing the 'setFrom' element should be unchanged.
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, SetValueElementIsNoopWhenSetToSelf) {
@@ -1468,7 +1468,7 @@ TEST(Document, SetValueElementIsNoopWhenSetToSelf) {
     auto element = doc.root().leftChild();
     ASSERT_OK(element.setValueElement(element));
 
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementIsNoopWhenSetToSelfFromCopy) {
@@ -1479,7 +1479,7 @@ TEST(Document, SetValueElementIsNoopWhenSetToSelfFromCopy) {
     auto elementCopy = element;
     ASSERT_OK(element.setValueElement(elementCopy));
 
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementIsNoopWhenSetToSelfNonRootElement) {
@@ -1490,7 +1490,7 @@ TEST(Document, SetValueElementIsNoopWhenSetToSelfNonRootElement) {
     ASSERT_EQ("c", element.getFieldName());
     ASSERT_OK(element.setValueElement(element));
 
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementSetToNestedObject) {
@@ -1504,10 +1504,10 @@ TEST(Document, SetValueElementSetToNestedObject) {
     auto setFrom = doc2.root().leftChild();
     ASSERT_OK(setTo.setValueElement(setFrom));
 
-    ASSERT_EQ(mongo::fromjson("{ a : { c : 5, d : 6 } }"), doc1.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ a : { c : 5, d : 6 } }"), doc1.getObject());
 
     // Doc containing the 'setFrom' element should be unchanged.
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, SetValueElementNonRootElements) {
@@ -1523,10 +1523,10 @@ TEST(Document, SetValueElementNonRootElements) {
     ASSERT_EQ("e", setFrom.getFieldName());
     ASSERT_OK(setTo.setValueElement(setFrom));
 
-    ASSERT_EQ(mongo::fromjson("{ a : { b : 5, c : 8 } }"), doc1.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ a : { b : 5, c : 8 } }"), doc1.getObject());
 
     // Doc containing the 'setFrom' element should be unchanged.
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, SetValueElementSetRootToSelfErrors) {
@@ -1535,7 +1535,7 @@ TEST(Document, SetValueElementSetRootToSelfErrors) {
 
     auto element = doc.root();
     ASSERT_NOT_OK(element.setValueElement(element));
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementSetRootToAnotherDocRootErrors) {
@@ -1549,8 +1549,8 @@ TEST(Document, SetValueElementSetRootToAnotherDocRootErrors) {
     auto setFrom = doc2.root();
     ASSERT_NOT_OK(setTo.setValueElement(setFrom));
 
-    ASSERT_EQ(inObj, doc1.getObject());
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc1.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, SetValueElementSetRootToNotRootInSelfErrors) {
@@ -1560,7 +1560,7 @@ TEST(Document, SetValueElementSetRootToNotRootInSelfErrors) {
     auto setTo = doc.root();
     auto setFrom = doc.root().leftChild();
     ASSERT_NOT_OK(setTo.setValueElement(setFrom));
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementSetRootToNotRootInAnotherDocErrors) {
@@ -1574,8 +1574,8 @@ TEST(Document, SetValueElementSetRootToNotRootInAnotherDocErrors) {
     auto setFrom = doc2.root().leftChild();
     ASSERT_NOT_OK(setTo.setValueElement(setFrom));
 
-    ASSERT_EQ(inObj, doc1.getObject());
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc1.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, SetValueElementSetToOwnRootErrors) {
@@ -1587,7 +1587,7 @@ TEST(Document, SetValueElementSetToOwnRootErrors) {
     auto setFrom = doc.root();
 
     ASSERT_NOT_OK(setTo.setValueElement(setFrom));
-    ASSERT_EQ(inObj, doc.getObject());
+    ASSERT_BSONOBJ_EQ(inObj, doc.getObject());
 }
 
 TEST(Document, SetValueElementSetToOtherDocRoot) {
@@ -1602,8 +1602,8 @@ TEST(Document, SetValueElementSetToOtherDocRoot) {
     auto setFrom = doc2.root();
 
     ASSERT_OK(setTo.setValueElement(setFrom));
-    ASSERT_EQ(mongo::fromjson("{ a : { b : { c : 5 } } }"), doc1.getObject());
-    ASSERT_EQ(inObj2, doc2.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson("{ a : { b : { c : 5 } } }"), doc1.getObject());
+    ASSERT_BSONOBJ_EQ(inObj2, doc2.getObject());
 }
 
 TEST(Document, CreateElementWithEmptyFieldName) {
@@ -1797,7 +1797,7 @@ TEST(Document, ValueOfEphemeralObjectElementIsEmpty) {
     ASSERT_OK(root.pushBack(ephemeralObject));
     ASSERT_FALSE(ephemeralObject.hasValue());
     // NOTE: You really shouldn't rely on this behavior; this test is mostly for coverage.
-    ASSERT_EQUALS(mongo::BSONElement(), ephemeralObject.getValue());
+    ASSERT_BSONELT_EQ(mongo::BSONElement(), ephemeralObject.getValue());
 }
 
 TEST(Element, RemovingRemovedElementFails) {
@@ -1921,7 +1921,7 @@ TEST(TypeSupport, EncodingEquivalenceObject) {
     ASSERT_TRUE(a.ok());
     ASSERT_EQUALS(a.getType(), mongo::Object);
     ASSERT_TRUE(a.hasValue());
-    ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueObject());
+    ASSERT_BSONOBJ_EQ(value1, mmb::ConstElement(a).getValueObject());
 
     // Construct via call passing BSON element
     ASSERT_OK(doc.root().appendElement(thing));
@@ -1962,7 +1962,7 @@ TEST(TypeSupport, EncodingEquivalenceArray) {
     ASSERT_TRUE(a.ok());
     ASSERT_EQUALS(a.getType(), mongo::Array);
     ASSERT_TRUE(a.hasValue());
-    ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueArray());
+    ASSERT_BSONOBJ_EQ(value1, mmb::ConstElement(a).getValueArray());
 
     // Construct via call passing BSON element
     ASSERT_OK(doc.root().appendElement(thing));
@@ -2714,7 +2714,7 @@ TEST(Document, ManipulateComplexObjInLeafHeap) {
 
     static const char outJson[] =
         "{ embedded: { a: 1, b: 2, c: 2.0, d : ['w', 'y', 'z'] }, free: {} }";
-    ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), doc.getObject());
 }
 
 TEST(DocumentInPlace, EphemeralDocumentsDoNotUseInPlaceMode) {
@@ -2889,7 +2889,7 @@ TEST(DocumentInPlace, DisablingInPlaceDoesNotDiscardUpdates) {
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
 
     static const char outJson[] = "{ foo : true, bar : false, baz : 'baz' }";
-    ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    ASSERT_BSONOBJ_EQ(mongo::fromjson(outJson), doc.getObject());
 }
 
 TEST(DocumentInPlace, StringLifecycle) {
@@ -3186,10 +3186,10 @@ TEST(DocumentComparison, SimpleComparison) {
         mongo::fromjson("{ a : 'a', b : ['b', 'b', 'b'], c : { one : 1.0 } }");
 
     const mmb::Document doc1(obj.getOwned());
-    ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj));
+    ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj, nullptr));
     const mmb::Document doc2(obj.getOwned());
-    ASSERT_EQUALS(0, doc1.compareWith(doc2));
-    ASSERT_EQUALS(0, doc2.compareWith(doc1));
+    ASSERT_EQUALS(0, doc1.compareWith(doc2, nullptr));
+    ASSERT_EQUALS(0, doc2.compareWith(doc1, nullptr));
 }
 
 TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
@@ -3207,10 +3207,10 @@ TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
     ASSERT_OK(b0.remove());
     ASSERT_OK(b.pushBack(b0));
     // Ensure that it compares correctly against the source object.
-    ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj));
+    ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj, nullptr));
     // Ensure that it compares correctly against a pristine document.
-    ASSERT_EQUALS(0, doc1.compareWith(doc1Copy));
-    ASSERT_EQUALS(0, doc1Copy.compareWith(doc1));
+    ASSERT_EQUALS(0, doc1.compareWith(doc1Copy, nullptr));
+    ASSERT_EQUALS(0, doc1Copy.compareWith(doc1, nullptr));
 
     // Perform an operation on 'c' that doesn't change the serialized value, but
     // deserializeds the node.
@@ -3223,14 +3223,14 @@ TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
     ASSERT_OK(c1.remove());
     ASSERT_OK(c.pushBack(c1));
     // Ensure that it compares correctly against the source object
-    ASSERT_EQUALS(0, doc2.compareWithBSONObj(obj));
+    ASSERT_EQUALS(0, doc2.compareWithBSONObj(obj, nullptr));
     // Ensure that it compares correctly against a pristine document.
-    ASSERT_EQUALS(0, doc2.compareWith(doc2Copy));
-    ASSERT_EQUALS(0, doc2Copy.compareWith(doc2));
+    ASSERT_EQUALS(0, doc2.compareWith(doc2Copy, nullptr));
+    ASSERT_EQUALS(0, doc2Copy.compareWith(doc2, nullptr));
 
     // Ensure that the two deserialized documents compare with each other correctly.
-    ASSERT_EQUALS(0, doc1.compareWith(doc2));
-    ASSERT_EQUALS(0, doc2.compareWith(doc1));
+    ASSERT_EQUALS(0, doc1.compareWith(doc2, nullptr));
+    ASSERT_EQUALS(0, doc2.compareWith(doc1, nullptr));
 }
 
 TEST(DocumentComparison, DocumentCompareWithRespectsCollation) {
@@ -3239,8 +3239,8 @@ TEST(DocumentComparison, DocumentCompareWithRespectsCollation) {
     const mmb::Document doc2(mongo::fromjson("{a: 'bar'}"));
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, doc1.compareWith(doc2, true));
-    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+    ASSERT_NE(0, doc1.compareWith(doc2, nullptr, true));
+    ASSERT_EQ(0, doc1.compareWith(doc2, &collator, true));
 }
 
 TEST(DocumentComparison, DocumentCompareWithBSONObjRespectsCollation) {
@@ -3249,8 +3249,8 @@ TEST(DocumentComparison, DocumentCompareWithBSONObjRespectsCollation) {
     const mongo::BSONObj doc2 = mongo::fromjson("{a: 'bar'}");
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, doc1.compareWithBSONObj(doc2, true));
-    ASSERT_EQ(0, doc1.compareWithBSONObj(doc2, true, &collator));
+    ASSERT_NE(0, doc1.compareWithBSONObj(doc2, nullptr, true));
+    ASSERT_EQ(0, doc1.compareWithBSONObj(doc2, &collator, true));
 }
 
 TEST(DocumentComparison, ElementCompareWithElementRespectsCollator) {
@@ -3261,8 +3261,8 @@ TEST(DocumentComparison, ElementCompareWithElementRespectsCollator) {
     const mmb::ConstElement element2 = doc2.root().leftChild();
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, element1.compareWithElement(element2, true));
-    ASSERT_EQ(0, element1.compareWithElement(element2, true, &collator));
+    ASSERT_NE(0, element1.compareWithElement(element2, nullptr, true));
+    ASSERT_EQ(0, element1.compareWithElement(element2, &collator, true));
 }
 
 TEST(DocumentComparison, ElementCompareWithBSONElementRespectsCollator) {
@@ -3273,8 +3273,8 @@ TEST(DocumentComparison, ElementCompareWithBSONElementRespectsCollator) {
     const mongo::BSONElement element2 = doc2["a"];
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, element1.compareWithBSONElement(element2, true));
-    ASSERT_EQ(0, element1.compareWithBSONElement(element2, true, &collator));
+    ASSERT_NE(0, element1.compareWithBSONElement(element2, nullptr, true));
+    ASSERT_EQ(0, element1.compareWithBSONElement(element2, &collator, true));
 }
 
 TEST(DocumentComparison, ElementCompareWithBSONObjRespectsCollator) {
@@ -3284,8 +3284,8 @@ TEST(DocumentComparison, ElementCompareWithBSONObjRespectsCollator) {
     const mmb::ConstElement element1 = doc1.root().leftChild();
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, element1.compareWithBSONObj(doc2, true));
-    ASSERT_EQ(0, element1.compareWithBSONObj(doc2, true, &collator));
+    ASSERT_NE(0, element1.compareWithBSONObj(doc2, nullptr, true));
+    ASSERT_EQ(0, element1.compareWithBSONObj(doc2, &collator, true));
 }
 
 TEST(DocumentComparison, DocumentCompareWithRespectsCollationRecursively) {
@@ -3294,8 +3294,8 @@ TEST(DocumentComparison, DocumentCompareWithRespectsCollationRecursively) {
     const mmb::Document doc2(mongo::fromjson("{a: [{b: 'notFoo'}, {b: 'notBar'}]}"));
     // Pass true to indicate that we should compare field names. The two documents should be unequal
     // without the collator, but equal when using the "always equal" collator.
-    ASSERT_NE(0, doc1.compareWith(doc2, true));
-    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
+    ASSERT_NE(0, doc1.compareWith(doc2, nullptr, true));
+    ASSERT_EQ(0, doc1.compareWith(doc2, &collator, true));
 }
 
 TEST(DocumentComparison, DocumentCompareWithRespectsCollationWithDeserializedElement) {
@@ -3304,8 +3304,8 @@ TEST(DocumentComparison, DocumentCompareWithRespectsCollationWithDeserializedEle
     mmb::Document doc2(mongo::fromjson("{a: ['bar', 'bar']}"));
 
     // With the always equal collator, the documents should start out comparing equal.
-    ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
-    ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+    ASSERT_EQ(0, doc1.compareWith(doc2, &collator, true));
+    ASSERT_EQ(0, doc2.compareWith(doc1, &collator, true));
 
     // They should still be equal after causing deserialization of one of the leaf elements of
     // 'doc1'.
@@ -3316,8 +3316,8 @@ TEST(DocumentComparison, DocumentCompareWithRespectsCollationWithDeserializedEle
         ASSERT_TRUE(elementA0.ok());
         ASSERT_OK(elementA0.remove());
         ASSERT_OK(elementA.pushBack(elementA0));
-        ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
-        ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+        ASSERT_EQ(0, doc1.compareWith(doc2, &collator, true));
+        ASSERT_EQ(0, doc2.compareWith(doc1, &collator, true));
     }
 
     // And they should remain equal after doing the same to 'doc2'.
@@ -3328,8 +3328,8 @@ TEST(DocumentComparison, DocumentCompareWithRespectsCollationWithDeserializedEle
         ASSERT_TRUE(elementA0.ok());
         ASSERT_OK(elementA0.remove());
         ASSERT_OK(elementA.pushBack(elementA0));
-        ASSERT_EQ(0, doc1.compareWith(doc2, true, &collator));
-        ASSERT_EQ(0, doc2.compareWith(doc1, true, &collator));
+        ASSERT_EQ(0, doc1.compareWith(doc2, &collator, true));
+        ASSERT_EQ(0, doc2.compareWith(doc1, &collator, true));
     }
 }
 

@@ -15,12 +15,22 @@ env.SConscript(
 )
 
 env.Library(
+    target='version_impl',
+    source=[
+        'version_impl.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
+env.Library(
     target='intrusive_counter',
     source=[
         'intrusive_counter.cpp',
         ],
     LIBDEPS=[
-        'foundation',
+        '$BUILD_DIR/mongo/base',
         ]
     )
 
@@ -75,7 +85,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/foundation',
     ],
 )
 
@@ -95,10 +104,10 @@ env.Library(
     target='progress_meter',
     source=[
         'progress_meter.cpp',
+        'thread_safe_string.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/foundation',
     ],
 )
 
@@ -132,25 +141,6 @@ env.CppUnitTest(
 )
 
 env.Library(
-    target='foundation',
-    source=[
-        "startup_test.cpp",
-        "touch_pages.cpp",
-        'file.cpp',
-        'platform_init.cpp',
-        'thread_safe_string.cpp',
-        'timer.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/platform/platform',
-        '$BUILD_DIR/third_party/shim_allocator',
-        '$BUILD_DIR/third_party/shim_boost',
-        '$BUILD_DIR/third_party/shim_tz',
-    ],
-)
-
-env.Library(
     target='clock_source_mock',
     source=[
         'clock_source_mock.cpp',
@@ -162,12 +152,22 @@ env.Library(
 )
 
 env.CppUnitTest(
+    target='clock_source_mock_test',
+    source=[
+        'clock_source_mock_test.cpp',
+    ],
+    LIBDEPS=[
+        'clock_source_mock',
+    ],
+)
+
+env.CppUnitTest(
     target='text_test',
     source=[
         'text_test.cpp'
     ],
     LIBDEPS=[
-        'foundation',
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -177,7 +177,7 @@ env.CppUnitTest(
         'time_support_test.cpp',
     ],
     LIBDEPS=[
-        'foundation',
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -199,8 +199,6 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
-        "$BUILD_DIR/mongo/platform/platform",
-        "$BUILD_DIR/mongo/util/foundation",
     ],
 )
 
@@ -219,10 +217,13 @@ env.Library(
     source=[
         "fail_point.cpp",
         "fail_point_registry.cpp",
+        "fail_point_server_parameter.cpp",
         "fail_point_service.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/bson/util/bson_extract",
+        "$BUILD_DIR/mongo/db/server_parameters",
     ],
 )
 
@@ -244,7 +245,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         'concurrency/spin_lock',
-        'foundation',
     ],
 )
 
@@ -284,6 +284,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         source=[
             'tcmalloc_server_status_section.cpp',
             'tcmalloc_set_parameter.cpp',
+            'heap_profiler.cpp',
         ],
         LIBDEPS=[
             # TODO: This is needless, the definition of
@@ -306,7 +307,6 @@ env.Library(
         'ntservice.cpp',
     ],
     LIBDEPS=[
-        'foundation',
         'signal_handlers',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
@@ -355,7 +355,7 @@ env.Library(
         'elapsed_tracker.cpp',
     ],
     LIBDEPS=[
-        'foundation',
+        '$BUILD_DIR/mongo/base',
         'net/network', # this is for using listener to check elapsed time
     ],
 )
@@ -428,7 +428,6 @@ env.Library(
         "signal_win32.cpp",
     ],
     LIBDEPS=[
-        "foundation",
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/service_context",
         "$BUILD_DIR/mongo/db/server_options_core",
@@ -477,7 +476,6 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        'foundation',
     ],
 )
 
@@ -509,3 +507,53 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ])
+
+env.CppUnitTest(
+    target='assert_util_test',
+    source=[
+        'assert_util_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
+if env.TargetOSIs('linux'):
+    env.Library(
+        target='procparser',
+        source=[
+            "procparser.cpp",
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+        ],
+    )
+
+    env.CppUnitTest(
+        target='procparser_test',
+        source=[
+            'procparser_test.cpp',
+        ],
+        LIBDEPS=[
+            'procparser',
+        ])
+
+if env.TargetOSIs('windows'):
+    env.Library(
+        target='perfctr_collect',
+        source=[
+            "perfctr_collect.cpp",
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+        ],
+    )
+
+    env.CppUnitTest(
+        target='perfctr_collect_test',
+        source=[
+            'perfctr_collect_test.cpp',
+        ],
+        LIBDEPS=[
+            'perfctr_collect',
+        ])

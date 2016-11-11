@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "mongo/stdx/type_traits.h"
 #define MONGO_INCLUDE_INVARIANT_H_WHITELISTED
 #include "mongo/util/invariant.h"
 #undef MONGO_INCLUDE_INVARIANT_H_WHITELISTED
@@ -62,6 +63,9 @@ class StringData {
 public:
     // Declared in string_data_comparator_interface.h.
     class ComparatorInterface;
+
+    // Iterator type
+    using const_iterator = const char*;
 
     /** Constructs an empty StringData. */
     constexpr StringData() = default;
@@ -96,6 +100,23 @@ public:
      * for constexpr creation of StringData's that are known at compile time.
      */
     constexpr friend StringData operator"" _sd(const char* c, std::size_t len);
+
+    /**
+     * Constructs a StringData with begin and end iterators. begin points to the beginning of the
+     * string. end points to the position past the end of the string. In a null-terminated string,
+     * end points to the null-terminator.
+     *
+     * We template the second parameter to ensure if StringData is called with 0 in the second
+     * parameter, the (ptr,len) constructor is chosen instead.
+     */
+    template <
+        typename InputIt,
+        typename = stdx::enable_if_t<std::is_same<StringData::const_iterator, InputIt>::value>>
+    StringData(InputIt begin, InputIt end) {
+        invariant(begin && end);
+        _data = begin;
+        _size = std::distance(begin, end);
+    }
 
     /**
      * Returns -1, 0, or 1 if 'this' is less, equal, or greater than 'other' in
@@ -158,21 +179,9 @@ public:
         return _data[pos];
     }
 
-    /**
-     * Functor compatible with std::hash for std::unordered_{map,set}
-     * Warning: The hash function is subject to change. Do not use in cases where hashes need
-     *          to be consistent across versions.
-     */
-    struct Hasher {
-        size_t operator()(StringData str) const;
-    };
-
     //
     // iterators
     //
-
-    typedef const char* const_iterator;
-
     const_iterator begin() const {
         return rawData();
     }
@@ -322,6 +331,18 @@ inline bool StringData::endsWith(StringData suffix) const {
     if (suffixSize > thisSize)
         return false;
     return substr(thisSize - suffixSize) == suffix;
+}
+
+inline std::string operator+(std::string lhs, StringData rhs) {
+    if (!rhs.empty())
+        lhs.append(rhs.rawData(), rhs.size());
+    return lhs;
+}
+
+inline std::string operator+(StringData lhs, std::string rhs) {
+    if (!lhs.empty())
+        rhs.insert(0, lhs.rawData(), lhs.size());
+    return rhs;
 }
 
 }  // namespace mongo

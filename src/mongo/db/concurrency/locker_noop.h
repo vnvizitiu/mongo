@@ -41,6 +41,10 @@ class LockerNoop : public Locker {
 public:
     LockerNoop() {}
 
+    virtual bool isNoop() const {
+        return true;
+    }
+
     virtual ClientState getClientState() const {
         invariant(false);
     }
@@ -157,14 +161,6 @@ public:
     }
 
     virtual bool hasLockPending() const {
-        invariant(false);
-    }
-
-    virtual void setIsBatchWriter(bool newValue) {
-        invariant(false);
-    }
-
-    virtual bool isBatchWriter() const {
         invariant(false);
     }
 };

@@ -63,6 +63,7 @@ namespace mongo {
 class SSLManagerInterface;
 class SSLConnection;
 #endif
+struct SSLPeerInfo;
 
 extern const int portSendFlags;
 extern const int portRecvFlags;
@@ -221,7 +222,7 @@ public:
      *
      * This function may throw SocketException.
      */
-    std::string doSSLHandshake(const char* firstBytes = NULL, int len = 0);
+    SSLPeerInfo doSSLHandshake(const char* firstBytes = NULL, int len = 0);
 
     /**
      * @return the time when the socket was opened.
@@ -231,7 +232,9 @@ public:
     }
 
     void handleRecvError(int ret, int len);
-    MONGO_COMPILER_NORETURN void handleSendError(int ret, const char* context);
+    void handleSendError(int ret, const char* context);
+
+    std::string getSNIServerName() const;
 
 private:
     void _init();

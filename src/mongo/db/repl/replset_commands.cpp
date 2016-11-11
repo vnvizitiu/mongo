@@ -59,6 +59,8 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -68,7 +70,6 @@ namespace repl {
 
 using std::string;
 using std::stringstream;
-
 
 class ReplExecutorSSM : public ServerStatusMetric {
 public:
@@ -86,7 +87,7 @@ public:
         help << "Just for tests.\n";
     }
     // No auth needed because it only works when enabled via command line.
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         return Status::OK();
@@ -186,17 +187,6 @@ public:
         help << "{ replSetGetStatus : 1 }";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetGetStatus);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
-    }
     CmdReplSetGetStatus() : ReplSetCommand("replSetGetStatus", true) {}
     virtual bool run(OperationContext* txn,
                      const string&,
@@ -211,8 +201,24 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        status = getGlobalReplicationCoordinator()->processReplSetGetStatus(&result);
+        bool includeInitialSync = false;
+        Status initialSyncStatus =
+            bsonExtractBooleanFieldWithDefault(cmdObj, "initialSync", false, &includeInitialSync);
+        if (!initialSyncStatus.isOK()) {
+            return appendCommandStatus(result, initialSyncStatus);
+        }
+
+        auto responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kBasic;
+        if (includeInitialSync) {
+            responseStyle = ReplicationCoordinator::ReplSetGetStatusResponseStyle::kInitialSync;
+        }
+        status = getGlobalReplicationCoordinator()->processReplSetGetStatus(&result, responseStyle);
         return appendCommandStatus(result, status);
+    }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetGetStatus};
     }
 } cmdReplSetGetStatus;
 
@@ -222,17 +228,6 @@ public:
         help << "Returns the current replica set configuration";
         help << "{ replSetGetConfig : 1 }";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetGetConfig);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
     }
     CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig", true) {}
     virtual bool run(OperationContext* txn,
@@ -247,6 +242,11 @@ public:
 
         getGlobalReplicationCoordinator()->processReplSetGetConfig(&result);
         return true;
+    }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetGetConfig};
     }
 } cmdReplSetGetConfig;
 
@@ -330,17 +330,6 @@ public:
         h << "Initiate/christen a replica set.";
         h << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
     }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetConfigure);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
-    }
     virtual bool run(OperationContext* txn,
                      const string&,
                      BSONObj& cmdObj,
@@ -400,6 +389,11 @@ public:
             getGlobalReplicationCoordinator()->processReplSetInitiate(txn, configObj, &result);
         return appendCommandStatus(result, status);
     }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetConfigure};
+    }
 } cmdReplSetInitiate;
 
 class CmdReplSetReconfig : public ReplSetCommand {
@@ -408,17 +402,6 @@ public:
         help << "Adjust configuration of a replica set\n";
         help << "{ replSetReconfig : config_object }";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetConfigure);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
     }
     CmdReplSetReconfig() : ReplSetCommand("replSetReconfig") {}
     virtual bool run(OperationContext* txn,
@@ -459,6 +442,11 @@ public:
 
         return appendCommandStatus(result, status);
     }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetConfigure};
+    }
 } cmdReplSetReconfig;
 
 class CmdReplSetFreeze : public ReplSetCommand {
@@ -472,17 +460,6 @@ public:
         help << "You can call again with {replSetFreeze:0} to unfreeze sooner.\n";
         help << "A process restart unfreezes the member also.\n";
         help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetStateChange);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
     }
     CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") {}
     virtual bool run(OperationContext* txn,
@@ -499,6 +476,11 @@ public:
         return appendCommandStatus(
             result, getGlobalReplicationCoordinator()->processReplSetFreeze(secs, &result));
     }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
+    }
 } cmdReplSetFreeze;
 
 class CmdReplSetStepDown : public ReplSetCommand {
@@ -510,17 +492,6 @@ public:
         help << "(If another member with same priority takes over in the meantime, it will stay "
                 "primary.)\n";
         help << "http://dochub.mongodb.org/core/replicasetcommands";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetStateChange);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
     }
     CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
     virtual bool run(OperationContext* txn,
@@ -575,6 +546,11 @@ public:
             txn, force, Seconds(secondaryCatchUpPeriodSecs), Seconds(stepDownForSecs));
         return appendCommandStatus(result, status);
     }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
+    }
 } cmdReplSetStepDown;
 
 class CmdReplSetMaintenance : public ReplSetCommand {
@@ -582,17 +558,6 @@ public:
     virtual void help(stringstream& help) const {
         help << "{ replSetMaintenance : bool }\n";
         help << "Enable or disable maintenance mode.";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetStateChange);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
     }
     CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") {}
     virtual bool run(OperationContext* txn,
@@ -609,24 +574,19 @@ public:
                                    getGlobalReplicationCoordinator()->setMaintenanceMode(
                                        cmdObj["replSetMaintenance"].trueValue()));
     }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
+    }
 } cmdReplSetMaintenance;
 
 class CmdReplSetSyncFrom : public ReplSetCommand {
 public:
     virtual void help(stringstream& help) const {
         help << "{ replSetSyncFrom : \"host:port\" }\n";
-        help << "Change who this member is syncing from.";
-    }
-    virtual Status checkAuthForCommand(ClientBasic* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        ActionSet actions;
-        actions.addAction(ActionType::replSetStateChange);
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), actions)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
+        help << "Change who this member is syncing from. Note: This will interrupt and restart an "
+                "in-progress initial sync.";
     }
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
     virtual bool run(OperationContext* txn,
@@ -644,9 +604,14 @@ public:
         if (!status.isOK())
             return appendCommandStatus(result, status);
 
-        return appendCommandStatus(
-            result,
-            getGlobalReplicationCoordinator()->processReplSetSyncFrom(targetHostAndPort, &result));
+        return appendCommandStatus(result,
+                                   getGlobalReplicationCoordinator()->processReplSetSyncFrom(
+                                       txn, targetHostAndPort, &result));
+    }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
     }
 } cmdReplSetSyncFrom;
 
@@ -774,17 +739,17 @@ public:
 
         /* we want to keep heartbeat connections open when relinquishing primary.
            tag them here. */
-        AbstractMessagingPort* mp = txn->getClient()->port();
-        unsigned originalTag = 0;
-        if (mp) {
-            originalTag = mp->getTag();
-            mp->setTag(originalTag | executor::NetworkInterface::kMessagingPortKeepOpen);
+        transport::Session::TagMask originalTag = 0;
+        auto session = txn->getClient()->session();
+        if (session) {
+            originalTag = session->getTags();
+            session->replaceTags(originalTag | transport::Session::kKeepOpen);
         }
 
         // Unset the tag on block exit
-        ON_BLOCK_EXIT([mp, originalTag]() {
-            if (mp) {
-                mp->setTag(originalTag);
+        ON_BLOCK_EXIT([session, originalTag]() {
+            if (session) {
+                session->replaceTags(originalTag);
             }
         });
 
@@ -892,6 +857,31 @@ private:
         return appendCommandStatus(result, status);
     }
 } cmdReplSetElect;
+
+class CmdReplSetStepUp : public ReplSetCommand {
+public:
+    CmdReplSetStepUp() : ReplSetCommand("replSetStepUp") {}
+
+    virtual bool run(OperationContext* txn,
+                     const string&,
+                     BSONObj& cmdObj,
+                     int,
+                     string& errmsg,
+                     BSONObjBuilder& result) {
+        Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+        if (!status.isOK())
+            return appendCommandStatus(result, status);
+
+        status = getGlobalReplicationCoordinator()->stepUpIfEligible();
+
+        return appendCommandStatus(result, status);
+    }
+
+private:
+    ActionSet getAuthActionSet() const override {
+        return ActionSet{ActionType::replSetStateChange};
+    }
+} cmdReplSetStepUp;
 
 }  // namespace repl
 }  // namespace mongo

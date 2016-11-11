@@ -28,17 +28,23 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/status.h"
 #include "mongo/transport/transport_layer.h"
 
 namespace mongo {
 namespace transport {
 
-TransportLayer::TransportLayer() = default;
-TransportLayer::~TransportLayer() = default;
+const Status TransportLayer::SessionUnknownStatus =
+    Status(ErrorCodes::TransportSessionUnknown, "TransportLayer does not own the Session.");
 
-TicketImpl* TransportLayer::getTicketImpl(const Ticket& ticket) {
-    return ticket.impl();
-}
+const Status TransportLayer::ShutdownStatus =
+    Status(ErrorCodes::ShutdownInProgress, "TransportLayer is in shutdown.");
+
+const Status TransportLayer::TicketSessionUnknownStatus = Status(
+    ErrorCodes::TransportSessionUnknown, "TransportLayer does not own the Ticket's Session.");
+
+const Status TransportLayer::TicketSessionClosedStatus = Status(
+    ErrorCodes::TransportSessionClosed, "Operation attempted on a closed transport Session.");
 
 }  // namespace transport
 }  // namespace mongo

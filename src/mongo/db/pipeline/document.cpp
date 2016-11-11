@@ -186,10 +186,12 @@ intrusive_ptr<DocumentStorage> DocumentStorage::clone() const {
 
     // Make a copy of the buffer.
     // It is very important that the positions of each field are the same after cloning.
-    const size_t bufferBytes = (_bufferEnd + hashTabBytes()) - _buffer;
+    const size_t bufferBytes = allocatedBytes();
     out->_buffer = new char[bufferBytes];
     out->_bufferEnd = out->_buffer + (_bufferEnd - _buffer);
-    memcpy(out->_buffer, _buffer, bufferBytes);
+    if (bufferBytes > 0) {
+        memcpy(out->_buffer, _buffer, bufferBytes);
+    }
 
     // Copy remaining fields
     out->_usedBytes = _usedBytes;
@@ -373,15 +375,18 @@ size_t Document::getApproximateSize() const {
     return size;
 }
 
-void Document::hash_combine(size_t& seed) const {
+void Document::hash_combine(size_t& seed,
+                            const StringData::ComparatorInterface* stringComparator) const {
     for (DocumentStorageIterator it = storage().iterator(); !it.atEnd(); it.advance()) {
         StringData name = it->nameSD();
         boost::hash_range(seed, name.rawData(), name.rawData() + name.size());
-        it->val.hash_combine(seed);
+        it->val.hash_combine(seed, stringComparator);
     }
 }
 
-int Document::compare(const Document& rL, const Document& rR) {
+int Document::compare(const Document& rL,
+                      const Document& rR,
+                      const StringData::ComparatorInterface* stringComparator) {
     DocumentStorageIterator lIt = rL.storage().iterator();
     DocumentStorageIterator rIt = rR.storage().iterator();
 
@@ -410,7 +415,7 @@ int Document::compare(const Document& rL, const Document& rR) {
         if (nameCmp)
             return nameCmp;  // field names are unequal
 
-        const int valueCmp = Value::compare(lField.val, rField.val);
+        const int valueCmp = Value::compare(lField.val, rField.val, stringComparator);
         if (valueCmp)
             return valueCmp;  // fields are unequal
 

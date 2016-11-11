@@ -33,7 +33,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/stdx/memory.h"
@@ -86,18 +86,19 @@ GroupStage::GroupStage(OperationContext* txn,
       _specificStats(),
       _groupState(GroupState_Initializing),
       _reduceFunction(0),
-      _keyFunction(0) {
+      _keyFunction(0),
+      _groupMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<int>()) {
     _children.emplace_back(child);
 }
 
 Status GroupStage::initGroupScripting() {
     // Initialize _scope.
     const std::string userToken =
-        AuthorizationSession::get(ClientBasic::getCurrent())->getAuthenticatedUserNamesToken();
+        AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
 
     const NamespaceString nss(_request.ns);
-    _scope =
-        globalScriptEngine->getPooledScope(getOpCtx(), nss.db().toString(), "group" + userToken);
+    _scope = getGlobalScriptEngine()->getPooledScope(
+        getOpCtx(), nss.db().toString(), "group" + userToken);
     if (!_request.reduceScope.isEmpty()) {
         _scope->init(&_request.reduceScope);
     }

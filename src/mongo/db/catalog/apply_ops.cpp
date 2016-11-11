@@ -158,7 +158,7 @@ Status _applyOps(OperationContext* txn,
 
                 MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                     if (*opType == 'c') {
-                        status = repl::applyCommand_inlock(txn, opObj);
+                        status = repl::applyCommand_inlock(txn, opObj, true);
                     } else {
                         OldClientContext ctx(txn, ns);
 
@@ -170,6 +170,8 @@ Status _applyOps(OperationContext* txn,
                 ab.append(false);
                 result->append("applied", ++(*numApplied));
                 result->append("code", ex.getCode());
+                result->append("codeName",
+                               ErrorCodes::errorString(ErrorCodes::fromInt(ex.getCode())));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
                 return Status(ErrorCodes::UnknownError, "");
@@ -212,18 +214,20 @@ Status _applyOps(OperationContext* txn,
 
         const BSONObj cmdRewritten = cmdBuilder.done();
 
+        auto opObserver = getGlobalServiceContext()->getOpObserver();
+        invariant(opObserver);
         if (haveWrappingWUOW) {
-            getGlobalServiceContext()->getOpObserver()->onApplyOps(txn, tempNS, cmdRewritten);
+            opObserver->onApplyOps(txn, tempNS, cmdRewritten);
         } else {
             // When executing applyOps outside of a wrapping WriteUnitOfWOrk, always logOp the
-            // command regardless of whether the individial ops succeeded and rely on any failures
-            // to also on secondaries. This isn't perfect, but it's what the command has always done
-            // and is part of its "correct" behavior.
+            // command regardless of whether the individial ops succeeded and rely on any
+            // failures to also on secondaries. This isn't perfect, but it's what the command
+            // has always done and is part of its "correct" behavior.
             while (true) {
                 try {
                     WriteUnitOfWork wunit(txn);
-                    getGlobalServiceContext()->getOpObserver()->onApplyOps(
-                        txn, tempNS, cmdRewritten);
+                    opObserver->onApplyOps(txn, tempNS, cmdRewritten);
+
                     wunit.commit();
                     break;
                 } catch (const WriteConflictException& wce) {
@@ -332,6 +336,7 @@ Status applyOps(OperationContext* txn,
             ab.append(false);
         result->append("applied", numApplied);
         result->append("code", ex.getCode());
+        result->append("codeName", ErrorCodes::errorString(ErrorCodes::fromInt(ex.getCode())));
         result->append("errmsg", ex.what());
         result->append("results", ab.arr());
         return Status(ErrorCodes::UnknownError, "");

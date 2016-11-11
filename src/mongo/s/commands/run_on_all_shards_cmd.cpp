@@ -77,7 +77,7 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
                                 int options,
                                 std::string& errmsg,
                                 BSONObjBuilder& output) {
-    LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj;
+    LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << redact(cmdObj);
 
     if (_implicitCreateDb) {
         uassertStatusOK(ScopedShardDatabase::getOrCreate(txn, dbName));
@@ -88,13 +88,17 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
 
     std::list<std::shared_ptr<Future::CommandResult>> futures;
     for (const ShardId& shardId : shardIds) {
-        const auto shard = grid.shardRegistry()->getShard(txn, shardId);
-        if (!shard) {
+        const auto shardStatus = grid.shardRegistry()->getShard(txn, shardId);
+        if (!shardStatus.isOK()) {
             continue;
         }
 
-        futures.push_back(Future::spawnCommand(
-            shard->getConnString().toString(), dbName, cmdObj, 0, NULL, _useShardConn));
+        futures.push_back(Future::spawnCommand(shardStatus.getValue()->getConnString().toString(),
+                                               dbName,
+                                               cmdObj,
+                                               0,
+                                               NULL,
+                                               _useShardConn));
     }
 
     std::vector<ShardAndReply> results;
@@ -181,7 +185,7 @@ bool RunOnAllShardsCommand::run(OperationContext* txn,
     BSONObj errobj = errors.done();
 
     if (!errobj.isEmpty()) {
-        errmsg = errobj.toString(false, true);
+        errmsg = errobj.toString();
 
         // If every error has a code, and the code for all errors is the same, then add
         // a top-level field "code" with this value to the output object.

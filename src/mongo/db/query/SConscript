@@ -42,6 +42,16 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target="query_settings_test",
+    source=[
+        "query_settings_test.cpp",
+    ],
+    LIBDEPS=[
+        "query_planner"
+    ]
+)
+
 env.Library(
     target='query',
     source=[
@@ -89,6 +99,19 @@ env.Library(
 )
 
 env.CppUnitTest(
+    target="parsed_distinct_test",
+    source=[
+        "parsed_distinct_test.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        "query_test_service_context",
+        "query_common",
+    ],
+)
+
+env.CppUnitTest(
     target="get_executor_test",
     source=[
         "get_executor_test.cpp"
@@ -125,11 +148,13 @@ env.Library(
     target='command_request_response',
     source=[
         'count_request.cpp',
+        'cursor_request.cpp',
         'cursor_response.cpp',
         'find_and_modify_request.cpp',
         'getmore_request.cpp',
         'killcursors_request.cpp',
         'killcursors_response.cpp',
+        'view_response_formatter.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -151,8 +176,10 @@ env.CppUnitTest(
         'getmore_request_test.cpp',
         'killcursors_request_test.cpp',
         'killcursors_response_test.cpp',
+        'view_response_formatter_test.cpp',
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         'command_request_response',
     ]
 )
@@ -267,6 +294,7 @@ env.CppUnitTest(
         "query_request_test.cpp"
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         "query_request",
     ],
 )
@@ -307,6 +335,7 @@ env.CppUnitTest(
         "plan_cache_indexability_test.cpp"
     ],
     LIBDEPS=[
+        "collation/collator_interface_mock",
         "query_planner",
     ],
 )

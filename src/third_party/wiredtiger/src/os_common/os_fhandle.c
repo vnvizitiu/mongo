@@ -24,23 +24,22 @@ __fhandle_method_finalize(
 		    "a WT_FILE_HANDLE.%s method must be configured", #name)
 
 	WT_HANDLE_METHOD_REQ(close);
-	/* not required: fadvise */
-	/* not required: fallocate */
-	/* not required: fallocate_nolock */
+	/* not required: fh_advise */
+	/* not required: fh_extend */
+	/* not required: fh_extend_nolock */
 	WT_HANDLE_METHOD_REQ(fh_lock);
-	/* not required: map */
-	/* not required: map_discard */
-	/* not required: map_preload */
-	/* not required: map_unmap */
+	/* not required: fh_map */
+	/* not required: fh_map_discard */
+	/* not required: fh_map_preload */
+	/* not required: fh_unmap */
 	WT_HANDLE_METHOD_REQ(fh_read);
 	WT_HANDLE_METHOD_REQ(fh_size);
 	if (!readonly)
 		WT_HANDLE_METHOD_REQ(fh_sync);
-	/* not required: sync_nowait */
-	if (!readonly) {
-		WT_HANDLE_METHOD_REQ(fh_truncate);
+	/* not required: fh_sync_nowait */
+	/* not required: fh_truncate */
+	if (!readonly)
 		WT_HANDLE_METHOD_REQ(fh_write);
-	}
 
 	return (0);
 }
@@ -150,19 +149,19 @@ __open_verbose(
 	 */
 
 	switch (file_type) {
-	case WT_OPEN_FILE_TYPE_CHECKPOINT:
+	case WT_FS_OPEN_FILE_TYPE_CHECKPOINT:
 		file_type_tag = "checkpoint";
 		break;
-	case WT_OPEN_FILE_TYPE_DATA:
+	case WT_FS_OPEN_FILE_TYPE_DATA:
 		file_type_tag = "data";
 		break;
-	case WT_OPEN_FILE_TYPE_DIRECTORY:
+	case WT_FS_OPEN_FILE_TYPE_DIRECTORY:
 		file_type_tag = "directory";
 		break;
-	case WT_OPEN_FILE_TYPE_LOG:
+	case WT_FS_OPEN_FILE_TYPE_LOG:
 		file_type_tag = "log";
 		break;
-	case WT_OPEN_FILE_TYPE_REGULAR:
+	case WT_FS_OPEN_FILE_TYPE_REGULAR:
 		file_type_tag = "regular";
 		break;
 	default:
@@ -172,23 +171,23 @@ __open_verbose(
 
 	WT_RET(__wt_scr_alloc(session, 0, &tmp));
 	sep = " (";
-#define	WT_OPEN_VERBOSE_FLAG(f, name)					\
+#define	WT_FS_OPEN_VERBOSE_FLAG(f, name)				\
 	if (LF_ISSET(f)) {						\
 		WT_ERR(__wt_buf_catfmt(					\
 		    session, tmp, "%s%s", sep, name));			\
 		sep = ", ";						\
 	}
 
-	WT_OPEN_VERBOSE_FLAG(WT_OPEN_CREATE, "create");
-	WT_OPEN_VERBOSE_FLAG(WT_OPEN_DIRECTIO, "direct-IO");
-	WT_OPEN_VERBOSE_FLAG(WT_OPEN_EXCLUSIVE, "exclusive");
-	WT_OPEN_VERBOSE_FLAG(WT_OPEN_FIXED, "fixed");
-	WT_OPEN_VERBOSE_FLAG(WT_OPEN_READONLY, "readonly");
+	WT_FS_OPEN_VERBOSE_FLAG(WT_FS_OPEN_CREATE, "create");
+	WT_FS_OPEN_VERBOSE_FLAG(WT_FS_OPEN_DIRECTIO, "direct-IO");
+	WT_FS_OPEN_VERBOSE_FLAG(WT_FS_OPEN_EXCLUSIVE, "exclusive");
+	WT_FS_OPEN_VERBOSE_FLAG(WT_FS_OPEN_FIXED, "fixed");
+	WT_FS_OPEN_VERBOSE_FLAG(WT_FS_OPEN_READONLY, "readonly");
 
 	if (tmp->size != 0)
 		WT_ERR(__wt_buf_catfmt(session, tmp, ")"));
 
-	ret = __wt_verbose(session, WT_VERB_FILEOPS,
+	__wt_verbose(session, WT_VERB_FILEOPS,
 	    "%s: file-open: type %s%s",
 	    name, file_type_tag, tmp->size == 0 ? "" : (char *)tmp->data);
 
@@ -209,7 +208,7 @@ err:	__wt_scr_free(session, &tmp);
  */
 int
 __wt_open(WT_SESSION_IMPL *session,
-    const char *name, WT_OPEN_FILE_TYPE file_type, u_int flags, WT_FH **fhp)
+    const char *name, WT_FS_OPEN_FILE_TYPE file_type, u_int flags, WT_FH **fhp)
 {
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
@@ -247,12 +246,12 @@ __wt_open(WT_SESSION_IMPL *session,
 	if (F_ISSET(conn, WT_CONN_READONLY)) {
 		lock_file = strcmp(name, WT_SINGLETHREAD) == 0;
 		if (!lock_file)
-			LF_SET(WT_OPEN_READONLY);
-		WT_ASSERT(session, lock_file || !LF_ISSET(WT_OPEN_CREATE));
+			LF_SET(WT_FS_OPEN_READONLY);
+		WT_ASSERT(session, lock_file || !LF_ISSET(WT_FS_OPEN_CREATE));
 	}
 
 	/* Create the path to the file. */
-	if (!LF_ISSET(WT_OPEN_FIXED))
+	if (!LF_ISSET(WT_FS_OPEN_FIXED))
 		WT_ERR(__wt_filename(session, name, &path));
 
 	/* Call the underlying open function. */
@@ -261,7 +260,7 @@ __wt_open(WT_SESSION_IMPL *session,
 	open_called = true;
 
 	WT_ERR(__fhandle_method_finalize(
-	    session, fh->handle, LF_ISSET(WT_OPEN_READONLY)));
+	    session, fh->handle, LF_ISSET(WT_FS_OPEN_READONLY)));
 
 	/*
 	 * Repeat the check for a match: if there's no match, link our newly
@@ -301,8 +300,7 @@ __wt_close(WT_SESSION_IMPL *session, WT_FH **fhp)
 	*fhp = NULL;
 
 	/* Track handle-close as a file operation, so open and close match. */
-	WT_RET(__wt_verbose(
-	    session, WT_VERB_FILEOPS, "%s: file-close", fh->name));
+	__wt_verbose(session, WT_VERB_FILEOPS, "%s: file-close", fh->name);
 
 	/*
 	 * If the reference count hasn't gone to 0, or if it's an in-memory

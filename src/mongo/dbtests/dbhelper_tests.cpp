@@ -74,11 +74,12 @@ public:
 
             KeyRange range(ns, BSON("_id" << _min), BSON("_id" << _max), BSON("_id" << 1));
             mongo::WriteConcernOptions dummyWriteConcern;
-            Helpers::removeRange(&txn, range, false, dummyWriteConcern);
+            Helpers::removeRange(
+                &txn, range, BoundInclusion::kIncludeStartKeyOnly, dummyWriteConcern);
         }
 
         // Check that the expected documents remain.
-        ASSERT_EQUALS(expected(), docs(&txn));
+        ASSERT_BSONOBJ_EQ(expected(), docs(&txn));
     }
 
 private:

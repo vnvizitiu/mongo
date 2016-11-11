@@ -266,6 +266,14 @@ std::unique_ptr<AuthorizationSession> AuthorizationManager::makeAuthorizationSes
         _externalState->makeAuthzSessionExternalState(this));
 }
 
+void AuthorizationManager::setShouldValidateAuthSchemaOnStartup(bool validate) {
+    _startupAuthSchemaValidation = validate;
+}
+
+bool AuthorizationManager::shouldValidateAuthSchemaOnStartup() {
+    return _startupAuthSchemaValidation;
+}
+
 Status AuthorizationManager::getAuthorizationVersion(OperationContext* txn, int* version) {
     CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
     int newVersion = _version;
@@ -277,7 +285,7 @@ Status AuthorizationManager::getAuthorizationVersion(OperationContext* txn, int*
         guard.endFetchPhase();
         if (!status.isOK()) {
             warning() << "Problem fetching the stored schema version of authorization data: "
-                      << status;
+                      << redact(status);
             *version = schemaVersionInvalid;
             return status;
         }
@@ -414,18 +422,26 @@ Status AuthorizationManager::getUserDescription(OperationContext* txn,
 
 Status AuthorizationManager::getRoleDescription(OperationContext* txn,
                                                 const RoleName& roleName,
-                                                bool showPrivileges,
+                                                PrivilegeFormat privileges,
                                                 BSONObj* result) {
-    return _externalState->getRoleDescription(txn, roleName, showPrivileges, result);
+    return _externalState->getRoleDescription(txn, roleName, privileges, result);
 }
+
+Status AuthorizationManager::getRolesDescription(OperationContext* txn,
+                                                 const std::vector<RoleName>& roleName,
+                                                 PrivilegeFormat privileges,
+                                                 BSONObj* result) {
+    return _externalState->getRolesDescription(txn, roleName, privileges, result);
+}
+
 
 Status AuthorizationManager::getRoleDescriptionsForDB(OperationContext* txn,
                                                       const std::string dbname,
-                                                      bool showPrivileges,
+                                                      PrivilegeFormat privileges,
                                                       bool showBuiltinRoles,
                                                       vector<BSONObj>* result) {
     return _externalState->getRoleDescriptionsForDB(
-        txn, dbname, showPrivileges, showBuiltinRoles, result);
+        txn, dbname, privileges, showBuiltinRoles, result);
 }
 
 Status AuthorizationManager::acquireUser(OperationContext* txn,
@@ -706,7 +722,7 @@ void AuthorizationManager::_invalidateRelevantCacheData(const char* op,
         if (!userName.isOK()) {
             warning() << "Invalidating user cache based on user being updated failed, will "
                          "invalidate the entire cache instead: "
-                      << userName.getStatus() << endl;
+                      << userName.getStatus();
             invalidateUserCache();
             return;
         }

@@ -46,6 +46,7 @@ namespace {
 
 const char kModeFieldName[] = "mode";
 const char kTagsFieldName[] = "tags";
+const char kMaxStalenessMSFieldName[] = "maxStalenessMS";
 
 const char kPrimaryOnly[] = "primary";
 const char kPrimaryPreferred[] = "primaryPreferred";
@@ -112,11 +113,25 @@ TagSet defaultTagSetForMode(ReadPreference mode) {
 
 }  // namespace
 
+
+/**
+ * Replica set refresh period on the task executor.
+ */
+const Milliseconds ReadPreferenceSetting::kMinimalMaxStalenessValue(60000);
+
 TagSet::TagSet() : _tags(BSON_ARRAY(BSONObj())) {}
 
 TagSet TagSet::primaryOnly() {
     return TagSet{BSONArray()};
 }
+
+ReadPreferenceSetting::ReadPreferenceSetting(ReadPreference pref,
+                                             TagSet tags,
+                                             Milliseconds maxStalenessMS)
+    : pref(std::move(pref)), tags(std::move(tags)), maxStalenessMS(std::move(maxStalenessMS)) {}
+
+ReadPreferenceSetting::ReadPreferenceSetting(ReadPreference pref, Milliseconds maxStalenessMS)
+    : ReadPreferenceSetting(pref, defaultTagSetForMode(pref), maxStalenessMS) {}
 
 ReadPreferenceSetting::ReadPreferenceSetting(ReadPreference pref, TagSet tags)
     : pref(std::move(pref)), tags(std::move(tags)) {}
@@ -167,7 +182,39 @@ StatusWith<ReadPreferenceSetting> ReadPreferenceSetting::fromBSON(const BSONObj&
         return tagExtractStatus;
     }
 
-    return ReadPreferenceSetting(mode, tags);
+    long long maxStalenessMSValue;
+    auto maxStalenessMSExtractStatus = bsonExtractIntegerFieldWithDefault(
+        readPrefObj, kMaxStalenessMSFieldName, 0, &maxStalenessMSValue);
+
+    if (!maxStalenessMSExtractStatus.isOK()) {
+        return maxStalenessMSExtractStatus;
+    }
+
+    if (maxStalenessMSValue && maxStalenessMSValue < 0) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << kMaxStalenessMSFieldName
+                                    << " must be a non negative integer");
+    }
+
+    if (maxStalenessMSValue && maxStalenessMSValue >= Milliseconds::max().count()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << kMaxStalenessMSFieldName << " value can not exceed "
+                                    << Milliseconds::max().count());
+    }
+
+    if (maxStalenessMSValue && maxStalenessMSValue < kMinimalMaxStalenessValue.count()) {
+        return Status(ErrorCodes::MaxStalenessOutOfRange,
+                      str::stream() << kMaxStalenessMSFieldName << " value can not be less than "
+                                    << kMinimalMaxStalenessValue.count());
+    }
+
+    if ((mode == ReadPreference::PrimaryOnly) && maxStalenessMSValue) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << kMaxStalenessMSFieldName
+                                    << " can not be set for the primary mode");
+    }
+
+    return ReadPreferenceSetting(mode, tags, Milliseconds(maxStalenessMSValue));
 }
 
 BSONObj ReadPreferenceSetting::toBSON() const {
@@ -175,6 +222,9 @@ BSONObj ReadPreferenceSetting::toBSON() const {
     bob.append(kModeFieldName, readPreferenceName(pref));
     if (tags != defaultTagSetForMode(pref)) {
         bob.append(kTagsFieldName, tags.getTagBSON());
+    }
+    if (maxStalenessMS.count() > 0) {
+        bob.append(kMaxStalenessMSFieldName, maxStalenessMS.count());
     }
     return bob.obj();
 }

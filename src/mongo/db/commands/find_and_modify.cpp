@@ -63,6 +63,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -116,7 +117,7 @@ StatusWith<boost::optional<BSONObj>> advanceExecutor(OperationContext* txn,
 
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
-                << ", stats: " << Explain::getWinningPlanStats(exec);
+                << ", stats: " << redact(Explain::getWinningPlanStats(exec));
 
         if (WorkingSetCommon::isValidStatusMemberObject(value)) {
             const Status errorStatus = WorkingSetCommon::getMemberObjectStatus(value);
@@ -198,6 +199,20 @@ Status checkCanAcceptWritesForDatabase(const NamespaceString& nsString) {
                           << nsString.ns());
     }
     return Status::OK();
+}
+
+void recordStatsForTopCommand(OperationContext* txn) {
+    auto curOp = CurOp::get(txn);
+    const int writeLocked = 1;
+
+    Top::get(txn->getClient()->getServiceContext())
+        .record(txn,
+                curOp->getNS(),
+                curOp->getLogicalOp(),
+                writeLocked,
+                curOp->elapsedMicros(),
+                curOp->isCommand(),
+                curOp->getReadWriteType());
 }
 
 }  // namespace
@@ -398,6 +413,11 @@ public:
                 }
 
                 Collection* const collection = autoDb.getDb()->getCollection(nsString.ns());
+                if (!collection && autoDb.getDb()->getViewCatalog()->lookup(txn, nsString.ns())) {
+                    return appendCommandStatus(result,
+                                               {ErrorCodes::CommandNotSupportedOnView,
+                                                "findAndModify not supported on a view"});
+                }
                 auto statusWithPlanExecutor =
                     getExecutorDelete(txn, opDebug, collection, &parsedDelete);
                 if (!statusWithPlanExecutor.isOK()) {
@@ -416,6 +436,9 @@ public:
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
+                // Nothing after advancing the plan executor should throw a WriteConflictException,
+                // so the following bookkeeping with execution stats won't end up being done
+                // multiple times.
 
                 PlanSummaryStats summaryStats;
                 Explain::getSummaryStats(*exec, &summaryStats);
@@ -427,11 +450,12 @@ public:
                 // Fill out OpDebug with the number of deleted docs.
                 opDebug->ndeleted = getDeleteStats(exec.get())->docsDeleted;
 
-                if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+                if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                     curOp->debug().execStats = execStatsBob.obj();
                 }
+                recordStatsForTopCommand(txn);
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);
@@ -466,6 +490,11 @@ public:
                 }
 
                 Collection* collection = autoDb.getDb()->getCollection(nsString.ns());
+                if (!collection && autoDb.getDb()->getViewCatalog()->lookup(txn, nsString.ns())) {
+                    return appendCommandStatus(result,
+                                               {ErrorCodes::CommandNotSupportedOnView,
+                                                "findAndModify not supported on a view"});
+                }
 
                 // Create the collection if it does not exist when performing an upsert
                 // because the update stage does not create its own collection.
@@ -513,6 +542,9 @@ public:
                 if (!advanceStatus.isOK()) {
                     return appendCommandStatus(result, advanceStatus.getStatus());
                 }
+                // Nothing after advancing the plan executor should throw a WriteConflictException,
+                // so the following bookkeeping with execution stats won't end up being done
+                // multiple times.
 
                 PlanSummaryStats summaryStats;
                 Explain::getSummaryStats(*exec, &summaryStats);
@@ -522,11 +554,12 @@ public:
                 UpdateStage::recordUpdateStatsInOpDebug(getUpdateStats(exec.get()), opDebug);
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
-                if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+                if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                     curOp->debug().execStats = execStatsBob.obj();
                 }
+                recordStatsForTopCommand(txn);
 
                 boost::optional<BSONObj> value = advanceStatus.getValue();
                 appendCommandResponse(exec.get(), args.isRemove(), value, result);

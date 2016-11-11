@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_geo.h"
@@ -174,8 +175,7 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
         bool indexIs2D = (String == elt.type() && "2d" == elt.String());
 
         if (indexIs2D) {
-            GeoNear2DNode* ret = new GeoNear2DNode();
-            ret->indexKeyPattern = index.keyPattern;
+            GeoNear2DNode* ret = new GeoNear2DNode(index);
             ret->nq = &nearExpr->getData();
             ret->baseBounds.fields.resize(index.keyPattern.nFields());
             if (NULL != query.getProj()) {
@@ -185,8 +185,7 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
 
             return ret;
         } else {
-            GeoNear2DSphereNode* ret = new GeoNear2DSphereNode();
-            ret->indexKeyPattern = index.keyPattern;
+            GeoNear2DSphereNode* ret = new GeoNear2DSphereNode(index);
             ret->nq = &nearExpr->getData();
             ret->baseBounds.fields.resize(index.keyPattern.nFields());
             if (NULL != query.getProj()) {
@@ -199,20 +198,16 @@ QuerySolutionNode* QueryPlannerAccess::makeLeafNode(
         // We must not keep the expression node around.
         *tightnessOut = IndexBoundsBuilder::EXACT;
         TextMatchExpressionBase* textExpr = static_cast<TextMatchExpressionBase*>(expr);
-        TextNode* ret = new TextNode();
-        ret->indexKeyPattern = index.keyPattern;
+        TextNode* ret = new TextNode(index);
         ret->ftsQuery = textExpr->getFTSQuery().clone();
         return ret;
     } else {
         // Note that indexKeyPattern.firstElement().fieldName() may not equal expr->path()
         // because expr might be inside an array operator that provides a path prefix.
-        IndexScanNode* isn = new IndexScanNode();
-        isn->indexKeyPattern = index.keyPattern;
-        isn->indexIsMultiKey = index.multikey;
+        IndexScanNode* isn = new IndexScanNode(index);
         isn->bounds.fields.resize(index.keyPattern.nFields());
         isn->maxScan = query.getQueryRequest().getMaxScan();
         isn->addKeyMetadata = query.getQueryRequest().returnKey();
-        isn->indexCollator = index.collator;
         isn->queryCollator = query.getCollator();
 
         // Get the ixtag->pos-th element of the index key pattern.
@@ -402,7 +397,7 @@ void QueryPlannerAccess::finishTextNode(QuerySolutionNode* node, const IndexEntr
     // For example, say keyPattern = { a: 1, _fts: "text", _ftsx: 1, b: 1 }
     // prefixEnd should be 1.
     size_t prefixEnd = 0;
-    BSONObjIterator it(tn->indexKeyPattern);
+    BSONObjIterator it(tn->index.keyPattern);
     // Count how many prefix terms we have.
     while (it.more()) {
         // We know that the only key pattern with a type of String is the _fts field
@@ -1099,13 +1094,14 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedOr(const CanonicalQuery& quer
             if (!sharedSortOrders.empty()) {
                 for (size_t i = 1; i < ixscanNodes.size(); ++i) {
                     ixscanNodes[i]->computeProperties();
-                    BSONObjSet isect;
+                    const auto& bsonCmp = SimpleBSONObjComparator::kInstance;
+                    BSONObjSet isect = bsonCmp.makeBSONObjSet();
                     set_intersection(sharedSortOrders.begin(),
                                      sharedSortOrders.end(),
                                      ixscanNodes[i]->getSort().begin(),
                                      ixscanNodes[i]->getSort().end(),
                                      std::inserter(isect, isect.end()),
-                                     BSONObjCmp());
+                                     bsonCmp.makeLessThan());
                     sharedSortOrders = isect;
                     if (sharedSortOrders.empty()) {
                         break;
@@ -1246,12 +1242,9 @@ QuerySolutionNode* QueryPlannerAccess::scanWholeIndex(const IndexEntry& index,
     QuerySolutionNode* solnRoot = NULL;
 
     // Build an ixscan over the id index, use it, and return it.
-    unique_ptr<IndexScanNode> isn = make_unique<IndexScanNode>();
-    isn->indexKeyPattern = index.keyPattern;
-    isn->indexIsMultiKey = index.multikey;
+    unique_ptr<IndexScanNode> isn = make_unique<IndexScanNode>(index);
     isn->maxScan = query.getQueryRequest().getMaxScan();
     isn->addKeyMetadata = query.getQueryRequest().returnKey();
-    isn->indexCollator = index.collator;
     isn->queryCollator = query.getCollator();
 
     IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds);
@@ -1384,17 +1377,14 @@ QuerySolutionNode* QueryPlannerAccess::makeIndexScan(const IndexEntry& index,
     QuerySolutionNode* solnRoot = NULL;
 
     // Build an ixscan over the id index, use it, and return it.
-    IndexScanNode* isn = new IndexScanNode();
-    isn->indexKeyPattern = index.keyPattern;
-    isn->indexIsMultiKey = index.multikey;
+    IndexScanNode* isn = new IndexScanNode(index);
     isn->direction = 1;
     isn->maxScan = query.getQueryRequest().getMaxScan();
     isn->addKeyMetadata = query.getQueryRequest().returnKey();
     isn->bounds.isSimpleRange = true;
     isn->bounds.startKey = startKey;
     isn->bounds.endKey = endKey;
-    isn->bounds.endKeyInclusive = false;
-    isn->indexCollator = index.collator;
+    isn->bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
     isn->queryCollator = query.getCollator();
 
     unique_ptr<MatchExpression> filter = query.root()->shallowClone();

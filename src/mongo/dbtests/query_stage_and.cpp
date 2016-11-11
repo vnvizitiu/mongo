@@ -72,11 +72,12 @@ public:
     }
 
     IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
-        IndexDescriptor* descriptor = coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, obj);
-        if (NULL == descriptor) {
+        std::vector<IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(&_txn, obj, false, &indexes);
+        if (indexes.empty()) {
             FAIL(mongoutils::str::stream() << "Unable to find index with key pattern " << obj);
         }
-        return descriptor;
+        return indexes[0];
     }
 
     void getRecordIds(set<RecordId>* out, Collection* coll) {
@@ -192,7 +193,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -200,7 +201,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -298,7 +299,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -386,7 +387,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -394,7 +395,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -441,7 +442,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20 << "" << big);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -449,7 +450,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -494,7 +495,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -502,7 +503,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1 << "big" << 1), coll);
         params.bounds.startKey = BSON("" << 10 << "" << big);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -542,7 +543,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -550,7 +551,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -558,7 +559,7 @@ public:
         params.descriptor = getIndex(BSON("baz" << 1), coll);
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -609,7 +610,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -617,7 +618,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1 << "big" << 1), coll);
         params.bounds.startKey = BSON("" << 10 << "" << big);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -625,7 +626,7 @@ public:
         params.descriptor = getIndex(BSON("baz" << 1), coll);
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -663,7 +664,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -671,7 +672,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 5);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -726,7 +727,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 100);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -738,7 +739,7 @@ public:
         // want to include that in our scan.
         params.bounds.endKey = BSON(""
                                     << "");
-        params.bounds.endKeyInclusive = false;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -778,7 +779,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         IndexScan* firstScan = new IndexScan(&_txn, params, &ws, NULL);
 
@@ -791,7 +792,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -837,7 +838,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -845,7 +846,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 10);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         IndexScan* secondScan = new IndexScan(&_txn, params, &ws, NULL);
 
@@ -1031,7 +1032,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1164,7 +1165,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1209,7 +1210,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1217,7 +1218,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1258,7 +1259,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1266,7 +1267,7 @@ public:
         params.descriptor = getIndex(BSON("bar" << 1), coll);
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1303,7 +1304,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
@@ -1369,7 +1370,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         IndexScan* firstScan = new IndexScan(&_txn, params, &ws, NULL);
 
@@ -1423,7 +1424,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         as->addChild(new IndexScan(&_txn, params, &ws, NULL));
 

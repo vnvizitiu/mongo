@@ -66,7 +66,7 @@ public:
         help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -106,7 +106,7 @@ public:
                 Status(ErrorCodes::NamespaceNotSharded, "ns [" + nss.ns() + " is not sharded."));
         }
 
-        ChunkManagerPtr cm = config->getChunkManagerIfExists(txn, nss.ns());
+        auto cm = config->getChunkManagerIfExists(txn, nss.ns());
         if (!cm) {
             errmsg = "no chunk manager?";
             return false;

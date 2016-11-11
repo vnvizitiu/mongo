@@ -161,6 +161,11 @@ public:
     std::string getDiagnosticString() const;
 
     /**
+     * Returns an informational string.
+     */
+    std::string toString() const;
+
+    /**
      * Returns true if a remote command has been scheduled (but not completed)
      * with the executor.
      */
@@ -175,13 +180,20 @@ public:
      * Cancels remote command request.
      * Returns immediately if fetcher is not active.
      */
-    void cancel();
+    void shutdown();
 
     /**
      * Waits for remote command requests to complete.
      * Returns immediately if fetcher is not active.
      */
-    void wait();
+    void join();
+
+    /**
+     * Returns whether the fetcher is in shutdown.
+     *
+     * For testing only.
+     */
+    bool inShutdown_forTest() const;
 
 private:
     /**
@@ -207,6 +219,11 @@ private:
      */
     void _sendKillCursors(const CursorId id, const NamespaceString& nss);
 
+    /**
+     * Returns whether the fetcher is in shutdown.
+     */
+    bool _isInShutdown() const;
+
     // Not owned by us.
     executor::TaskExecutor* _executor;
 
@@ -227,6 +244,9 @@ private:
     // _first is true for first query response and false for subsequent responses.
     // Using boolean instead of a counter to avoid issues with wrap around.
     bool _first = true;
+
+    // _inShutdown is true after cancel() is called.
+    bool _inShutdown = false;
 
     // Callback handle to the scheduled getMore command.
     executor::TaskExecutor::CallbackHandle _getMoreCallbackHandle;

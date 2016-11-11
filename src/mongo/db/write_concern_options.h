@@ -47,6 +47,7 @@ public:
     static const BSONObj Unacknowledged;
     static const BSONObj Majority;
 
+    static const StringData kWriteConcernField;
     static const char kMajority[];  // = "majority"
 
     WriteConcernOptions() {
@@ -79,8 +80,8 @@ public:
     bool shouldWaitForOtherNodes() const;
 
     /**
-     * Returns true if this is a valid write concern to use against a config server.
-     * TODO(spencer): Once we stop supporting SCCC config servers, forbid this from allowing w:1
+     * Returns true if this is a {w:majority} write concern, which is the only valid write concern
+     * to use against a config server.
      */
     bool validForConfigServers() const;
 
@@ -104,6 +105,9 @@ public:
 
     // Timeout in milliseconds.
     int wTimeout;
+    // Deadline. If this is set to something other than Date_t::max(), this takes precedence over
+    // wTimeout.
+    Date_t wDeadline = Date_t::max();
 
     // True if the default write concern was used.
     bool usedDefault = false;

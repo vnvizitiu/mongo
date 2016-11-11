@@ -35,6 +35,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/server_options.h"
 
 namespace mongo {
 
@@ -51,6 +52,13 @@ Status ParsedUpdate::parseRequest() {
     invariant(_request->getProj().isEmpty() || _request->shouldReturnAnyDocs());
 
     if (!_request->getCollation().isEmpty()) {
+        if (serverGlobalParams.featureCompatibility.version.load() ==
+            ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
+        }
+
         auto collator = CollatorFactoryInterface::get(_txn->getServiceContext())
                             ->makeFromBSON(_request->getCollation());
         if (!collator.isOK()) {
@@ -75,10 +83,7 @@ Status ParsedUpdate::parseRequest() {
 Status ParsedUpdate::parseQuery() {
     dassert(!_canonicalQuery.get());
 
-    // TODO SERVER-23924: Create decision logic for idhack when the query has no collation, but
-    // there may be a collection default collation.
-    if (!_driver.needMatchDetails() && _request->getCollation().isEmpty() &&
-        CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
+    if (!_driver.needMatchDetails() && CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
         return Status::OK();
     }
 
@@ -104,7 +109,6 @@ Status ParsedUpdate::parseQueryToCQ() {
     // deleted/modified under it, but a limit could inhibit that and give an EOF when the update
     // has not actually updated a document. This behavior is fine for findAndModify, but should
     // not apply to update in general.
-    // TODO SERVER-23473: Pass the collation to canonicalize().
     if (!_request->isMulti() && !_request->getSort().isEmpty()) {
         qr->setLimit(1);
     }

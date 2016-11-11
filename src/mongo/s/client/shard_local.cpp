@@ -28,6 +28,8 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
+#include <boost/none_t.hpp>
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/client/shard_local.h"
@@ -43,21 +45,18 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-namespace {
-const Status kInternalErrorStatus{ErrorCodes::InternalError,
-                                  "Invalid to check for write concern error if command failed"};
-}  // namespace
+ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
+    // Currently ShardLocal only works for config servers. If we ever start using ShardLocal on
+    // shards we'll need to consider how to handle shards.
+    invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+}
 
 const ConnectionString ShardLocal::getConnString() const {
     auto replCoord = repl::getGlobalReplicationCoordinator();
-
-    // Currently ShardLocal only works for config servers, which must be replica sets.  If we
-    // ever start using ShardLocal on shards we'll need to consider how to handle shards that are
-    // not replica sets.
-    invariant(replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet);
     return replCoord->getConfig().getConnectionString();
 }
 
@@ -94,10 +93,40 @@ bool ShardLocal::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
     }
 }
 
-StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* txn,
-                                                           const ReadPreferenceSetting& unused,
-                                                           const std::string& dbName,
-                                                           const BSONObj& cmdObj) {
+void ShardLocal::_updateLastOpTimeFromClient(OperationContext* txn,
+                                             const repl::OpTime& previousOpTimeOnClient) {
+    repl::OpTime lastOpTimeFromClient =
+        repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+    invariant(lastOpTimeFromClient >= previousOpTimeOnClient);
+    if (lastOpTimeFromClient.isNull() || lastOpTimeFromClient == previousOpTimeOnClient) {
+        return;
+    }
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (lastOpTimeFromClient >= _lastOpTime) {
+        // It's always possible for lastOpTimeFromClient to be less than _lastOpTime if another
+        // thread started and completed a write through this ShardLocal (updating _lastOpTime)
+        // after this operation had completed its write but before it got here.
+        _lastOpTime = lastOpTimeFromClient;
+    }
+}
+
+repl::OpTime ShardLocal::_getLastOpTime() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _lastOpTime;
+}
+
+Shard::HostWithResponse ShardLocal::_runCommand(OperationContext* txn,
+                                                const ReadPreferenceSetting& unused,
+                                                const std::string& dbName,
+                                                Milliseconds maxTimeMSOverrideUnused,
+                                                const BSONObj& cmdObj) {
+    repl::OpTime currentOpTimeFromClient =
+        repl::ReplClientInfo::forClient(txn->getClient()).getLastOp();
+    ON_BLOCK_EXIT([this, &txn, &currentOpTimeFromClient] {
+        _updateLastOpTimeFromClient(txn, currentOpTimeFromClient);
+    });
+
     try {
         DBDirectClient client(txn);
         rpc::UniqueReply commandResponse = client.runCommandWithMetadata(
@@ -106,17 +135,15 @@ StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* txn
         BSONObj responseMetadata = commandResponse->getMetadata().getOwned();
 
         Status commandStatus = getStatusFromCommandResult(responseReply);
-        Status writeConcernStatus = kInternalErrorStatus;
-        if (commandStatus.isOK()) {
-            writeConcernStatus = getWriteConcernStatusFromCommandResult(responseReply);
-        }
+        Status writeConcernStatus = getWriteConcernStatusFromCommandResult(responseReply);
 
-        return Shard::CommandResponse{std::move(responseReply),
-                                      std::move(responseMetadata),
-                                      std::move(commandStatus),
-                                      std::move(writeConcernStatus)};
+        return Shard::HostWithResponse(boost::none,
+                                       Shard::CommandResponse{std::move(responseReply),
+                                                              std::move(responseMetadata),
+                                                              std::move(commandStatus),
+                                                              std::move(writeConcernStatus)});
     } catch (const DBException& ex) {
-        return ex.toStatus();
+        return Shard::HostWithResponse(boost::none, ex.toStatus());
     }
 }
 
@@ -134,13 +161,16 @@ StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
         // Set up operation context with majority read snapshot so correct optime can be retrieved.
         Status status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
 
-        // Wait until a snapshot is available.
-        while (status == ErrorCodes::ReadConcernMajorityNotAvailableYet) {
-            LOG(1) << "Waiting for ReadFromMajorityCommittedSnapshot to become available";
-            replCoord->waitUntilSnapshotCommitted(txn, SnapshotName::min());
-            status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+        // Wait for any writes performed by this ShardLocal instance to be committed and visible.
+        Status readConcernStatus = replCoord->waitUntilOpTimeForRead(
+            txn, repl::ReadConcernArgs{_getLastOpTime(), readConcernLevel});
+        if (!readConcernStatus.isOK()) {
+            return readConcernStatus;
         }
 
+        // Inform the storage engine to read from the committed snapshot for the rest of this
+        // operation.
+        status = txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
         if (!status.isOK()) {
             return status;
         }

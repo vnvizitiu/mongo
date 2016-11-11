@@ -13,18 +13,25 @@
         });
     };
 
-    var checkShardingStateInitialized = function(conn, configConnStr, shardName) {
+    var checkShardingStateInitialized = function(conn, configConnStr, shardName, clusterId) {
         var res = conn.getDB('admin').runCommand({shardingState: 1});
         assert.commandWorked(res);
         assert(res.enabled);
         assert.eq(configConnStr, res.configServer);
         assert.eq(shardName, res.shardName);
-        // TODO SERVER-23096: How should the clusterId be obtained externally?
-        // assert.eq(clusterId, res.clusterId);
+        assert(clusterId.equals(res.clusterId),
+               'cluster id: ' + tojson(clusterId) + ' != ' + tojson(res.clusterId));
+    };
+
+    var checkShardMarkedAsShardAware = function(mongosConn, shardName) {
+        var res = mongosConn.getDB('config').getCollection('shards').findOne({_id: shardName});
+        assert.neq(null, res, "Could not find new shard " + shardName + " in config.shards");
+        assert.eq(1, res.state);
     };
 
     // Create the cluster to test adding shards to.
     var st = new ShardingTest({shards: 1});
+    var clusterId = st.s.getDB('config').getCollection('version').findOne().clusterId;
 
     // Add a shard that is a standalone mongod.
 
@@ -34,7 +41,8 @@
     jsTest.log("Going to add standalone as shard: " + standaloneConn);
     var newShardName = "newShard";
     assert.commandWorked(st.s.adminCommand({addShard: standaloneConn.name, name: newShardName}));
-    checkShardingStateInitialized(standaloneConn, st.configRS.getURL(), newShardName);
+    checkShardingStateInitialized(standaloneConn, st.configRS.getURL(), newShardName, clusterId);
+    checkShardMarkedAsShardAware(st.s, newShardName);
 
     MongoRunner.stopMongod(standaloneConn.port);
 
@@ -45,9 +53,11 @@
     replTest.initiate();
     waitForIsMaster(replTest.getPrimary());
 
-    jsTest.log("Going to add replica set as shard: " + replTest);
+    jsTest.log("Going to add replica set as shard: " + tojson(replTest));
     assert.commandWorked(st.s.adminCommand({addShard: replTest.getURL(), name: replTest.getURL()}));
-    checkShardingStateInitialized(replTest.getPrimary(), st.configRS.getURL(), replTest.getURL());
+    checkShardingStateInitialized(
+        replTest.getPrimary(), st.configRS.getURL(), replTest.getURL(), clusterId);
+    checkShardMarkedAsShardAware(st.s, newShardName);
 
     replTest.stopSet();
 

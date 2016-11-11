@@ -237,16 +237,19 @@ Status validateElementInfo(Buffer* buffer,
                     return makeError("Invalid bson", idElem);
                 return Status::OK();
             } else {
-                return Status(
-                    ErrorCodes::InvalidBSON,
-                    "Attempt to use a decimal BSON type when support is not currently enabled.");
+                return Status(ErrorCodes::InvalidBSON,
+                              "Cannot use decimal BSON type when the featureCompatibilityVersion "
+                              "is 3.2. See "
+                              "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
             }
 
         case DBRef:
             status = buffer->readUTF8String(NULL);
             if (!status.isOK())
                 return status;
-            buffer->skip(OID::kOIDSize);
+            if (!buffer->skip(OID::kOIDSize)) {
+                return makeError("invalid bson length", idElem);
+            }
             return Status::OK();
 
         case RegEx:

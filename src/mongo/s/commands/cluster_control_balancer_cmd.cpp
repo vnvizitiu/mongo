@@ -66,7 +66,7 @@ public:
         help << "Starts or stops the sharding balancer.";
     }
 
-    Status checkAuthForCommand(ClientBasic* client,
+    Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -84,12 +84,12 @@ public:
              std::string& errmsg,
              BSONObjBuilder& result) override {
         auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
-        auto cmdResponse =
-            uassertStatusOK(configShard->runCommand(txn,
-                                                    kPrimaryOnlyReadPreference,
-                                                    "admin",
-                                                    BSON(_configsvrCommandName << 1),
-                                                    Shard::RetryPolicy::kIdempotent));
+        auto cmdResponse = uassertStatusOK(
+            configShard->runCommandWithFixedRetryAttempts(txn,
+                                                          kPrimaryOnlyReadPreference,
+                                                          "admin",
+                                                          BSON(_configsvrCommandName << 1),
+                                                          Shard::RetryPolicy::kIdempotent));
         uassertStatusOK(cmdResponse.commandStatus);
 
         // Append any return value from the response, which the config server returned

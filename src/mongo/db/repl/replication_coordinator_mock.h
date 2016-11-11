@@ -30,6 +30,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/platform/atomic_word.h"
 
@@ -99,7 +100,7 @@ public:
                                          const NamespaceString& ns,
                                          bool slaveOk);
 
-    virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
+    virtual bool shouldRelaxIndexConstraints(const NamespaceString& ns);
 
     virtual Status setLastOptimeForSlave(const OID& rid, const Timestamp& ts);
 
@@ -116,8 +117,8 @@ public:
     virtual OpTime getMyLastAppliedOpTime() const;
     virtual OpTime getMyLastDurableOpTime() const;
 
-    virtual ReadConcernResponse waitUntilOpTime(OperationContext* txn,
-                                                const ReadConcernArgs& settings) override;
+    virtual Status waitUntilOpTimeForRead(OperationContext* txn,
+                                          const ReadConcernArgs& settings) override;
 
     virtual OID getElectionId();
 
@@ -129,16 +130,20 @@ public:
 
     virtual bool isWaitingForApplierToDrain();
 
+    virtual bool isCatchingUp();
+
     virtual void signalDrainComplete(OperationContext*);
 
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater();
 
+    virtual Status resyncData(OperationContext* txn, bool waitUntilCompleted) override;
+
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         ReplSetUpdatePositionCommandStyle commandStyle) const override;
 
-    virtual Status processReplSetGetStatus(BSONObjBuilder* result);
+    virtual Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle);
 
     virtual void fillIsMasterForReplSet(IsMasterResponse* result);
 
@@ -158,7 +163,9 @@ public:
 
     virtual bool getMaintenanceMode();
 
-    virtual Status processReplSetSyncFrom(const HostAndPort& target, BSONObjBuilder* resultObj);
+    virtual Status processReplSetSyncFrom(OperationContext* txn,
+                                          const HostAndPort& target,
+                                          BSONObjBuilder* resultObj);
 
     virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
 
@@ -201,9 +208,6 @@ public:
     virtual HostAndPort chooseNewSyncSource(const Timestamp& lastTimestampFetched);
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
-
-    virtual SyncSourceResolverResponse selectSyncSource(OperationContext* txn,
-                                                        const OpTime& lastOpTimeFetched);
 
     virtual void resetLastOpTimesFromOplog(OperationContext* txn);
 
@@ -250,11 +254,20 @@ public:
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
 
-    virtual bool getInitialSyncRequestedFlag() const override;
-    virtual void setInitialSyncRequestedFlag(bool value) override;
-
     virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
+
+    virtual Status stepUpIfEligible() override;
+
+    /**
+     * Sets the return value for calls to getConfig.
+     */
+    void setGetConfigReturnValue(ReplicaSetConfig returnValue);
+
+    /**
+     * Always allow writes even if this node is not master. Used by sharding unit tests.
+     */
+    void alwaysAllowWrites(bool allowWrites);
 
 private:
     AtomicUInt64 _snapshotNameGenerator;
@@ -262,6 +275,8 @@ private:
     MemberState _memberState;
     OpTime _myLastDurableOpTime;
     OpTime _myLastAppliedOpTime;
+    ReplicaSetConfig _getConfigReturnValue;
+    bool _alwaysAllowWrites = false;
 };
 
 }  // namespace repl

@@ -26,8 +26,11 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/auth/user_management_commands_parser.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -49,25 +52,6 @@ namespace mongo {
 namespace auth {
 
 using std::vector;
-
-/**
- * Writes into *writeConcern a BSONObj describing the parameters to getLastError to use for
- * the write confirmation.
- */
-Status _extractWriteConcern(const BSONObj& cmdObj, BSONObj* writeConcern) {
-    BSONElement writeConcernElement;
-    Status status = bsonExtractTypedField(cmdObj, "writeConcern", Object, &writeConcernElement);
-    if (!status.isOK()) {
-        if (status.code() == ErrorCodes::NoSuchKey) {
-            *writeConcern = BSONObj();
-            return Status::OK();
-        }
-        return status;
-    }
-    *writeConcern = writeConcernElement.Obj().getOwned();
-    ;
-    return Status::OK();
-}
 
 Status _checkNoExtraFields(const BSONObj& cmdObj,
                            StringData cmdName,
@@ -215,11 +199,6 @@ Status parseCreateOrUpdateUserCommands(const BSONObj& cmdObj,
         return status;
     }
 
-    status = _extractWriteConcern(cmdObj, &parsedArgs->writeConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
     BSONObjBuilder userObjBuilder;
 
     // Parse user name
@@ -352,6 +331,7 @@ Status parseUsersInfoCommand(const BSONObj& cmdObj, StringData dbname, UsersInfo
         if (!status.isOK()) {
             return status;
         }
+        std::sort(parsedArgs->userNames.begin(), parsedArgs->userNames.end());
     } else {
         UserName name;
         status = _parseNameFromBSONElement(cmdObj["usersInfo"],
@@ -412,10 +392,20 @@ Status parseRolesInfoCommand(const BSONObj& cmdObj, StringData dbname, RolesInfo
         parsedArgs->roleNames.push_back(name);
     }
 
-    status = bsonExtractBooleanFieldWithDefault(
-        cmdObj, "showPrivileges", false, &parsedArgs->showPrivileges);
-    if (!status.isOK()) {
-        return status;
+    BSONElement showPrivileges = cmdObj["showPrivileges"];
+    if (showPrivileges.eoo()) {
+        parsedArgs->privilegeFormat = PrivilegeFormat::kOmit;
+    } else if (showPrivileges.isNumber() || showPrivileges.isBoolean()) {
+        parsedArgs->privilegeFormat =
+            showPrivileges.trueValue() ? PrivilegeFormat::kShowSeparate : PrivilegeFormat::kOmit;
+    } else if (showPrivileges.type() == BSONType::String &&
+               showPrivileges.String() == "asUserFragment") {
+        parsedArgs->privilegeFormat = PrivilegeFormat::kShowAsUserFragment;
+    } else {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Failed to parse 'showPrivileges'. 'showPrivileges' should "
+                                       "either be a boolean or the string 'asUserFragment', given: "
+                                    << showPrivileges.toString());
     }
 
     status = bsonExtractBooleanFieldWithDefault(
@@ -481,11 +471,6 @@ Status parseCreateOrUpdateRoleCommands(const BSONObj& cmdObj,
     validFieldNames.insert("maxTimeMS");
 
     Status status = _checkNoExtraFields(cmdObj, cmdName, validFieldNames);
-    if (!status.isOK()) {
-        return status;
-    }
-
-    status = _extractWriteConcern(cmdObj, &parsedArgs->writeConcern);
     if (!status.isOK()) {
         return status;
     }
@@ -622,11 +607,6 @@ Status parseMergeAuthzCollectionsCommand(const BSONObj& cmdObj,
         return status;
     }
 
-    status = _extractWriteConcern(cmdObj, &parsedArgs->writeConcern);
-    if (!status.isOK()) {
-        return status;
-    }
-
     status = bsonExtractStringFieldWithDefault(
         cmdObj, "tempUsersCollection", "", &parsedArgs->usersCollName);
     if (!status.isOK()) {
@@ -696,11 +676,6 @@ Status parseAuthSchemaUpgradeCommand(const BSONObj& cmdObj,
                                                 << steps);
     }
     parsedArgs->maxSteps = static_cast<int>(steps);
-
-    status = _extractWriteConcern(cmdObj, &parsedArgs->writeConcern);
-    if (!status.isOK()) {
-        return status;
-    }
 
     return Status::OK();
 }

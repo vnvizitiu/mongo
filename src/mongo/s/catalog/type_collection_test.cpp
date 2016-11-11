@@ -52,6 +52,8 @@ TEST(CollectionType, Basic) {
                                       << CollectionType::epoch(oid)
                                       << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
                                       << CollectionType::keyPattern(BSON("a" << 1))
+                                      << CollectionType::defaultCollation(BSON("locale"
+                                                                               << "fr_CA"))
                                       << CollectionType::unique(true)));
     ASSERT_TRUE(status.isOK());
 
@@ -60,10 +62,76 @@ TEST(CollectionType, Basic) {
     ASSERT(coll.getNs() == NamespaceString{"db.coll"});
     ASSERT_EQUALS(coll.getEpoch(), oid);
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
-    ASSERT_EQUALS(coll.getKeyPattern().toBSON(), BSON("a" << 1));
+    ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));
+    ASSERT_BSONOBJ_EQ(coll.getDefaultCollation(),
+                      BSON("locale"
+                           << "fr_CA"));
     ASSERT_EQUALS(coll.getUnique(), true);
     ASSERT_EQUALS(coll.getAllowBalance(), true);
     ASSERT_EQUALS(coll.getDropped(), false);
+}
+
+TEST(CollectionType, EmptyDefaultCollationFailsToParse) {
+    const OID oid = OID::gen();
+    StatusWith<CollectionType> status =
+        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
+                                      << CollectionType::epoch(oid)
+                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
+                                      << CollectionType::keyPattern(BSON("a" << 1))
+                                      << CollectionType::defaultCollation(BSONObj())
+                                      << CollectionType::unique(true)));
+    ASSERT_FALSE(status.isOK());
+}
+
+TEST(CollectionType, MissingDefaultCollationParses) {
+    const OID oid = OID::gen();
+    StatusWith<CollectionType> status =
+        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
+                                      << CollectionType::epoch(oid)
+                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
+                                      << CollectionType::keyPattern(BSON("a" << 1))
+                                      << CollectionType::unique(true)));
+    ASSERT_TRUE(status.isOK());
+
+    CollectionType coll = status.getValue();
+    ASSERT_TRUE(coll.validate().isOK());
+    ASSERT_BSONOBJ_EQ(coll.getDefaultCollation(), BSONObj());
+}
+
+TEST(CollectionType, DefaultCollationSerializesCorrectly) {
+    const OID oid = OID::gen();
+    StatusWith<CollectionType> status =
+        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
+                                      << CollectionType::epoch(oid)
+                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
+                                      << CollectionType::keyPattern(BSON("a" << 1))
+                                      << CollectionType::defaultCollation(BSON("locale"
+                                                                               << "fr_CA"))
+                                      << CollectionType::unique(true)));
+    ASSERT_TRUE(status.isOK());
+
+    CollectionType coll = status.getValue();
+    ASSERT_TRUE(coll.validate().isOK());
+    BSONObj serialized = coll.toBSON();
+    ASSERT_BSONOBJ_EQ(serialized["defaultCollation"].Obj(),
+                      BSON("locale"
+                           << "fr_CA"));
+}
+
+TEST(CollectionType, MissingDefaultCollationIsNotSerialized) {
+    const OID oid = OID::gen();
+    StatusWith<CollectionType> status =
+        CollectionType::fromBSON(BSON(CollectionType::fullNs("db.coll")
+                                      << CollectionType::epoch(oid)
+                                      << CollectionType::updatedAt(Date_t::fromMillisSinceEpoch(1))
+                                      << CollectionType::keyPattern(BSON("a" << 1))
+                                      << CollectionType::unique(true)));
+    ASSERT_TRUE(status.isOK());
+
+    CollectionType coll = status.getValue();
+    ASSERT_TRUE(coll.validate().isOK());
+    BSONObj serialized = coll.toBSON();
+    ASSERT_FALSE(serialized["defaultCollation"]);
 }
 
 TEST(CollectionType, EpochCorrectness) {
@@ -104,7 +172,7 @@ TEST(CollectionType, Pre22Format) {
     ASSERT(coll.getNs() == NamespaceString{"db.coll"});
     ASSERT(!coll.getEpoch().isSet());
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
-    ASSERT_EQUALS(coll.getKeyPattern().toBSON(), BSON("a" << 1));
+    ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));
     ASSERT_EQUALS(coll.getUnique(), false);
     ASSERT_EQUALS(coll.getAllowBalance(), true);
     ASSERT_EQUALS(coll.getDropped(), false);

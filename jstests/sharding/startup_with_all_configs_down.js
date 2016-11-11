@@ -66,28 +66,30 @@
         st.restartConfigServer(i);
     }
 
-    // TODO: SERVER-23192 - restart all shards and mongos because their replica set monitor has
-    // deemed the CSRS config server set as unusable.
-    restartShard(st.shard0, true);
-    restartShard(st.shard1, true);
-    st.restartMongos(0);
+    print("Sleeping for 60 seconds to let the other shards restart their ReplicaSetMonitors");
+    sleep(60000);
 
     jsTestLog("Queries against the original mongos should work again");
     assert.eq(100, st.s.getDB('test').foo.find().itcount());
 
     jsTestLog("Should now be possible to connect to the mongos that was started while the config " +
               "servers were down");
-    var mongos2 = null;
-    assert.soon(function() {
-        try {
-            mongos2 = new Mongo(newMongosInfo.host);
-            return true;
-        } catch (e) {
-            printjson(e);
-            return false;
-        }
-    });
-    assert.eq(100, mongos2.getDB('test').foo.find().itcount());
+    var newMongosConn = null;
+    var caughtException = null;
+    assert.soon(
+        function() {
+            try {
+                newMongosConn = new Mongo(newMongosInfo.host);
+                return true;
+            } catch (e) {
+                caughtException = e;
+                return false;
+            }
+        },
+        "Failed to connect to mongos after config servers were restarted: " +
+            tojson(caughtException));
+
+    assert.eq(100, newMongosConn.getDB('test').foo.find().itcount());
 
     st.stop();
 }());

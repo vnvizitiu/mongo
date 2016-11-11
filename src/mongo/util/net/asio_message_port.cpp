@@ -35,6 +35,7 @@
 #include <set>
 
 #include "mongo/base/init.h"
+#include "mongo/base/static_assert.h"
 #include "mongo/config.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
@@ -53,40 +54,6 @@ namespace {
 const char kGET[] = "GET";
 const int kHeaderLen = sizeof(MSGHEADER::Value);
 const int kInitialMessageSize = 1024;
-
-class ASIOPorts {
-public:
-    void closeAll(AbstractMessagingPort::Tag skipMask) {
-        stdx::lock_guard<stdx::mutex> lock_guard(mutex);
-        for (auto&& port : _portSet) {
-            if (port->getTag() & skipMask) {
-                LOG(3) << "Skip closing connection # " << port->connectionId();
-                continue;
-            }
-            LOG(3) << "Closing connection # " << port->connectionId();
-            port->shutdown();
-        }
-    }
-
-    void insert(ASIOMessagingPort* p) {
-        stdx::lock_guard<stdx::mutex> lock_guard(mutex);
-        _portSet.insert(p);
-    }
-
-    void erase(ASIOMessagingPort* p) {
-        stdx::lock_guard<stdx::mutex> lock_guard(mutex);
-        _portSet.erase(p);
-    }
-
-private:
-    stdx::mutex mutex;
-    std::unordered_set<ASIOMessagingPort*> _portSet;
-};
-
-// We "new" this so it will still be around when other automatic global vars are being destructed
-// during termination. TODO: This is an artifact from MessagingPort and should be removed when we
-// decide where to put networking global state.
-ASIOPorts& asioPorts = *(new ASIOPorts());
 
 #ifdef MONGO_CONFIG_SSL
 struct ASIOSSLContextPair {
@@ -109,10 +76,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(ASIOSSLContextSetup, ("SSLManager"))(Initia
 
 }  // namespace
 
-void ASIOMessagingPort::closeSockets(AbstractMessagingPort::Tag skipMask) {
-    asioPorts.closeAll(skipMask);
-}
-
 ASIOMessagingPort::ASIOMessagingPort(int fd, SockAddr farEnd)
     : _service(1),
       _timer(_service),
@@ -121,7 +84,7 @@ ASIOMessagingPort::ASIOMessagingPort(int fd, SockAddr farEnd)
       _remote(),
       _isEncrypted(false),
       _awaitingHandshake(true),
-      _x509SubjectName(),
+      _x509PeerInfo(),
       _bytesIn(0),
       _bytesOut(0),
       _logLevel(logger::LogSeverity::Log()),
@@ -145,7 +108,6 @@ ASIOMessagingPort::ASIOMessagingPort(int fd, SockAddr farEnd)
                                            farEnd.getType() == AF_UNIX ? 0 : IPPROTO_TCP),
             fd) {
 #endif  // MONGO_CONFIG_SSL
-    asioPorts.insert(this);
     _getSocket().non_blocking(true);
     _remote = HostAndPort(farEnd.getAddr(), farEnd.getPort());
     _timer.expires_at(decltype(_timer)::time_point::max());
@@ -160,7 +122,7 @@ ASIOMessagingPort::ASIOMessagingPort(Milliseconds timeout, logger::LogSeverity l
       _remote(),
       _isEncrypted(false),
       _awaitingHandshake(true),
-      _x509SubjectName(),
+      _x509PeerInfo(),
       _bytesIn(0),
       _bytesOut(0),
       _logLevel(logLevel),
@@ -177,7 +139,6 @@ ASIOMessagingPort::ASIOMessagingPort(Milliseconds timeout, logger::LogSeverity l
 #else
       _sock(_service) {
 #endif  // MONGO_CONFIG_SSL
-    asioPorts.insert(this);
     if (*_timeout == Milliseconds(0)) {
         _timeout = boost::none;
     }
@@ -187,7 +148,6 @@ ASIOMessagingPort::ASIOMessagingPort(Milliseconds timeout, logger::LogSeverity l
 
 ASIOMessagingPort::~ASIOMessagingPort() {
     shutdown();
-    asioPorts.erase(this);
 }
 
 void ASIOMessagingPort::setTimeout(Milliseconds millis) {
@@ -391,8 +351,8 @@ bool ASIOMessagingPort::recv(Message& m) {
         }
 
         if (_awaitingHandshake) {
-            static_assert(sizeof(kGET) - 1 <= kHeaderLen,
-                          "HTTP GET string must be smaller than the message header.");
+            MONGO_STATIC_ASSERT_MSG(sizeof(kGET) - 1 <= kHeaderLen,
+                                    "HTTP GET string must be smaller than the message header.");
             if (memcmp(md.view2ptr(), kGET, strlen(kGET)) == 0) {
                 std::string httpMsg =
                     "It looks like you are trying to access MongoDB over HTTP on the native driver "
@@ -424,13 +384,13 @@ bool ASIOMessagingPort::recv(Message& m) {
                     throw asio::system_error(ec);
                 }
 
-                auto swPeerSubjectName =
+                auto swPeerInfo =
                     getSSLManager()->parseAndValidatePeerCertificate(_sslSock.native_handle(), "");
-                if (!swPeerSubjectName.isOK()) {
+                if (!swPeerInfo.isOK()) {
                     throw SocketException(SocketException::CONNECT_ERROR,
-                                          swPeerSubjectName.getStatus().reason());
+                                          swPeerInfo.getStatus().reason());
                 }
-                setX509SubjectName(swPeerSubjectName.getValue().get_value_or(""));
+                setX509PeerInfo(swPeerInfo.getValue().get_value_or(SSLPeerInfo()));
 
                 _isEncrypted = true;
                 _awaitingHandshake = false;
@@ -468,7 +428,7 @@ bool ASIOMessagingPort::recv(Message& m) {
         return true;
 
     } catch (const asio::system_error& e) {
-        LOG(_logLevel) << "SocketException: remote: " << remote() << " error: " << e.what();
+        LOG(_logLevel) << "SocketException: remote: " << remote() << " error: " << redact(e.what());
         m.reset();
         return false;
     }
@@ -502,6 +462,11 @@ void ASIOMessagingPort::say(Message& toSend, int responseTo) {
     invariant(!toSend.empty());
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(responseTo);
+    return say(const_cast<const Message&>(toSend));
+}
+
+void ASIOMessagingPort::say(const Message& toSend) {
+    invariant(!toSend.empty());
     auto buf = toSend.buf();
     if (buf) {
         send(buf, MsgData::ConstView(buf).getLen(), nullptr);
@@ -626,13 +591,12 @@ bool ASIOMessagingPort::secure(SSLManagerInterface* ssl, const std::string& remo
         return false;
     }
 
-    auto swPeerSubjectName =
+    auto swPeerInfo =
         getSSLManager()->parseAndValidatePeerCertificate(_sslSock.native_handle(), remoteHost);
-    if (!swPeerSubjectName.isOK()) {
-        throw SocketException(SocketException::CONNECT_ERROR,
-                              swPeerSubjectName.getStatus().reason());
+    if (!swPeerInfo.isOK()) {
+        throw SocketException(SocketException::CONNECT_ERROR, swPeerInfo.getStatus().reason());
     }
-    setX509SubjectName(swPeerSubjectName.getValue().get_value_or(""));
+    setX509PeerInfo(swPeerInfo.getValue().get_value_or(SSLPeerInfo()));
 
     _isEncrypted = true;
     return true;
@@ -666,12 +630,12 @@ long long ASIOMessagingPort::getBytesOut() const {
     return _bytesOut;
 }
 
-void ASIOMessagingPort::setX509SubjectName(const std::string& x509SubjectName) {
-    _x509SubjectName = x509SubjectName;
+void ASIOMessagingPort::setX509PeerInfo(SSLPeerInfo x509PeerInfo) {
+    _x509PeerInfo = std::move(x509PeerInfo);
 }
 
-std::string ASIOMessagingPort::getX509SubjectName() const {
-    return _x509SubjectName;
+const SSLPeerInfo& ASIOMessagingPort::getX509PeerInfo() const {
+    return _x509PeerInfo;
 }
 
 void ASIOMessagingPort::setConnectionId(const long long connectionId) {

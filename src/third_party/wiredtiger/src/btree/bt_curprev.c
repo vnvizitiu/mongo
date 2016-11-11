@@ -329,6 +329,7 @@ __cursor_var_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 		if (cbt->last_standard_recno == 0)
 			return (WT_NOTFOUND);
 		__cursor_set_recno(cbt, cbt->last_standard_recno);
+		cbt->cip_saved = NULL;
 		goto new_page;
 	}
 
@@ -447,7 +448,7 @@ __cursor_row_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 	 * WT_INSERT_HEAD[0], and so on.  This means WT_INSERT lists are
 	 * odd-numbered slots, and WT_ROW array slots are even-numbered slots.
 	 *
-	 * New page configuration.
+	 * Initialize for each new page.
 	 */
 	if (newpage) {
 		/*
@@ -464,6 +465,7 @@ __cursor_row_prev(WT_CURSOR_BTREE *cbt, bool newpage)
 			    WT_ROW_INSERT_SLOT(page, page->pg_row_entries - 1);
 		cbt->ins = WT_SKIP_LAST(cbt->ins_head);
 		cbt->row_iteration_slot = page->pg_row_entries * 2 + 1;
+		cbt->rip_saved = NULL;
 		goto new_insert;
 	}
 
@@ -541,8 +543,8 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, bool truncating)
 
 	session = (WT_SESSION_IMPL *)cbt->iface.session;
 
-	WT_STAT_FAST_CONN_INCR(session, cursor_prev);
-	WT_STAT_FAST_DATA_INCR(session, cursor_prev);
+	WT_STAT_CONN_INCR(session, cursor_prev);
+	WT_STAT_DATA_INCR(session, cursor_prev);
 
 	flags = WT_READ_PREV | WT_READ_SKIP_INTL;	/* Tree walk flags. */
 	if (truncating)
@@ -619,7 +621,7 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, bool truncating)
 		if (page != NULL &&
 		    (cbt->page_deleted_count > WT_BTREE_DELETE_THRESHOLD ||
 		    (newpage && cbt->page_deleted_count > 0)))
-			__wt_page_evict_soon(page);
+			__wt_page_evict_soon(session, cbt->ref);
 		cbt->page_deleted_count = 0;
 
 		WT_ERR(__wt_tree_walk(session, &cbt->ref, flags));

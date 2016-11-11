@@ -49,6 +49,7 @@
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
 #include "mongo/logger/logstream_builder.h"
+#include "mongo/logger/redaction.h"
 #include "mongo/logger/tee.h"
 #include "mongo/util/concurrency/thread_name.h"
 
@@ -223,6 +224,11 @@ std::pair<int, std::string> errnoAndDescription();
  * Write the current context (backtrace), along with the optional "msg".
  */
 void logContext(const char* msg = NULL);
+
+/**
+ * Turns the global log manager into a plain console logger (no adornments).
+ */
+void setPlainConsoleLogger();
 
 }  // namespace mongo
 

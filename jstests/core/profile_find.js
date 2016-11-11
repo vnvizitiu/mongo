@@ -6,13 +6,13 @@
     // For getLatestProfilerEntry and getProfilerProtocolStringForCommand
     load("jstests/libs/profiler.js");
 
-    var conn = new Mongo(db.getMongo().host);
-    var testDB = conn.getDB("profile_find");
+    var testDB = db.getSiblingDB("profile_find");
     assert.commandWorked(testDB.dropDatabase());
     var coll = testDB.getCollection("test");
-    var isLegacyReadMode = (db.getMongo().readMode() === "legacy");
+    var isLegacyReadMode = (testDB.getMongo().readMode() === "legacy");
 
     testDB.setProfilingLevel(2);
+    const profileEntryFilter = {op: "query"};
 
     //
     // Confirm most metrics on single document read.
@@ -21,14 +21,17 @@
     for (i = 0; i < 3; ++i) {
         assert.writeOK(coll.insert({a: i, b: i}));
     }
-    assert.commandWorked(coll.createIndex({a: 1}));
+    assert.commandWorked(coll.createIndex({a: 1}, {collation: {locale: "fr"}}));
 
-    assert.neq(coll.findOne({a: 1}), null);
+    if (!isLegacyReadMode) {
+        assert.eq(coll.find({a: 1}).collation({locale: "fr"}).limit(1).itcount(), 1);
+    } else {
+        assert.neq(coll.findOne({a: 1}), null);
+    }
 
-    var profileObj = getLatestProfilerEntry(testDB);
+    var profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
     assert.eq(profileObj.ns, coll.getFullName(), tojson(profileObj));
-    assert.eq(profileObj.op, "query", tojson(profileObj));
     assert.eq(profileObj.keysExamined, 1, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.nreturned, 1, tojson(profileObj));
@@ -39,8 +42,13 @@
         assert.eq(profileObj.query.ntoreturn, -1, tojson(profileObj));
     } else {
         assert.eq(profileObj.query.limit, 1, tojson(profileObj));
-        assert.eq(
-            profileObj.protocol, getProfilerProtocolStringForCommand(conn), tojson(profileObj));
+        assert.eq(profileObj.protocol,
+                  getProfilerProtocolStringForCommand(testDB.getMongo()),
+                  tojson(profileObj));
+    }
+
+    if (!isLegacyReadMode) {
+        assert.eq(profileObj.query.collation, {locale: "fr"});
     }
     assert.eq(profileObj.cursorExhausted, true, tojson(profileObj));
     assert(!profileObj.hasOwnProperty("cursorid"), tojson(profileObj));
@@ -51,6 +59,7 @@
     assert(profileObj.locks.hasOwnProperty("Global"), tojson(profileObj));
     assert(profileObj.locks.hasOwnProperty("Database"), tojson(profileObj));
     assert(profileObj.locks.hasOwnProperty("Collection"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm "cursorId" and "hasSortStage" metrics.
@@ -64,11 +73,12 @@
     assert.neq(coll.findOne({a: 1}), null);
 
     assert.neq(coll.find({a: {$gte: 0}}).sort({b: 1}).batchSize(1).next(), null);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
     assert.eq(profileObj.hasSortStage, true, tojson(profileObj));
     assert(profileObj.hasOwnProperty("cursorid"), tojson(profileObj));
     assert(!profileObj.hasOwnProperty("cursorExhausted"), tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm "fromMultiPlanner" metric.
@@ -81,9 +91,10 @@
     }
 
     assert.neq(coll.findOne({a: 3, b: 3}), null);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
     assert.eq(profileObj.fromMultiPlanner, true, tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm "replanned" metric.
@@ -100,9 +111,10 @@
     }
     assert.neq(coll.findOne({a: 5, b: 15}), null);
     assert.neq(coll.findOne({a: 15, b: 10}), null);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
 
     assert.eq(profileObj.replanned, true, tojson(profileObj));
+    assert.eq(profileObj.appName, "MongoDB Shell", tojson(profileObj));
 
     //
     // Confirm that query modifiers such as "hint" are in the profiler document.
@@ -111,35 +123,35 @@
     assert.writeOK(coll.insert({_id: 2}));
 
     assert.eq(coll.find().hint({_id: 1}).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.hint, {_id: 1}, tojson(profileObj));
 
     assert.eq(coll.find().comment("a comment").itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.comment, "a comment", tojson(profileObj));
 
     assert.eq(coll.find().maxScan(3000).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.maxScan, 3000, tojson(profileObj));
 
     var maxTimeMS = 100000;
     assert.eq(coll.find().maxTimeMS(maxTimeMS).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.maxTimeMS, maxTimeMS, tojson(profileObj));
 
     assert.eq(coll.find().max({_id: 3}).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.max, {_id: 3}, tojson(profileObj));
 
     assert.eq(coll.find().min({_id: 0}).itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.min, {_id: 0}, tojson(profileObj));
 
     assert.eq(coll.find().returnKey().itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.returnKey, true, tojson(profileObj));
 
     assert.eq(coll.find().snapshot().itcount(), 1);
-    profileObj = getLatestProfilerEntry(testDB);
+    profileObj = getLatestProfilerEntry(testDB, profileEntryFilter);
     assert.eq(profileObj.query.snapshot, true, tojson(profileObj));
 })();

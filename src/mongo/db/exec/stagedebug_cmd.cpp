@@ -210,7 +210,7 @@ public:
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             error() << "Plan executor error during StageDebug command: "
                     << PlanExecutor::statestr(state)
-                    << ", stats: " << Explain::getWinningPlanStats(exec.get());
+                    << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
             return appendCommandStatus(result,
                                        Status(ErrorCodes::OperationFailed,
@@ -273,19 +273,41 @@ public:
         string nodeName = firstElt.fieldName();
 
         if ("ixscan" == nodeName) {
-            // This'll throw if it's not an obj but that's OK.
-            BSONObj keyPatternObj = nodeArgs["keyPattern"].Obj();
-
-            IndexDescriptor* desc =
-                collection->getIndexCatalog()->findIndexByKeyPattern(txn, keyPatternObj);
-            uassert(16890, "Can't find index: " + keyPatternObj.toString(), desc);
+            IndexDescriptor* desc;
+            if (BSONElement keyPatternElement = nodeArgs["keyPattern"]) {
+                // This'll throw if it's not an obj but that's OK.
+                BSONObj keyPatternObj = keyPatternElement.Obj();
+                std::vector<IndexDescriptor*> indexes;
+                collection->getIndexCatalog()->findIndexesByKeyPattern(
+                    txn, keyPatternObj, false, &indexes);
+                uassert(16890,
+                        str::stream() << "Can't find index: " << keyPatternObj,
+                        !indexes.empty());
+                uassert(ErrorCodes::AmbiguousIndexKeyPattern,
+                        str::stream() << indexes.size() << " matching indexes for key pattern: "
+                                      << keyPatternObj
+                                      << ". Conflicting indexes: "
+                                      << indexes[0]->infoObj()
+                                      << ", "
+                                      << indexes[1]->infoObj(),
+                        indexes.size() == 1);
+                desc = indexes[0];
+            } else {
+                uassert(40306,
+                        str::stream() << "Index 'name' must be a string in: " << nodeArgs,
+                        nodeArgs["name"].type() == BSONType::String);
+                StringData name = nodeArgs["name"].valueStringData();
+                desc = collection->getIndexCatalog()->findIndexByName(txn, name);
+                uassert(40223, str::stream() << "Can't find index: " << name.toString(), desc);
+            }
 
             IndexScanParams params;
             params.descriptor = desc;
             params.bounds.isSimpleRange = true;
             params.bounds.startKey = stripFieldNames(nodeArgs["startKey"].Obj());
             params.bounds.endKey = stripFieldNames(nodeArgs["endKey"].Obj());
-            params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
+            params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
+                nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
             params.direction = nodeArgs["direction"].numberInt();
 
             return new IndexScan(txn, params, workingSet, matcher);

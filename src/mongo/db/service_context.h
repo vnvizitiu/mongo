@@ -37,6 +37,7 @@
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/tick_source.h"
@@ -47,6 +48,12 @@ class AbstractMessagingPort;
 class Client;
 class OperationContext;
 class OpObserver;
+class ServiceEntryPoint;
+
+namespace transport {
+class TransportLayer;
+class TransportLayerManager;
+}  // namespace transport
 
 /**
  * Classes that implement this interface can receive notification on killOp.
@@ -207,9 +214,9 @@ public:
      *
      * The "desc" string is used to set a descriptive name for the client, used in logging.
      *
-     * If supplied, "p" is the communication channel used for communicating with the client.
+     * If supplied, "session" is the transport::Session used for communicating with the client.
      */
-    UniqueClient makeClient(std::string desc, AbstractMessagingPort* p = nullptr);
+    UniqueClient makeClient(std::string desc, transport::SessionHandle session = nullptr);
 
     /**
      * Creates a new OperationContext on "client".
@@ -279,10 +286,11 @@ public:
     }
 
     /**
-     * @param i opid of operation to kill
-     * @return if operation was found
+     * Kills the operation "txn" with the code "killCode", if txn has not already been killed.
+     * Caller must own the lock on txn->getClient, and txn->getServiceContext() must be the same as
+     * this service context.
      **/
-    bool killOperation(unsigned int opId);
+    void killOperation(OperationContext* txn, ErrorCodes::Error killCode = ErrorCodes::Interrupted);
 
     /**
      * Kills all operations that have a Client that is associated with an incoming user
@@ -297,6 +305,33 @@ public:
      * unregister, the listener object must outlive this ServiceContext object.
      */
     void registerKillOpListener(KillOpListenerInterface* listener);
+
+    //
+    // Transport.
+    //
+
+    /**
+     * Get the master TransportLayer. Routes to all other TransportLayers that
+     * may be in use within this service.
+     *
+     * See TransportLayerManager for more details.
+     */
+    transport::TransportLayer* getTransportLayer() const;
+
+    /**
+     * Get the service entry point for the service context.
+     *
+     * See ServiceEntryPoint for more details.
+     */
+    ServiceEntryPoint* getServiceEntryPoint() const;
+
+    /**
+     * Add a new TransportLayer to this service context. The new TransportLayer will
+     * be added to the TransportLayerManager accessible via getTransportLayer().
+     *
+     * It additionally calls start() on the TransportLayer after adding it.
+     */
+    Status addAndStartTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
 
     //
     // Global OpObserver.
@@ -346,6 +381,11 @@ public:
      */
     void setPreciseClockSource(std::unique_ptr<ClockSource> newSource);
 
+    /**
+     * Binds the service entry point implementation to the service context
+     */
+    void setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep);
+
 protected:
     ServiceContext();
 
@@ -368,6 +408,16 @@ private:
      */
     void _killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode);
 
+
+    /**
+     * The TransportLayerManager.
+     */
+    std::unique_ptr<transport::TransportLayerManager> _transportLayerManager;
+
+    /**
+     * The service entry point
+     */
+    std::unique_ptr<ServiceEntryPoint> _serviceEntryPoint;
 
     /**
      * Vector of registered observers.

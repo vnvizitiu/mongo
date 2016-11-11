@@ -34,6 +34,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/metadata_manager.h"
 
 namespace mongo {
 
@@ -56,11 +57,22 @@ class CollectionShardingState {
 
 public:
     /**
-     * Instantiates a new per-collection sharding state with some initial metadata.
+     * Instantiates a new per-collection sharding state as unsharded.
      */
-    CollectionShardingState(NamespaceString nss,
-                            std::unique_ptr<CollectionMetadata> initialMetadata);
+    CollectionShardingState(ServiceContext* sc, NamespaceString nss);
     ~CollectionShardingState();
+
+    /**
+     * Holds information used for tracking document removals during chunk migration.
+     */
+    struct DeleteState {
+        // Contains the _id field of the document being deleted.
+        BSONObj idDoc;
+
+        // True if the document being deleted belongs to a chunk which is currently being migrated
+        // out of this shard.
+        bool isMigrating = false;
+    };
 
     /**
      * Obtains the sharding state for the specified collection. If it does not exist, it will be
@@ -75,14 +87,36 @@ public:
     /**
      * Returns the chunk metadata for the collection.
      */
-    std::shared_ptr<CollectionMetadata> getMetadata() const {
-        return _metadata;
-    }
+    ScopedCollectionMetadata getMetadata();
 
     /**
-     * Set a new metadata to be used for this collection.
+     * Updates the metadata based on changes received from the config server and also resolves the
+     * pending receives map in case some of these pending receives have completed or have been
+     * abandoned.
+     *
+     * Must always be called with an exclusive collection lock.
      */
-    void setMetadata(std::shared_ptr<CollectionMetadata> newMetadata);
+    void refreshMetadata(OperationContext* txn, std::unique_ptr<CollectionMetadata> newMetadata);
+
+    /**
+     * Marks the collection as not sharded at stepdown time so that no filtering will occur for
+     * slaveOk queries.
+     */
+    void markNotShardedAtStepdown();
+
+    /**
+     * Modifies the collection's sharding state to indicate that it is beginning to receive the
+     * given ChunkRange.
+     */
+    void beginReceive(const ChunkRange& range);
+
+    /*
+     * Modifies the collection's sharding state to indicate that the previous pending migration
+     * failed. If the range was not previously pending, this function will crash the server.
+     *
+     * This function is the mirror image of beginReceive.
+     */
+    void forgetReceive(const ChunkRange& range);
 
     /**
      * Returns the active migration source manager, if one is available.
@@ -112,7 +146,13 @@ public:
      * response is constructed, this function should be the only means of checking for shard version
      * match.
      */
-    void checkShardVersionOrThrow(OperationContext* txn) const;
+    void checkShardVersionOrThrow(OperationContext* txn);
+
+    /**
+     * Returns whether this collection is sharded. Valid only if mongoD is primary.
+     * TODO SERVER-24960: This method may return a false positive until SERVER-24960 is fixed.
+     */
+    bool collectionIsSharded();
 
     // Replication subsystem hooks. If this collection is serving as a source for migration, these
     // methods inform it of any changes to its contents.
@@ -123,9 +163,13 @@ public:
 
     void onUpdateOp(OperationContext* txn, const BSONObj& updatedDoc);
 
-    void onDeleteOp(OperationContext* txn, const BSONObj& deletedDocId);
+    void onDeleteOp(OperationContext* txn, const DeleteState& deleteState);
+
+    void onDropCollection(OperationContext* txn, const NamespaceString& collectionName);
 
 private:
+    friend class CollectionRangeDeleter;
+
     /**
      * Checks whether the shard version of the operation matches that of the collection.
      *
@@ -142,14 +186,13 @@ private:
     bool _checkShardVersionOk(OperationContext* txn,
                               std::string* errmsg,
                               ChunkVersion* expectedShardVersion,
-                              ChunkVersion* actualShardVersion) const;
+                              ChunkVersion* actualShardVersion);
 
     // Namespace to which this state belongs.
     const NamespaceString _nss;
 
-    // Contains all the chunks associated with this collection. This value will be null if the
-    // collection is not sharded.
-    std::shared_ptr<CollectionMetadata> _metadata;
+    // Contains all the metadata associated with this collection.
+    MetadataManager _metadataManager;
 
     // If this collection is serving as a source shard for chunk migration, this value will be
     // non-null. To write this value there needs to be X-lock on the collection in order to

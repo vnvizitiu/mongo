@@ -17,8 +17,17 @@ function aggregateNoOrder(coll, pipeline) {
 }
 
 jsTestLog("Creating sharded cluster");
-var shardedAggTest =
-    new ShardingTest({shards: 2, mongos: 1, other: {chunkSize: 1, enableBalancer: true}});
+var shardedAggTest = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    other: {
+        chunkSize: 1,
+        enableBalancer: true,
+        mongosOptions: {verbose: ''},
+        shardOptions: {verbose: ''},
+        configOptions: {verbose: ''},
+    }
+});
 
 jsTestLog("Setting up sharded cluster");
 shardedAggTest.adminCommand({enablesharding: "aggShard"});
@@ -193,11 +202,19 @@ testAvgStdDev();
 
 function testSample() {
     jsTestLog('testing $sample');
+    shardedAggTest.printCollectionInfo(db.ts1.getFullName());
     [0, 1, 10, nItems, nItems + 1].forEach(function(size) {
         var res = db.ts1.aggregate([{$sample: {size: size}}]).toArray();
         assert.eq(res.length, Math.min(nItems, size));
     });
 }
+testSample();
+
+// SERVER-26742 Attempt to reproduce an incorrect number of results being returned.
+testSample();
+testSample();
+testSample();
+testSample();
 testSample();
 
 jsTestLog('test $out by copying source collection verbatim to output');
@@ -209,9 +226,10 @@ assert.eq(db.ts1.find().sort({_id: 1}).toArray(), outCollection.find().sort({_id
 shardedAggTest.startBalancer();  // TODO: remove after fixing SERVER-9622
 
 // Make sure we error out if $out collection is sharded
-assertErrorCode(outCollection, [{$out: db.ts1.getName()}], 17017);
+assert.commandFailed(
+    db.runCommand({aggregate: outCollection.getName(), pipeline: [{$out: db.ts1.getName()}]}));
 
-db.literal.save({dollar: false});
+assert.writeOK(db.literal.save({dollar: false}));
 
 result = aggregateOrdered(
     db.literal,

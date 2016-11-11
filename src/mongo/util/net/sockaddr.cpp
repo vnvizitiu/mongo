@@ -46,8 +46,8 @@
 #endif
 #endif
 
+#include "mongo/bson/util/builder.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 
 namespace mongo {
@@ -68,7 +68,7 @@ SockAddr::SockAddr(int sourcePort) {
     _isValid = true;
 }
 
-SockAddr::SockAddr(const char* _iporhost, int port) {
+SockAddr::SockAddr(const char* _iporhost, int port) : _hostOrIp(_iporhost) {
     std::string target = _iporhost;
     if (target == "localhost") {
         target = "127.0.0.1";
@@ -117,8 +117,7 @@ SockAddr::SockAddr(const char* _iporhost, int port) {
         // we were unsuccessful
         if (target != "0.0.0.0") {  // don't log if this as it is a
                                     // CRT construction and log() may not work yet.
-            log() << "getaddrinfo(\"" << target << "\") failed: " << getAddrInfoStrError(ret)
-                  << std::endl;
+            log() << "getaddrinfo(\"" << target << "\") failed: " << getAddrInfoStrError(ret);
             _isValid = false;
             return;
         }
@@ -150,10 +149,19 @@ bool SockAddr::isLocalHost() const {
 }
 
 std::string SockAddr::toString(bool includePort) const {
-    std::string out = getAddr();
-    if (includePort && getType() != AF_UNIX && getType() != AF_UNSPEC)
-        out += mongoutils::str::stream() << ':' << getPort();
-    return out;
+    if (includePort && (getType() != AF_UNIX) && (getType() != AF_UNSPEC)) {
+        StringBuilder ss;
+
+        if (getType() == AF_INET6) {
+            ss << '[' << getAddr() << "]:" << getPort();
+        } else {
+            ss << getAddr() << ':' << getPort();
+        }
+
+        return ss.str();
+    } else {
+        return getAddr();
+    }
 }
 
 sa_family_t SockAddr::getType() const {

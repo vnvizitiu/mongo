@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/dbmessage.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
@@ -41,7 +42,7 @@ class Request {
     MONGO_DISALLOW_COPYING(Request);
 
 public:
-    Request(Message& m, AbstractMessagingPort* p);
+    Request(Message& m);
 
     const char* getns() const {
         return _d.getns();
@@ -71,9 +72,8 @@ public:
     DbMessage& d() {
         return _d;
     }
-    AbstractMessagingPort* p() const {
-        return _p;
-    }
+
+    const transport::SessionHandle& session() const;
 
     void process(OperationContext* txn, int attempt = 0);
 
@@ -84,7 +84,6 @@ private:
 
     Message& _m;
     DbMessage _d;
-    AbstractMessagingPort* const _p;
 
     int32_t _id;
 

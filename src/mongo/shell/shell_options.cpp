@@ -44,6 +44,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
+#include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
@@ -78,6 +79,22 @@ Status addMongoShellOptions(moe::OptionSection* options) {
     options->addOptionChaining("host", "host", moe::String, "server to connect to");
 
     options->addOptionChaining("eval", "eval", moe::String, "evaluate javascript");
+
+    options
+        ->addOptionChaining(
+            "objcheck", "objcheck", moe::Switch, "inspect client data for validity on receipt")
+        .hidden()
+        .setSources(moe::SourceAllLegacy)
+        .incompatibleWith("noobjcheck");
+
+    options
+        ->addOptionChaining("noobjcheck",
+                            "noobjcheck",
+                            moe::Switch,
+                            "do NOT inspect client data for validity on receipt (DEFAULT)")
+        .hidden()
+        .setSources(moe::SourceAllLegacy)
+        .incompatibleWith("objcheck");
 
     moe::OptionSection authenticationOptions("Authentication Options");
 
@@ -195,12 +212,18 @@ Status addMongoShellOptions(moe::OptionSection* options) {
             "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opCommandOnly, all")
         .hidden();
 
+    ret = addMessageCompressionOptions(options, true);
+    if (!ret.isOK())
+        return ret;
+
+    options->addOptionChaining(
+        "jsHeapLimitMB", "jsHeapLimitMB", moe::Int, "set the js scope's heap size limit");
+
     return Status::OK();
 }
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
     StringBuilder sb;
-    sb << "MongoDB shell version: " << mongo::versionString << "\n";
     sb << "usage: " << name << " [options] [db address] [file names (ending in .js)]\n"
        << "db address can be:\n"
        << "  foo                   foo database on local machine\n"
@@ -214,12 +237,15 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
 
 bool handlePreValidationMongoShellOptions(const moe::Environment& params,
                                           const std::vector<std::string>& args) {
-    if (params.count("help")) {
-        std::cout << getMongoShellHelp(args[0], moe::startupOptions) << std::endl;
-        return false;
-    }
-    if (params.count("version")) {
-        cout << "MongoDB shell version: " << mongo::versionString << endl;
+    auto&& vii = VersionInfoInterface::instance();
+    if (params.count("version") || params.count("help")) {
+        setPlainConsoleLogger();
+        log() << mongoShellVersion(vii);
+        if (params.count("help")) {
+            log() << getMongoShellHelp(args[0], moe::startupOptions);
+        } else {
+            vii.logBuildInfo();
+        }
         return false;
     }
     return true;
@@ -227,11 +253,12 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
 
 Status storeMongoShellOptions(const moe::Environment& params,
                               const std::vector<std::string>& args) {
+    Status ret = Status::OK();
     if (params.count("quiet")) {
         mongo::serverGlobalParams.quiet = true;
     }
 #ifdef MONGO_CONFIG_SSL
-    Status ret = storeSSLClientOptions(params);
+    ret = storeSSLClientOptions(params);
     if (!ret.isOK()) {
         return ret;
     }
@@ -241,6 +268,16 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
     if (params.count("verbose")) {
         logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+    }
+
+    // `objcheck` option is part of `serverGlobalParams` to avoid making common parts depend upon
+    // the client options.  The option is set to false in clients by default.
+    if (params.count("objcheck")) {
+        serverGlobalParams.objcheck = true;
+    } else if (params.count("noobjcheck")) {
+        serverGlobalParams.objcheck = false;
+    } else {
+        serverGlobalParams.objcheck = false;
     }
 
     if (params.count("port")) {
@@ -362,6 +399,16 @@ Status storeMongoShellOptions(const moe::Environment& params,
         }
     }
 
+    if (params.count("jsHeapLimitMB")) {
+        int jsHeapLimitMB = params["jsHeapLimitMB"].as<int>();
+        if (jsHeapLimitMB <= 0) {
+            StringBuilder sb;
+            sb << "ERROR: \"jsHeapLimitMB\" needs to be greater than 0";
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+        shellGlobalParams.jsHeapLimitMB = jsHeapLimitMB;
+    }
+
     if (shellGlobalParams.url == "*") {
         StringBuilder sb;
         sb << "ERROR: "
@@ -399,6 +446,10 @@ Status storeMongoShellOptions(const moe::Environment& params,
         sb << " in connection URI and as a command-line option";
         return Status(ErrorCodes::InvalidOptions, sb.str());
     }
+
+    ret = storeMessageCompressionOptions(params);
+    if (!ret.isOK())
+        return ret;
 
     return Status::OK();
 }

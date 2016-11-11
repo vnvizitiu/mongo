@@ -30,8 +30,6 @@
 
 #include <memory>
 #include <queue>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -41,6 +39,9 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/list.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -49,6 +50,7 @@ class BSONObj;
 
 namespace executor {
 
+using ResponseStatus = TaskExecutor::ResponseStatus;
 class NetworkConnectionHook;
 
 /**
@@ -105,9 +107,17 @@ public:
     virtual Date_t now();
     virtual std::string getHostName();
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                const RemoteCommandRequest& request,
+                                RemoteCommandRequest& request,
                                 const RemoteCommandCompletionFn& onFinish);
+
+    /**
+     * If the network operation is in the _unscheduled or _processing queues, moves the operation
+     * into the _scheduled queue with ErrorCodes::CallbackCanceled. If the operation is already in
+     * the _scheduled queue, does nothing. The latter simulates the case where cancelCommand() is
+     * called after the task has already completed, but its callback has not yet been run.
+     */
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle);
+
     /**
      * Not implemented.
      */
@@ -173,7 +183,7 @@ public:
      */
     void scheduleResponse(NetworkOperationIterator noi,
                           Date_t when,
-                          const TaskExecutor::ResponseStatus& response);
+                          const ResponseStatus& response);
 
     /**
      * Schedules a successful "response" to "noi" at virtual time "when".
@@ -195,6 +205,7 @@ public:
      * "when" defaults to now().
      */
     RemoteCommandRequest scheduleErrorResponse(const Status& response);
+    RemoteCommandRequest scheduleErrorResponse(const ResponseStatus response);
     RemoteCommandRequest scheduleErrorResponse(NetworkOperationIterator noi,
                                                const Status& response);
     RemoteCommandRequest scheduleErrorResponse(NetworkOperationIterator noi,
@@ -244,10 +255,13 @@ public:
     void setHandshakeReplyForHost(const HostAndPort& host, RemoteCommandResponse&& reply);
 
     /**
-     * Cancel a command with specified response, e.g. NetworkTimeout or CallbackCanceled errors.
+     * Deliver the response to the callback handle if the handle is present in queuesToCheck.
+     * This represents interrupting the regular flow with, for example, a NetworkTimeout or
+     * CallbackCanceled error.
      */
-    void _cancelCommand_inlock(const TaskExecutor::CallbackHandle& cbHandle,
-                               const TaskExecutor::ResponseStatus& response);
+    void _interruptWithResponse_inlock(const TaskExecutor::CallbackHandle& cbHandle,
+                                       const std::vector<NetworkOperationList*> queuesToCheck,
+                                       const ResponseStatus& response);
 
 private:
     /**
@@ -385,10 +399,10 @@ private:
     // ConnectionHook's validation and post-connection logic.
     //
     // TODO: provide a way to simulate disconnections.
-    std::unordered_set<HostAndPort> _connections;  // (M)
+    stdx::unordered_set<HostAndPort> _connections;  // (M)
 
     // The handshake replies set for each host.
-    std::unordered_map<HostAndPort, RemoteCommandResponse> _handshakeReplies;  // (M)
+    stdx::unordered_map<HostAndPort, RemoteCommandResponse> _handshakeReplies;  // (M)
 };
 
 /**
@@ -412,7 +426,7 @@ public:
     /**
      * Sets the response and thet virtual time at which it will be delivered.
      */
-    void setResponse(Date_t responseDate, const TaskExecutor::ResponseStatus& response);
+    void setResponse(Date_t responseDate, const ResponseStatus& response);
 
     /**
      * Predicate that returns true if cbHandle equals the executor's handle for this network
@@ -472,7 +486,7 @@ private:
     Date_t _responseDate;
     TaskExecutor::CallbackHandle _cbHandle;
     RemoteCommandRequest _request;
-    TaskExecutor::ResponseStatus _response;
+    ResponseStatus _response;
     RemoteCommandCompletionFn _onFinish;
 };
 
@@ -501,9 +515,32 @@ public:
      */
     ~InNetworkGuard();
 
+    /**
+     * Returns network interface mock pointer.
+     */
+    NetworkInterfaceMock* operator->() const;
+
 private:
     NetworkInterfaceMock* _net;
     bool _callExitNetwork = true;
+};
+
+class NetworkInterfaceMockClockSource : public ClockSource {
+public:
+    explicit NetworkInterfaceMockClockSource(NetworkInterfaceMock* net);
+
+    Milliseconds getPrecision() override {
+        return Milliseconds{1};
+    }
+    Date_t now() override {
+        return _net->now();
+    }
+    Status setAlarm(Date_t when, stdx::function<void()> action) override {
+        return _net->setAlarm(when, action);
+    }
+
+private:
+    NetworkInterfaceMock* _net;
 };
 
 }  // namespace executor

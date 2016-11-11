@@ -35,11 +35,13 @@
 #include <string>
 #include <vector>
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/mr.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/catalog_cache.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -288,7 +290,9 @@ public:
         if (!shardedInput && !shardedOutput && !customOutDB) {
             LOG(1) << "simple MR, just passthrough";
 
-            const auto shard = grid.shardRegistry()->getShard(txn, confIn->getPrimaryId());
+            const auto shard =
+                uassertStatusOK(grid.shardRegistry()->getShard(txn, confIn->getPrimaryId()));
+
             ShardConnection conn(shard->getConnString(), "");
 
             BSONObj res;
@@ -313,13 +317,18 @@ public:
             q = cmdObj["query"].embeddedObjectUserCheck();
         }
 
+        BSONObj collation;
+        if (cmdObj["collation"].type() == Object) {
+            collation = cmdObj["collation"].embeddedObjectUserCheck();
+        }
+
         set<string> servers;
         vector<Strategy::CommandResult> mrCommandResults;
 
         BSONObjBuilder shardResultsB;
         BSONObjBuilder shardCountsB;
         map<string, int64_t> countsMap;
-        set<BSONObj> splitPts;
+        auto splitPts = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
 
         {
             bool ok = true;
@@ -327,7 +336,8 @@ public:
             // TODO: take distributed lock to prevent split / migration?
 
             try {
-                Strategy::commandOp(txn, dbname, shardedCommand, 0, nss.ns(), q, &mrCommandResults);
+                Strategy::commandOp(
+                    txn, dbname, shardedCommand, 0, nss.ns(), q, collation, &mrCommandResults);
             } catch (DBException& e) {
                 e.addContext(str::stream() << "could not run map command on all shards for ns "
                                            << nss.ns()
@@ -340,7 +350,8 @@ public:
                 // Need to gather list of all servers even if an error happened
                 string server;
                 {
-                    const auto shard = grid.shardRegistry()->getShard(txn, mrResult.shardTargetId);
+                    const auto shard = uassertStatusOK(
+                        grid.shardRegistry()->getShard(txn, mrResult.shardTargetId));
                     server = shard->getConnString().toString();
                 }
                 servers.insert(server);
@@ -433,7 +444,9 @@ public:
         bool hasWCError = false;
 
         if (!shardedOutput) {
-            const auto shard = grid.shardRegistry()->getShard(txn, confOut->getPrimaryId());
+            const auto shard =
+                uassertStatusOK(grid.shardRegistry()->getShard(txn, confOut->getPrimaryId()));
+
             LOG(1) << "MR with single shard output, NS=" << outputCollNss.ns()
                    << " primary=" << shard->toString();
 
@@ -480,8 +493,18 @@ public:
 
                 BSONObj sortKey = BSON("_id" << 1);
                 ShardKeyPattern sortKeyPattern(sortKey);
-                Status status = grid.catalogClient(txn)->shardCollection(
-                    txn, outputCollNss.ns(), sortKeyPattern, true, sortedSplitPts, outShardIds);
+
+                // The collection default collation for the output collection. This is empty,
+                // representing the simple binary comparison collation.
+                BSONObj defaultCollation;
+
+                Status status = grid.catalogClient(txn)->shardCollection(txn,
+                                                                         outputCollNss.ns(),
+                                                                         sortKeyPattern,
+                                                                         defaultCollation,
+                                                                         true,
+                                                                         sortedSplitPts,
+                                                                         outShardIds);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -492,12 +515,11 @@ public:
                 confOut->getChunkManager(txn, outputCollNss.ns(), true /* force */);
             }
 
-            map<BSONObj, int> chunkSizes;
+            auto chunkSizes = SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<int>();
             {
                 // Take distributed lock to prevent split / migration.
-                auto scopedDistLock = grid.catalogClient(txn)->distLock(
+                auto scopedDistLock = grid.catalogClient(txn)->getDistLockManager()->lock(
                     txn, outputCollNss.ns(), "mr-post-process", kNoDistLockTimeout);
-
                 if (!scopedDistLock.isOK()) {
                     return appendCommandStatus(result, scopedDistLock.getStatus());
                 }
@@ -506,12 +528,14 @@ public:
                 mrCommandResults.clear();
 
                 try {
+                    const BSONObj query;
                     Strategy::commandOp(txn,
                                         outDB,
                                         finalCmdObj,
                                         0,
                                         outputCollNss.ns(),
-                                        BSONObj(),
+                                        query,
+                                        CollationSpec::kSimpleSpec,
                                         &mrCommandResults);
                     ok = true;
                 } catch (DBException& e) {
@@ -525,8 +549,8 @@ public:
                 for (const auto& mrResult : mrCommandResults) {
                     string server;
                     {
-                        const auto shard =
-                            grid.shardRegistry()->getShard(txn, mrResult.shardTargetId);
+                        const auto shard = uassertStatusOK(
+                            grid.shardRegistry()->getShard(txn, mrResult.shardTargetId));
                         server = shard->getConnString().toString();
                     }
                     singleResult = mrResult.result;
@@ -576,7 +600,7 @@ public:
                 invariant(size < std::numeric_limits<int>::max());
 
                 // key reported should be the chunk's minimum
-                shared_ptr<Chunk> c = cm->findIntersectingChunk(txn, key);
+                shared_ptr<Chunk> c = cm->findIntersectingChunkWithSimpleCollation(txn, key);
                 if (!c) {
                     warning() << "Mongod reported " << size << " bytes inserted for key " << key
                               << " but can't find chunk";
@@ -636,9 +660,9 @@ private:
                 conn.done();
             }
         } catch (const DBException& e) {
-            warning() << "Cannot cleanup shard results" << e.toString();
+            warning() << "Cannot cleanup shard results" << redact(e);
         } catch (const std::exception& e) {
-            severe() << "Cannot cleanup shard results" << causedBy(e);
+            severe() << "Cannot cleanup shard results" << causedBy(redact(e.what()));
         }
     }
 

@@ -62,8 +62,7 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/balancer/balancer.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_connection.h"
@@ -77,12 +76,14 @@
 #include "mongo/s/mongos_options.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/sharding_egress_metadata_hook_for_mongos.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/s/sharding_uptime_reporter.h"
 #include "mongo/s/version_mongos.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/transport_layer_legacy.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/concurrency/thread_name.h"
@@ -90,9 +91,7 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/hostname_canonicalization_worker.h"
 #include "mongo/util/net/message.h"
-#include "mongo/util/net/message_server.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -132,6 +131,7 @@ static ExitCode initService();
 // prior execution of mongo initializers or the existence of threads.
 static void cleanupTask() {
     {
+        auto serviceContext = getGlobalServiceContext();
         Client::initThreadIfNotAlready();
         Client& client = cc();
         ServiceContext::UniqueOperationContext uniqueTxn;
@@ -141,13 +141,21 @@ static void cleanupTask() {
             txn = uniqueTxn.get();
         }
 
-        auto cursorManager = grid.getCursorManager();
-        cursorManager->shutdown();
-        grid.getExecutorPool()->shutdownAndJoin();
-        grid.catalogClient(txn)->shutDown(txn);
+        if (serviceContext)
+            serviceContext->setKillAllOperations();
+
+        if (auto cursorManager = Grid::get(txn)->getCursorManager()) {
+            cursorManager->shutdown();
+        }
+        if (auto pool = Grid::get(txn)->getExecutorPool()) {
+            pool->shutdownAndJoin();
+        }
+        if (auto catalog = Grid::get(txn)->catalogClient(txn)) {
+            catalog->shutDown(txn);
+        }
     }
 
-    audit::logShutdown(ClientBasic::getCurrent());
+    audit::logShutdown(Client::getCurrent());
 }
 
 static BSONObj buildErrReply(const DBException& ex) {
@@ -159,58 +167,6 @@ static BSONObj buildErrReply(const DBException& ex) {
     }
     return errB.obj();
 }
-
-class ShardedMessageHandler : public MessageHandler {
-public:
-    virtual ~ShardedMessageHandler() {}
-
-    virtual void connected(AbstractMessagingPort* p) {
-        Client::initThread("conn", getGlobalServiceContext(), p);
-    }
-
-    virtual void process(Message& m, AbstractMessagingPort* p) {
-        verify(p);
-        Request r(m, p);
-        auto txn = cc().makeOperationContext();
-
-        try {
-            r.init(txn.get());
-            r.process(txn.get());
-        } catch (const AssertionException& ex) {
-            LOG(ex.isUserAssertion() ? 1 : 0) << "Assertion failed"
-                                              << " while processing "
-                                              << networkOpToString(m.operation()) << " op"
-                                              << " for " << r.getnsIfPresent() << causedBy(ex);
-
-            if (r.expectResponse()) {
-                m.header().setId(r.id());
-                replyToQuery(ResultFlag_ErrSet, p, m, buildErrReply(ex));
-            }
-
-            // We *always* populate the last error for now
-            LastError::get(cc()).setLastError(ex.getCode(), ex.what());
-        } catch (const DBException& ex) {
-            log() << "Exception thrown"
-                  << " while processing " << networkOpToString(m.operation()) << " op"
-                  << " for " << r.getnsIfPresent() << causedBy(ex);
-
-            if (r.expectResponse()) {
-                m.header().setId(r.id());
-                replyToQuery(ResultFlag_ErrSet, p, m, buildErrReply(ex));
-            }
-
-            // We *always* populate the last error for now
-            LastError::get(cc()).setLastError(ex.getCode(), ex.what());
-        }
-
-        // Release connections back to pool, if any still cached
-        ShardConnection::releaseMyConnections();
-    }
-
-    virtual void close() {
-        Client::destroy();
-    }
-};
 
 }  // namespace mongo
 
@@ -241,7 +197,9 @@ static Status initializeSharding(OperationContext* txn) {
         stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     Status status = initializeGlobalShardingState(
+        txn,
         mongosGlobalParams.configdbs,
+        generateDistLockProcessId(txn),
         std::move(shardFactory),
         []() { return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongos>(); },
         [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor) {
@@ -262,12 +220,11 @@ static Status initializeSharding(OperationContext* txn) {
 
 static void _initWireSpec() {
     WireSpec& spec = WireSpec::instance();
-    // accept from any version
-    spec.minWireVersionIncoming = RELEASE_2_4_AND_BEFORE;
-    spec.maxWireVersionIncoming = COMMANDS_ACCEPT_WRITE_CONCERN;
     // connect to version supporting Write Concern only
-    spec.minWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
-    spec.maxWireVersionOutgoing = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.minWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
+    spec.outgoing.maxWireVersion = COMMANDS_ACCEPT_WRITE_CONCERN;
+
+    spec.isInternalClient = true;
 }
 
 static ExitCode runMongosServer() {
@@ -275,6 +232,22 @@ static ExitCode runMongosServer() {
     printShardingVersionInfo(false);
 
     _initWireSpec();
+
+    transport::TransportLayerLegacy::Options opts;
+    opts.port = serverGlobalParams.port;
+    opts.ipList = serverGlobalParams.bind_ip;
+
+    auto sep =
+        stdx::make_unique<ServiceEntryPointMongos>(getGlobalServiceContext()->getTransportLayer());
+    auto sepPtr = sep.get();
+
+    getGlobalServiceContext()->setServiceEntryPoint(std::move(sep));
+
+    auto transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sepPtr);
+    auto res = transportLayer->setup();
+    if (!res.isOK()) {
+        return EXIT_NET_ERROR;
+    }
 
     // Add sharding hooks to both connection pools - ShardingConnectionHook includes auth hooks
     globalConnPool.addHook(new ShardingConnectionHookForMongos(false));
@@ -310,10 +283,6 @@ static ExitCode runMongosServer() {
         Grid::get(opCtx.get())->getBalancerConfiguration()->refreshAndCheck(opCtx.get());
     }
 
-#if !defined(_WIN32)
-    mongo::signalForkSuccess();
-#endif
-
     if (serverGlobalParams.isHttpInterfaceEnabled) {
         std::shared_ptr<DbWebServer> dbWebServer(new DbWebServer(serverGlobalParams.bind_ip,
                                                                  serverGlobalParams.port + 1000,
@@ -324,8 +293,6 @@ static ExitCode runMongosServer() {
         stdx::thread web(stdx::bind(&webServerListenThread, dbWebServer));
         web.detach();
     }
-
-    HostnameCanonicalizationWorker::start(getGlobalServiceContext());
 
     Status status = getGlobalAuthorizationManager()->initialize(NULL);
     if (!status.isOK()) {
@@ -338,8 +305,6 @@ static ExitCode runMongosServer() {
     shardingUptimeReporter.emplace();
     shardingUptimeReporter->startPeriodicThread();
 
-    Balancer::create(getGlobalServiceContext());
-
     clusterCursorCleanupJob.go();
 
     UserCacheInvalidator cacheInvalidatorThread(getGlobalAuthorizationManager());
@@ -350,24 +315,36 @@ static ExitCode runMongosServer() {
 
     PeriodicTask::startRunningPeriodicTasks();
 
-    MessageServer::Options opts;
-    opts.port = serverGlobalParams.port;
-    opts.ipList = serverGlobalParams.bind_ip;
-
-    auto handler = std::make_shared<ShardedMessageHandler>();
-    MessageServer* server = createServer(opts, std::move(handler), getGlobalServiceContext());
-    if (!server->setupSockets()) {
+    auto start = getGlobalServiceContext()->addAndStartTransportLayer(std::move(transportLayer));
+    if (!start.isOK()) {
         return EXIT_NET_ERROR;
     }
-    server->run();
 
-    // MessageServer::run will return when exit code closes its socket
-    return inShutdown() ? EXIT_CLEAN : EXIT_NET_ERROR;
+#if !defined(_WIN32)
+    mongo::signalForkSuccess();
+#else
+    if (ntservice::shouldStartService()) {
+        ntservice::reportStatus(SERVICE_RUNNING);
+        log() << "Service running";
+    }
+#endif
+
+    // Block until shutdown.
+    return waitForShutdown();
 }
 
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     mongo::forkServerOrDie();
+    return Status::OK();
+}
+
+// We set the featureCompatibilityVersion to 3.4 in the mongos so that BSON validation always uses
+// BSONVersion::kLatest.
+MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion34, ("EndStartupOptionStorage"))
+(InitializerContext* context) {
+    mongo::serverGlobalParams.featureCompatibility.version.store(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
     return Status::OK();
 }
 
@@ -424,9 +401,6 @@ static int _main() {
 #if defined(_WIN32)
 namespace mongo {
 static ExitCode initService() {
-    ntservice::reportStatus(SERVICE_RUNNING);
-    log() << "Service running";
-
     return runMongosServer();
 }
 }  // namespace mongo
@@ -482,11 +456,11 @@ int mongoSMain(int argc, char* argv[], char** envp) {
         int exitCode = _main();
         return exitCode;
     } catch (const SocketException& e) {
-        error() << "uncaught SocketException in mongos main: " << e.toString();
+        error() << "uncaught SocketException in mongos main: " << redact(e);
     } catch (const DBException& e) {
-        error() << "uncaught DBException in mongos main: " << e.toString();
+        error() << "uncaught DBException in mongos main: " << redact(e);
     } catch (const std::exception& e) {
-        error() << "uncaught std::exception in mongos main:" << e.what();
+        error() << "uncaught std::exception in mongos main:" << redact(e.what());
     } catch (...) {
         error() << "uncaught unknown exception in mongos main";
     }

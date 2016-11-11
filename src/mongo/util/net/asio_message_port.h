@@ -78,6 +78,7 @@ public:
     void reply(Message& received, Message& response) override;
 
     void say(Message& toSend, int responseTo = 0) override;
+    void say(const Message& toSend) override;
 
     void send(const char* data, int len, const char*) override;
     void send(const std::vector<std::pair<char*, int>>& data, const char*) override;
@@ -104,9 +105,9 @@ public:
 
     long long getBytesOut() const override;
 
-    void setX509SubjectName(const std::string& x509SubjectName) override;
+    void setX509PeerInfo(SSLPeerInfo x509PeerInfo) override;
 
-    std::string getX509SubjectName() const override;
+    const SSLPeerInfo& getX509PeerInfo() const override;
 
     void setConnectionId(const long long connectionId) override;
 
@@ -117,8 +118,6 @@ public:
     AbstractMessagingPort::Tag getTag() const override;
 
     bool secure(SSLManagerInterface* ssl, const std::string& remoteHost) override;
-
-    static void closeSockets(AbstractMessagingPort::Tag skipMask = kSkipAllMask);
 
 private:
     void _setTimerCallback();
@@ -141,7 +140,7 @@ private:
 
     bool _isEncrypted;
     bool _awaitingHandshake;
-    std::string _x509SubjectName;
+    SSLPeerInfo _x509PeerInfo;
 
     long long _bytesIn;
     long long _bytesOut;

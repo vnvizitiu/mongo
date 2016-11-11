@@ -35,8 +35,6 @@
 #include <memory>
 #include <string>
 #include <system_error>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "mongo/base/status.h"
@@ -56,6 +54,9 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/transport/message_compressor_manager.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
@@ -95,6 +96,7 @@ class NetworkInterfaceASIO final : public NetworkInterface {
     friend class connection_pool_asio::ASIOConnection;
     friend class connection_pool_asio::ASIOTimer;
     friend class connection_pool_asio::ASIOImpl;
+    class AsyncOp;
 
 public:
     struct Options {
@@ -127,7 +129,7 @@ public:
     void signalWorkAvailable() override;
     Date_t now() override;
     Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                        const RemoteCommandRequest& request,
+                        RemoteCommandRequest& request,
                         const RemoteCommandCompletionFn& onFinish) override;
     void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) override;
     void cancelAllCommands() override;
@@ -160,6 +162,10 @@ private:
         rpc::ProtocolSet clientProtocols() const;
         void setServerProtocols(rpc::ProtocolSet protocols);
 
+        MessageCompressorManager& getCompressorManager() {
+            return _compressorManager;
+        }
+
     private:
         std::unique_ptr<AsyncStreamInterface> _stream;
 
@@ -168,6 +174,8 @@ private:
         // Dynamically initialized from [min max]WireVersionOutgoing.
         // Its expected that isMaster response is checked only on the caller.
         rpc::ProtocolSet _clientProtocols{rpc::supports::kNone};
+
+        MessageCompressorManager _compressorManager;
     };
 
     /**
@@ -175,28 +183,7 @@ private:
      */
     class AsyncCommand {
     public:
-        /**
-         * Describes the variant of AsyncCommand this object represents.
-         */
-        enum class CommandType {
-            /**
-             * An ordinary command of an unspecified Protocol.
-             */
-            kRPC,
-
-            /**
-             * A 'find' command that has been downconverted to an OP_QUERY.
-             */
-            kDownConvertedFind,
-
-            /**
-             * A 'getMore' command that has been downconverted to an OP_GET_MORE.
-             */
-            kDownConvertedGetMore,
-        };
-
         AsyncCommand(AsyncConnection* conn,
-                     CommandType type,
                      Message&& command,
                      Date_t now,
                      const HostAndPort& target);
@@ -207,14 +194,13 @@ private:
         Message& toRecv();
         MSGHEADER::Value& header();
 
-        ResponseStatus response(rpc::Protocol protocol,
+        ResponseStatus response(AsyncOp* op,
+                                rpc::Protocol protocol,
                                 Date_t now,
                                 rpc::EgressMetadataHook* metadataHook = nullptr);
 
     private:
         NetworkInterfaceASIO::AsyncConnection* const _conn;
-
-        const CommandType _type;
 
         Message _toSend;
         Message _toRecv;
@@ -292,14 +278,11 @@ private:
         // AsyncOp may run multiple commands over its lifetime (for example, an ismaster
         // command, the command provided to the NetworkInterface via startCommand(), etc.)
         // Calling beginCommand() resets internal state to prepare to run newCommand.
-        Status beginCommand(const RemoteCommandRequest& request,
-                            rpc::EgressMetadataHook* metadataHook = nullptr);
+        Status beginCommand(const RemoteCommandRequest& request);
 
         // This form of beginCommand takes a raw message. It is needed if the caller
         // has to form the command manually (e.g. to use a specific requestBuilder).
-        Status beginCommand(Message&& newCommand,
-                            AsyncCommand::CommandType,
-                            const HostAndPort& target);
+        Status beginCommand(Message&& newCommand, const HostAndPort& target);
 
         AsyncCommand* command();
 
@@ -314,6 +297,9 @@ private:
         rpc::Protocol operationProtocol() const;
 
         void setOperationProtocol(rpc::Protocol proto);
+
+        void setResponseMetadata(BSONObj m);
+        BSONObj getResponseMetadata();
 
         void reset();
 
@@ -401,6 +387,7 @@ private:
          */
         boost::optional<AsyncCommand> _command;
         bool _inSetup;
+        bool _inRefresh;
 
         /**
          * The explicit strand that all operations for this op must run on.
@@ -416,6 +403,8 @@ private:
          * Must be holding the access control's lock to edit.
          */
         std::array<State, kMaxStateTransitions> _states;
+
+        BSONObj _responseMetadata{};
     };
 
     void _startCommand(AsyncOp* op);
@@ -430,16 +419,17 @@ private:
      */
     template <typename Handler>
     void _validateAndRun(AsyncOp* op, std::error_code ec, Handler&& handler) {
-        if (op->canceled())
-            return _completeOperation(op,
-                                      Status(ErrorCodes::CallbackCanceled, "Callback canceled"));
-        if (op->timedOut()) {
+        if (op->canceled()) {
+            auto rs = ResponseStatus(
+                ErrorCodes::CallbackCanceled, "Callback canceled", now() - op->start());
+            return _completeOperation(op, rs);
+        } else if (op->timedOut()) {
             str::stream msg;
             msg << "Operation timed out"
                 << ", request was " << op->_request.toString();
-            return _completeOperation(op, Status(ErrorCodes::ExceededTimeLimit, msg));
-        }
-        if (ec)
+            auto rs = ResponseStatus(ErrorCodes::ExceededTimeLimit, msg, now() - op->start());
+            return _completeOperation(op, rs);
+        } else if (ec)
             return _networkErrorCallback(op, ec);
 
         handler();
@@ -459,7 +449,7 @@ private:
     void _beginCommunication(AsyncOp* op);
     void _completedOpCallback(AsyncOp* op);
     void _networkErrorCallback(AsyncOp* op, const std::error_code& ec);
-    void _completeOperation(AsyncOp* op, const TaskExecutor::ResponseStatus& resp);
+    void _completeOperation(AsyncOp* op, TaskExecutor::ResponseStatus resp);
 
     void _signalWorkAvailable_inlock();
 
@@ -491,8 +481,8 @@ private:
     // If it is necessary to hold this lock while accessing a particular operation with
     // an AccessControl object, take this lock first, always.
     stdx::mutex _inProgressMutex;
-    std::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
-    std::unordered_set<TaskExecutor::CallbackHandle> _inGetConnection;
+    stdx::unordered_map<AsyncOp*, std::unique_ptr<AsyncOp>> _inProgress;
+    stdx::unordered_set<TaskExecutor::CallbackHandle> _inGetConnection;
 
     // Operation counters
     AtomicUInt64 _numCanceledOps;

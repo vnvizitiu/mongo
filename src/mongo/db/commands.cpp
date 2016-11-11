@@ -173,6 +173,7 @@ bool Command::appendCommandStatus(BSONObjBuilder& result, const Status& status) 
     BSONObj tmp = result.asTempObj();
     if (!status.isOK() && !tmp.hasField("code")) {
         result.append("code", status.code());
+        result.append("codeName", ErrorCodes::errorString(status.code()));
     }
     return status.isOK();
 }
@@ -180,12 +181,12 @@ bool Command::appendCommandStatus(BSONObjBuilder& result, const Status& status) 
 void Command::appendCommandStatus(BSONObjBuilder& result, bool ok, const std::string& errmsg) {
     BSONObj tmp = result.asTempObj();
     bool have_ok = tmp.hasField("ok");
-    bool have_errmsg = tmp.hasField("errmsg");
+    bool need_errmsg = !ok && !tmp.hasField("errmsg");
 
     if (!have_ok)
         result.append("ok", ok ? 1.0 : 0.0);
 
-    if (!ok && !have_errmsg) {
+    if (need_errmsg) {
         result.append("errmsg", errmsg);
     }
 }
@@ -204,49 +205,13 @@ void Command::appendCommandWCStatus(BSONObjBuilder& result,
     }
 }
 
-Status Command::parseCommandCursorOptions(const BSONObj& cmdObj,
-                                          long long defaultBatchSize,
-                                          long long* batchSize) {
-    invariant(batchSize);
-    *batchSize = defaultBatchSize;
-
-    BSONElement cursorElem = cmdObj["cursor"];
-    if (cursorElem.eoo()) {
-        return Status::OK();
-    }
-
-    if (cursorElem.type() != mongo::Object) {
-        return Status(ErrorCodes::TypeMismatch, "cursor field must be missing or an object");
-    }
-
-    BSONObj cursor = cursorElem.embeddedObject();
-    BSONElement batchSizeElem = cursor["batchSize"];
-
-    const int expectedNumberOfCursorFields = batchSizeElem.eoo() ? 0 : 1;
-    if (cursor.nFields() != expectedNumberOfCursorFields) {
-        return Status(ErrorCodes::BadValue,
-                      "cursor object can't contain fields other than batchSize");
-    }
-
-    if (batchSizeElem.eoo()) {
-        return Status::OK();
-    }
-
-    if (!batchSizeElem.isNumber()) {
-        return Status(ErrorCodes::TypeMismatch, "cursor.batchSize must be a number");
-    }
-
-    // This can change in the future, but for now all negatives are reserved.
-    if (batchSizeElem.numberLong() < 0) {
-        return Status(ErrorCodes::BadValue, "cursor.batchSize must not be negative");
-    }
-
-    *batchSize = batchSizeElem.numberLong();
-
-    return Status::OK();
+Status Command::checkAuthForOperation(OperationContext* txn,
+                                      const std::string& dbname,
+                                      const BSONObj& cmdObj) {
+    return checkAuthForCommand(txn->getClient(), dbname, cmdObj);
 }
 
-Status Command::checkAuthForCommand(ClientBasic* client,
+Status Command::checkAuthForCommand(Client* client,
                                     const std::string& dbname,
                                     const BSONObj& cmdObj) {
     std::vector<Privilege> privileges;
@@ -268,17 +233,18 @@ BSONObj Command::getRedactedCopyForLogging(const BSONObj& cmdObj) {
 }
 
 static Status _checkAuthorizationImpl(Command* c,
-                                      ClientBasic* client,
+                                      OperationContext* txn,
                                       const std::string& dbname,
                                       const BSONObj& cmdObj) {
     namespace mmb = mutablebson;
+    auto client = txn->getClient();
     if (c->adminOnly() && dbname != "admin") {
         return Status(ErrorCodes::Unauthorized,
                       str::stream() << c->getName()
                                     << " may only be run against the admin database.");
     }
     if (AuthorizationSession::get(client)->getAuthorizationManager().isAuthEnabled()) {
-        Status status = c->checkAuthForCommand(client, dbname, cmdObj);
+        Status status = c->checkAuthForOperation(txn, dbname, cmdObj);
         if (status == ErrorCodes::Unauthorized) {
             mmb::Document cmdToLog(cmdObj, mmb::Document::kInPlaceDisabled);
             c->redactForLogging(&cmdToLog);
@@ -298,16 +264,16 @@ static Status _checkAuthorizationImpl(Command* c,
     return Status::OK();
 }
 
-Status Command::_checkAuthorization(Command* c,
-                                    Client* client,
-                                    const std::string& dbname,
-                                    const BSONObj& cmdObj) {
+Status Command::checkAuthorization(Command* c,
+                                   OperationContext* txn,
+                                   const std::string& dbname,
+                                   const BSONObj& cmdObj) {
     namespace mmb = mutablebson;
-    Status status = _checkAuthorizationImpl(c, client, dbname, cmdObj);
+    Status status = _checkAuthorizationImpl(c, txn, dbname, cmdObj);
     if (!status.isOK()) {
-        log(LogComponent::kAccessControl) << status << std::endl;
+        log(LogComponent::kAccessControl) << status;
     }
-    audit::logCommandAuthzCheck(client, dbname, cmdObj, c, status.code());
+    audit::logCommandAuthzCheck(txn->getClient(), dbname, cmdObj, c, status.code());
     return status;
 }
 
@@ -394,22 +360,22 @@ void Command::generateErrorResponse(OperationContext* txn,
 }
 
 namespace {
-const std::unordered_set<std::string> userManagementCommands{"createUser",
-                                                             "updateUser",
-                                                             "dropUser",
-                                                             "dropAllUsersFromDatabase",
-                                                             "grantRolesToUser",
-                                                             "revokeRolesFromUser",
-                                                             "createRole",
-                                                             "updateRole",
-                                                             "dropRole",
-                                                             "dropAllRolesFromDatabase",
-                                                             "grantPrivilegesToRole",
-                                                             "revokePrivilegesFromRole",
-                                                             "grantRolesToRole",
-                                                             "revokeRolesFromRole",
-                                                             "_mergeAuthzCollections",
-                                                             "authSchemaUpgrade"};
+const stdx::unordered_set<std::string> userManagementCommands{"createUser",
+                                                              "updateUser",
+                                                              "dropUser",
+                                                              "dropAllUsersFromDatabase",
+                                                              "grantRolesToUser",
+                                                              "revokeRolesFromUser",
+                                                              "createRole",
+                                                              "updateRole",
+                                                              "dropRole",
+                                                              "dropAllRolesFromDatabase",
+                                                              "grantPrivilegesToRole",
+                                                              "revokePrivilegesFromRole",
+                                                              "grantRolesToRole",
+                                                              "revokeRolesFromRole",
+                                                              "_mergeAuthzCollections",
+                                                              "authSchemaUpgrade"};
 }  // namespace
 
 bool Command::isUserManagementCommand(const std::string& name) {

@@ -34,13 +34,17 @@
 
 #include <algorithm>
 
+#include "mongo/base/counter.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/fetcher.h"
+#include "mongo/client/remote_command_retry_scheduler.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/collection_cloner.h"
-#include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/databases_cloner.h"
+#include "mongo/db/repl/initial_sync_state.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
@@ -48,20 +52,18 @@
 #include "mongo/db/repl/rollback_checker.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/db/server_parameters.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/server_selection_metadata.h"
-#include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
-#include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/queue.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
-#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
@@ -69,15 +71,159 @@ namespace repl {
 // Failpoint for initial sync
 MONGO_FP_DECLARE(failInitialSyncWithBadHost);
 
+// Failpoint which fails initial sync and leaves an oplog entry in the buffer.
+MONGO_FP_DECLARE(failInitSyncWithBufferedEntriesLeft);
+
+// Failpoint which causes the initial sync function to hang before copying databases.
+MONGO_FP_DECLARE(initialSyncHangBeforeCopyingDatabases);
+
+// Failpoint which causes the initial sync function to hang before finishing.
+MONGO_FP_DECLARE(initialSyncHangBeforeFinish);
+
+// Failpoint which causes the initial sync function to hang before calling shouldRetry on a failed
+// operation.
+MONGO_FP_DECLARE(initialSyncHangBeforeGettingMissingDocument);
+
+// Failpoint which stops the applier.
+MONGO_FP_DECLARE(rsSyncApplyStop);
+
 namespace {
+using namespace executor;
+using CallbackArgs = executor::TaskExecutor::CallbackArgs;
+using Event = executor::TaskExecutor::EventHandle;
+using Handle = executor::TaskExecutor::CallbackHandle;
+using Operations = MultiApplier::Operations;
+using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
+
+// The number of attempts to connect to a sync source.
+MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncConnectAttempts, int, 10);
+
+// The number of attempts to call find on the remote oplog.
+MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncOplogFindAttempts, int, 3);
+
+Counter64 initialSyncFailedAttempts;
+Counter64 initialSyncFailures;
+Counter64 initialSyncCompletes;
+ServerStatusMetricField<Counter64> displaySSInitialSyncFailedAttempts(
+    "repl.initialSync.failedAttempts", &initialSyncFailedAttempts);
+ServerStatusMetricField<Counter64> displaySSInitialSyncFailures("repl.initialSync.failures",
+                                                                &initialSyncFailures);
+ServerStatusMetricField<Counter64> displaySSInitialSyncCompleted("repl.initialSync.completed",
+                                                                 &initialSyncCompletes);
+
+ServiceContext::UniqueOperationContext makeOpCtx() {
+    return cc().makeOperationContext();
+}
+
+StatusWith<TaskExecutor::CallbackHandle> scheduleWork(
+    TaskExecutor* exec,
+    stdx::function<void(OperationContext* txn, const CallbackArgs& cbData)> func) {
+
+    // Wrap 'func' with a lambda that checks for cancallation and creates an OperationContext*.
+    return exec->scheduleWork([func](const CallbackArgs& cbData) {
+        if (cbData.status == ErrorCodes::CallbackCanceled) {
+            return;
+        }
+        auto txn = makeOpCtx();
+        func(txn.get(), cbData);
+    });
+}
+
+StatusWith<Timestamp> parseTimestampStatus(const QueryResponseStatus& fetchResult) {
+    if (!fetchResult.isOK()) {
+        return fetchResult.getStatus();
+    } else {
+        const auto docs = fetchResult.getValue().documents;
+        const auto hasDoc = docs.begin() != docs.end();
+        if (!hasDoc || !docs.begin()->hasField("ts")) {
+            return {ErrorCodes::FailedToParse, "Could not find an oplog entry with 'ts' field."};
+        } else {
+            return {docs.begin()->getField("ts").timestamp()};
+        }
+    }
+}
+
+StatusWith<BSONObj> getLatestOplogEntry(executor::TaskExecutor* exec,
+                                        HostAndPort source,
+                                        const NamespaceString& oplogNS) {
+    BSONObj query =
+        BSON("find" << oplogNS.coll() << "sort" << BSON("$natural" << -1) << "limit" << 1);
+
+    BSONObj entry;
+    Status statusToReturn(Status::OK());
+    Fetcher fetcher(
+        exec,
+        source,
+        oplogNS.db().toString(),
+        query,
+        [&entry, &statusToReturn](const QueryResponseStatus& fetchResult,
+                                  Fetcher::NextAction* nextAction,
+                                  BSONObjBuilder*) {
+            if (!fetchResult.isOK()) {
+                statusToReturn = fetchResult.getStatus();
+            } else {
+                const auto docs = fetchResult.getValue().documents;
+                invariant(docs.size() < 2);
+                if (docs.size() == 0) {
+                    statusToReturn = {ErrorCodes::OplogStartMissing, "no oplog entry found."};
+                } else {
+                    entry = docs.back().getOwned();
+                }
+            }
+        });
+    Status scheduleStatus = fetcher.schedule();
+    if (!scheduleStatus.isOK()) {
+        return scheduleStatus;
+    }
+
+    // wait for fetcher to get the oplog position.
+    fetcher.join();
+    if (statusToReturn.isOK()) {
+        LOG(2) << "returning last oplog entry: " << redact(entry) << ", from: " << source
+               << ", ns: " << oplogNS;
+        return entry;
+    }
+    return statusToReturn;
+}
+
+StatusWith<OpTimeWithHash> parseOpTimeWithHash(const BSONObj& oplogEntry) {
+    auto oplogEntryHash = oplogEntry["h"].Long();
+    const auto lastOpTime = OpTime::parseFromOplogEntry(oplogEntry);
+    if (!lastOpTime.isOK()) {
+        return lastOpTime.getStatus();
+    }
+
+    return OpTimeWithHash{oplogEntryHash, lastOpTime.getValue()};
+}
+
+StatusWith<OpTimeWithHash> parseOpTimeWithHash(const QueryResponseStatus& fetchResult) {
+    if (!fetchResult.isOK()) {
+        return fetchResult.getStatus();
+    }
+    const auto docs = fetchResult.getValue().documents;
+    const auto hasDoc = docs.begin() != docs.end();
+    return hasDoc
+        ? parseOpTimeWithHash(docs.front())
+        : StatusWith<OpTimeWithHash>{ErrorCodes::NoMatchingDocument, "No document in batch."};
+}
 
 Timestamp findCommonPoint(HostAndPort host, Timestamp start) {
     // TODO: walk back in the oplog looking for a known/shared optime.
     return Timestamp();
 }
 
-ServiceContext::UniqueOperationContext makeOpCtx() {
-    return cc().makeOperationContext();
+template <typename T>
+void swapAndJoin_inlock(UniqueLock* lock, T& uniquePtrToReset, const char* msg) {
+    if (!uniquePtrToReset) {
+        return;
+    }
+    T tempPtr = std::move(uniquePtrToReset);
+    lock->unlock();
+    LOG(1) << msg << tempPtr->toString();
+    tempPtr->join();
+    lock->lock();
 }
 
 }  // namespace
@@ -86,387 +232,40 @@ std::string toString(DataReplicatorState s) {
     switch (s) {
         case DataReplicatorState::InitialSync:
             return "InitialSync";
-        case DataReplicatorState::Rollback:
-            return "Rollback";
-        case DataReplicatorState::Steady:
-            return "Steady Replication";
         case DataReplicatorState::Uninitialized:
             return "Uninitialized";
     }
     MONGO_UNREACHABLE;
 }
 
-class DatabasesCloner {
-public:
-    DatabasesCloner(ReplicationExecutor* exec,
-                    HostAndPort source,
-                    stdx::function<void(const Status&)> finishFn)
-        : _status(ErrorCodes::NotYetInitialized, ""),
-          _exec(exec),
-          _source(source),
-          _active(false),
-          _clonersActive(0),
-          _finishFn(finishFn) {
-        if (!_finishFn) {
-            _status = Status(ErrorCodes::InvalidOptions, "finishFn is not callable.");
-        }
-    };
-
-    Status start();
-
-    bool isActive() {
-        return _active;
-    }
-
-    Status getStatus() {
-        return _status;
-    }
-
-    void cancel() {
-        if (!_active)
-            return;
-        _active = false;
-        // TODO: cancel all cloners
-        _setStatus(Status(ErrorCodes::CallbackCanceled, "Initial Sync Cancelled."));
-    }
-
-    void wait() {
-        // TODO: wait on all cloners
-    }
-
-    std::string toString() {
-        return str::stream() << "initial sync --"
-                             << " active:" << _active << " status:" << _status.toString()
-                             << " source:" << _source.toString()
-                             << " db cloners active:" << _clonersActive
-                             << " db count:" << _databaseCloners.size();
-    }
-
-
-    // For testing
-    void setStorageInterface(CollectionCloner::StorageInterface* si) {
-        _storage = si;
-    }
-
-private:
-    /**
-     * Does the next action necessary for the initial sync process.
-     *
-     * NOTE: If (!_status.isOK() || !_isActive) then early return.
-     */
-    void _doNextActions();
-
-    /**
-     *  Setting the status to not-OK will stop the process
-     */
-    void _setStatus(CBHStatus s) {
-        _setStatus(s.getStatus());
-    }
-
-    /**
-     *  Setting the status to not-OK will stop the process
-     */
-    void _setStatus(Status s) {
-        // Only set the first time called, all subsequent failures are not recorded --only first
-        if (_status.code() != ErrorCodes::NotYetInitialized) {
-            _status = s;
-        }
-    }
-
-    /**
-     *  Setting the status to not-OK will stop the process
-     */
-    void _setStatus(TimestampStatus s) {
-        _setStatus(s.getStatus());
-    }
-
-    void _failed();
-
-    /** Called each time a database clone is finished */
-    void _onEachDBCloneFinish(const Status& status, const std::string name);
-
-    //  Callbacks
-
-    void _onListDatabaseFinish(const CommandCallbackArgs& cbd);
-
-
-    // Member variables
-    Status _status;              // If it is not OK, we stop everything.
-    ReplicationExecutor* _exec;  // executor to schedule things with
-    HostAndPort _source;         // The source to use, until we get an error
-    bool _active;                // false until we start
-    std::vector<std::shared_ptr<DatabaseCloner>> _databaseCloners;  // database cloners by name
-    int _clonersActive;
-
-    const stdx::function<void(const Status&)> _finishFn;
-
-    CollectionCloner::StorageInterface* _storage;
-};
-
-/** State held during Initial Sync */
-struct InitialSyncState {
-    InitialSyncState(DatabasesCloner cloner, Event event)
-        : dbsCloner(cloner), finishEvent(event), status(ErrorCodes::IllegalOperation, ""){};
-
-    DatabasesCloner dbsCloner;  // Cloner for all databases included in initial sync.
-    Timestamp beginTimestamp;   // Timestamp from the latest entry in oplog when started.
-    Timestamp stopTimestamp;    // Referred to as minvalid, or the place we can transition states.
-    Event finishEvent;          // event fired on completion, either successful or not.
-    Status status;              // final status, only valid after the finishEvent fires.
-    size_t fetchedMissingDocs;
-    size_t appliedOps;
-
-    // Temporary fetch for things like fetching remote optime, or tail
-    std::unique_ptr<Fetcher> tmpFetcher;
-    TimestampStatus getLatestOplogTimestamp(ReplicationExecutor* exec,
-                                            HostAndPort source,
-                                            const NamespaceString& oplogNS);
-    void setStatus(const Status& s);
-    void setStatus(const CBHStatus& s);
-    void _setTimestampStatus(const QueryResponseStatus& fetchResult, TimestampStatus* status);
-};
-
-// Initial Sync state
-TimestampStatus InitialSyncState::getLatestOplogTimestamp(ReplicationExecutor* exec,
-                                                          HostAndPort source,
-                                                          const NamespaceString& oplogNS) {
-    BSONObj query =
-        BSON("find" << oplogNS.coll() << "sort" << BSON("$natural" << -1) << "limit" << 1);
-
-    TimestampStatus timestampStatus(ErrorCodes::BadValue, "");
-    Fetcher f(exec,
-              source,
-              oplogNS.db().toString(),
-              query,
-              stdx::bind(&InitialSyncState::_setTimestampStatus,
-                         this,
-                         stdx::placeholders::_1,
-                         &timestampStatus));
-    Status s = f.schedule();
-    if (!s.isOK()) {
-        return TimestampStatus(s);
-    }
-
-    // wait for fetcher to get the oplog position.
-    f.wait();
-    return timestampStatus;
-}
-
-void InitialSyncState::_setTimestampStatus(const QueryResponseStatus& fetchResult,
-                                           TimestampStatus* status) {
-    if (!fetchResult.isOK()) {
-        *status = TimestampStatus(fetchResult.getStatus());
-    } else {
-        // TODO: Set _beginTimestamp from first doc "ts" field.
-        const auto docs = fetchResult.getValue().documents;
-        const auto hasDoc = docs.begin() != docs.end();
-        if (!hasDoc || !docs.begin()->hasField("ts")) {
-            *status = TimestampStatus(ErrorCodes::FailedToParse,
-                                      "Could not find an oplog entry with 'ts' field.");
-        } else {
-            *status = TimestampStatus(docs.begin()->getField("ts").timestamp());
-        }
-    }
-}
-
-void InitialSyncState::setStatus(const Status& s) {
-    status = s;
-}
-void InitialSyncState::setStatus(const CBHStatus& s) {
-    setStatus(s.getStatus());
-}
-
-// Initial Sync
-Status DatabasesCloner::start() {
-    _active = true;
-
-    if (!_status.isOK() && _status.code() != ErrorCodes::NotYetInitialized) {
-        return _status;
-    }
-
-    _status = Status::OK();
-
-    log() << "starting cloning of all databases";
-    // Schedule listDatabase command which will kick off the database cloner per result db.
-    Request listDBsReq(_source,
-                       "admin",
-                       BSON("listDatabases" << true),
-                       rpc::ServerSelectionMetadata(true, boost::none).toBSON());
-    CBHStatus s = _exec->scheduleRemoteCommand(
-        listDBsReq,
-        stdx::bind(&DatabasesCloner::_onListDatabaseFinish, this, stdx::placeholders::_1));
-    if (!s.isOK()) {
-        _setStatus(s);
-        _failed();
-    }
-
-    _doNextActions();
-
-    return _status;
-}
-
-void DatabasesCloner::_onListDatabaseFinish(const CommandCallbackArgs& cbd) {
-    const Status respStatus = cbd.response.getStatus();
-    if (!respStatus.isOK()) {
-        // TODO: retry internally?
-        _setStatus(respStatus);
-        _doNextActions();
-        return;
-    }
-
-    const auto respBSON = cbd.response.getValue().data;
-
-    // There should not be any cloners yet
-    invariant(_databaseCloners.size() == 0);
-
-    const auto okElem = respBSON["ok"];
-    if (okElem.trueValue()) {
-        const auto dbsElem = respBSON["databases"].Obj();
-        BSONForEach(arrayElement, dbsElem) {
-            const BSONObj dbBSON = arrayElement.Obj();
-            const std::string name = dbBSON["name"].str();
-            ++_clonersActive;
-            std::shared_ptr<DatabaseCloner> dbCloner{nullptr};
-            try {
-                dbCloner.reset(new DatabaseCloner(
-                    _exec,
-                    _source,
-                    name,
-                    BSONObj(),                            // do not filter database out.
-                    [](const BSONObj&) { return true; },  // clone all dbs.
-                    _storage,                             // use storage provided.
-                    [](const Status& status, const NamespaceString& srcNss) {
-                        if (status.isOK()) {
-                            log() << "collection clone finished: " << srcNss;
-                        } else {
-                            log() << "collection clone for '" << srcNss << "' failed due to "
-                                  << status.toString();
-                        }
-                    },
-                    [=](const Status& status) { _onEachDBCloneFinish(status, name); }));
-            } catch (...) {
-                // error creating, fails below.
-            }
-
-            Status s = dbCloner ? dbCloner->start() : Status(ErrorCodes::UnknownError, "Bad!");
-
-            if (!s.isOK()) {
-                std::string err = str::stream() << "could not create cloner for database: " << name
-                                                << " due to: " << s.toString();
-                _setStatus(Status(ErrorCodes::InitialSyncFailure, err));
-                error() << err;
-                break;  // exit for_each loop
-            }
-
-            // add cloner to list.
-            _databaseCloners.push_back(dbCloner);
-        }
-    } else {
-        _setStatus(Status(ErrorCodes::InitialSyncFailure,
-                          "failed to clone databases due to failed server response."));
-    }
-
-    // Move on to the next steps in the process.
-    _doNextActions();
-}
-
-void DatabasesCloner::_onEachDBCloneFinish(const Status& status, const std::string name) {
-    auto clonersLeft = --_clonersActive;
-
-    if (status.isOK()) {
-        log() << "database clone finished: " << name;
-    } else {
-        log() << "database clone failed due to " << status.toString();
-        _setStatus(status);
-    }
-
-    if (clonersLeft == 0) {
-        _active = false;
-        // All cloners are done, trigger event.
-        log() << "all database clones finished, calling _finishFn";
-        _finishFn(_status);
-    }
-
-    _doNextActions();
-}
-
-void DatabasesCloner::_doNextActions() {
-    // If we are no longer active or we had an error, stop doing more
-    if (!(_active && _status.isOK())) {
-        if (!_status.isOK()) {
-            // trigger failed state
-            _failed();
-        }
-        return;
-    }
-}
-
-void DatabasesCloner::_failed() {
-    if (!_active) {
-        return;
-    }
-    _active = false;
-
-    // TODO: cancel outstanding work, like any cloners active
-    invariant(_finishFn);
-    _finishFn(_status);
-}
-
 // Data Replicator
 DataReplicator::DataReplicator(
     DataReplicatorOptions opts,
     std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-    ReplicationExecutor* exec)
-    : _opts(opts),
+    StorageInterface* storage)
+    : _fetchCount(0),
+      _opts(opts),
       _dataReplicatorExternalState(std::move(dataReplicatorExternalState)),
-      _exec(exec),
+      _exec(_dataReplicatorExternalState->getTaskExecutor()),
       _state(DataReplicatorState::Uninitialized),
-      _fetcherPaused(false),
-      _reporterPaused(false),
-      _applierActive(false),
-      _applierPaused(false) {
-    uassert(ErrorCodes::BadValue, "invalid rollback function", _opts.rollbackFn);
-    uassert(ErrorCodes::BadValue,
-            "invalid replSetUpdatePosition command object creation function",
-            _opts.prepareReplSetUpdatePositionCommandFn);
+      _storage(storage) {
+    uassert(ErrorCodes::BadValue, "invalid storage interface", _storage);
     uassert(ErrorCodes::BadValue, "invalid getMyLastOptime function", _opts.getMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid setMyLastOptime function", _opts.setMyLastOptime);
-    uassert(ErrorCodes::BadValue, "invalid setFollowerMode function", _opts.setFollowerMode);
     uassert(ErrorCodes::BadValue, "invalid getSlaveDelay function", _opts.getSlaveDelay);
     uassert(ErrorCodes::BadValue, "invalid sync source selector", _opts.syncSourceSelector);
 }
 
 DataReplicator::~DataReplicator() {
     DESTRUCTOR_GUARD({
+        UniqueLock lk(_mutex);
         _cancelAllHandles_inlock();
-        _waitOnAll_inlock();
+        _waitOnAndResetAll_inlock(&lk);
     });
-}
-
-Status DataReplicator::start(OperationContext* txn) {
-    UniqueLock lk(_mutex);
-    if (_state != DataReplicatorState::Uninitialized) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream() << "Already started in another state: " << toString(_state));
-    }
-
-    _setState_inlock(DataReplicatorState::Steady);
-    _applierPaused = false;
-    _fetcherPaused = false;
-    _reporterPaused = false;
-    _oplogBuffer = _dataReplicatorExternalState->makeSteadyStateOplogBuffer(txn);
-    _oplogBuffer->startup(txn);
-    _doNextActions_Steady_inlock();
-    return Status::OK();
 }
 
 Status DataReplicator::shutdown(OperationContext* txn) {
     return _shutdown(txn);
-}
-
-Status DataReplicator::pause() {
-    _pauseApplier();
-    return Status::OK();
 }
 
 DataReplicatorState DataReplicator::getState() const {
@@ -474,26 +273,19 @@ DataReplicatorState DataReplicator::getState() const {
     return _state;
 }
 
-void DataReplicator::waitForState(const DataReplicatorState& state) {
-    UniqueLock lk(_mutex);
-    while (_state != state) {
-        _stateCondition.wait(lk);
-    }
-}
-
 HostAndPort DataReplicator::getSyncSource() const {
     LockGuard lk(_mutex);
     return _syncSource;
 }
 
-Timestamp DataReplicator::getLastTimestampFetched() const {
+OpTimeWithHash DataReplicator::getLastFetched() const {
     LockGuard lk(_mutex);
-    return _lastTimestampFetched;
+    return _lastFetched;
 }
 
-Timestamp DataReplicator::getLastTimestampApplied() const {
+OpTimeWithHash DataReplicator::getLastApplied() const {
     LockGuard lk(_mutex);
-    return _lastTimestampApplied;
+    return _lastApplied;
 }
 
 size_t DataReplicator::getOplogBufferCount() const {
@@ -505,358 +297,589 @@ std::string DataReplicator::getDiagnosticString() const {
     LockGuard lk(_mutex);
     str::stream out;
     out << "DataReplicator -"
-        << " opts: " << _opts.toString() << " oplogFetcher: " << _fetcher->toString()
+        << " opts: " << _opts.toString() << " oplogFetcher: " << _oplogFetcher->toString()
         << " opsBuffered: " << _oplogBuffer->getSize() << " state: " << toString(_state);
     switch (_state) {
         case DataReplicatorState::InitialSync:
             out << " opsAppied: " << _initialSyncState->appliedOps
                 << " status: " << _initialSyncState->status.toString();
             break;
-        case DataReplicatorState::Steady:
+        case DataReplicatorState::Uninitialized:
             // TODO: add more here
-            break;
-        case DataReplicatorState::Rollback:
-            // TODO: add more here
-            break;
-        default:
             break;
     }
 
     return out;
 }
 
-Status DataReplicator::resume(bool wait) {
-    CBHStatus handle = _exec->scheduleWork(
-        stdx::bind(&DataReplicator::_resumeFinish, this, stdx::placeholders::_1));
-    const Status status = handle.getStatus();
-    if (wait && status.isOK()) {
-        _exec->wait(handle.getValue());
-    }
-    return status;
+BSONObj DataReplicator::getInitialSyncProgress() const {
+    LockGuard lk(_mutex);
+    return _getInitialSyncProgress_inlock();
 }
 
-void DataReplicator::_resumeFinish(CallbackArgs cbData) {
-    UniqueLock lk(_mutex);
-    _fetcherPaused = _applierPaused = false;
+BSONObj DataReplicator::_getInitialSyncProgress_inlock() const {
+    BSONObjBuilder bob;
+    try {
+        _stats.append(&bob);
+        if (_initialSyncState) {
+            bob.appendNumber("fetchedMissingDocs", _initialSyncState->fetchedMissingDocs);
+            bob.appendNumber("appliedOps", _initialSyncState->appliedOps);
+            if (!_initialSyncState->beginTimestamp.isNull()) {
+                bob.append("initialSyncOplogStart", _initialSyncState->beginTimestamp);
+            }
+            if (!_initialSyncState->stopTimestamp.isNull()) {
+                bob.append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
+            }
+            if (_initialSyncState->dbsCloner) {
+                BSONObjBuilder dbsBuilder(bob.subobjStart("databases"));
+                _initialSyncState->dbsCloner->getStats().append(&dbsBuilder);
+                dbsBuilder.doneFast();
+            }
+        }
+    } catch (const DBException& e) {
+        bob.resetToEmpty();
+        bob.append("error", e.toString());
+        log() << "Error creating initial sync progress object: " << e.toString();
+    }
+    return bob.obj();
+}
+
+void DataReplicator::_resetState_inlock(OperationContext* txn, OpTimeWithHash lastAppliedOpTime) {
+    invariant(!_anyActiveHandles_inlock());
+    _lastApplied = _lastFetched = lastAppliedOpTime;
+    if (_oplogBuffer) {
+        _oplogBuffer->clear(txn);
+    }
+}
+
+void DataReplicator::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
+    LockGuard lk(_mutex);
+    _scheduleDbWorkFn = work;
+}
+
+Status DataReplicator::_runInitialSyncAttempt_inlock(OperationContext* txn,
+                                                     UniqueLock& lk,
+                                                     HostAndPort syncSource) {
+    RollbackChecker rollbackChecker(_exec, syncSource);
+    invariant(lk.owns_lock());
+    Status statusFromWrites(ErrorCodes::NotYetInitialized, "About to run Initial Sync Attempt.");
+
+    // drop/create oplog; drop user databases.
+    LOG(1) << "About to drop+create the oplog, if it exists, ns:" << _opts.localOplogNS
+           << ", and drop all user databases (so that we can clone them).";
+    const auto schedStatus = scheduleWork(
+        _exec, [&statusFromWrites, this](OperationContext* txn, const CallbackArgs& cd) {
+            /**
+             * This functions does the following:
+             *      1.) Drop oplog
+             *      2.) Drop user databases (replicated dbs)
+             *      3.) Create oplog
+             */
+            if (!cd.status.isOK()) {
+                error() << "Error while being called to drop/create oplog and drop users "
+                        << "databases, oplogNS: " << _opts.localOplogNS
+                        // REDACT cd??
+                        << " with status:" << cd.status.toString();
+                statusFromWrites = cd.status;
+                return;
+            }
+
+            invariant(txn);
+            // We are not replicating nor validating these writes.
+            txn->setReplicatedWrites(false);
+
+            // 1.) Drop the oplog.
+            LOG(2) << "Dropping the existing oplog: " << _opts.localOplogNS;
+            statusFromWrites = _storage->dropCollection(txn, _opts.localOplogNS);
+
+
+            // 2.) Drop user databases.
+            if (statusFromWrites.isOK()) {
+                LOG(2) << "Dropping  user databases";
+                statusFromWrites = _storage->dropReplicatedDatabases(txn);
+            }
+
+            // 3.) Create the oplog.
+            if (statusFromWrites.isOK()) {
+                LOG(2) << "Creating the oplog: " << _opts.localOplogNS;
+                statusFromWrites = _storage->createOplog(txn, _opts.localOplogNS);
+            }
+
+        });
+
+    if (!schedStatus.isOK())
+        return schedStatus.getStatus();
+
+    lk.unlock();
+    _exec->wait(schedStatus.getValue());
+    if (!statusFromWrites.isOK()) {
+        lk.lock();
+        return statusFromWrites;
+    }
+
+    auto rollbackStatus = rollbackChecker.reset_sync();
+    lk.lock();
+    if (!rollbackStatus.isOK())
+        return rollbackStatus;
+
+    Event initialSyncFinishEvent;
+    StatusWith<Event> eventStatus = _exec->makeEvent();
+    if (!eventStatus.isOK()) {
+        return eventStatus.getStatus();
+    }
+    initialSyncFinishEvent = eventStatus.getValue();
+
+    invariant(initialSyncFinishEvent.isValid());
+    _initialSyncState.reset(new InitialSyncState(
+        stdx::make_unique<DatabasesCloner>(
+            _storage,
+            _exec,
+            _dataReplicatorExternalState->getDbWorkThreadPool(),
+            syncSource,
+            [](BSONObj dbInfo) {
+                const std::string name = dbInfo["name"].str();
+                return (name != "local");
+            },
+            stdx::bind(
+                &DataReplicator::_onDataClonerFinish, this, stdx::placeholders::_1, syncSource)),
+        initialSyncFinishEvent));
+
+    const NamespaceString ns(_opts.remoteOplogNS);
+    lk.unlock();
+    // get the latest oplog entry, and parse out the optime + hash.
+    const auto lastOplogEntry = getLatestOplogEntry(_exec, syncSource, ns);
+    const auto lastOplogEntryOpTimeWithHashStatus = lastOplogEntry.isOK()
+        ? parseOpTimeWithHash(lastOplogEntry.getValue())
+        : StatusWith<OpTimeWithHash>{lastOplogEntry.getStatus()};
+
+    lk.lock();
+
+    if (!lastOplogEntryOpTimeWithHashStatus.isOK()) {
+        _initialSyncState->status = lastOplogEntryOpTimeWithHashStatus.getStatus();
+        return _initialSyncState->status;
+    }
+
+    _initialSyncState->oplogSeedDoc = lastOplogEntry.getValue().getOwned();
+    const auto lastOpTimeWithHash = lastOplogEntryOpTimeWithHashStatus.getValue();
+    _initialSyncState->beginTimestamp = lastOpTimeWithHash.opTime.getTimestamp();
+
+    if (_oplogFetcher) {
+        if (_oplogFetcher->isActive()) {
+            LOG(3) << "Fetcher is active, stopping it.";
+            _oplogFetcher->shutdown();
+        }
+    }
+    _oplogFetcher.reset();
+
+    const auto config = uassertStatusOK(_dataReplicatorExternalState->getCurrentConfig());
+    _oplogFetcher = stdx::make_unique<OplogFetcher>(_exec,
+                                                    lastOpTimeWithHash,
+                                                    syncSource,
+                                                    _opts.remoteOplogNS,
+                                                    config,
+                                                    _opts.oplogFetcherMaxFetcherRestarts,
+                                                    _dataReplicatorExternalState.get(),
+                                                    stdx::bind(&DataReplicator::_enqueueDocuments,
+                                                               this,
+                                                               stdx::placeholders::_1,
+                                                               stdx::placeholders::_2,
+                                                               stdx::placeholders::_3),
+                                                    stdx::bind(&DataReplicator::_onOplogFetchFinish,
+                                                               this,
+                                                               stdx::placeholders::_1,
+                                                               stdx::placeholders::_2));
+    _scheduleFetch_inlock();
+    DatabasesCloner* cloner = _initialSyncState->dbsCloner.get();
+    if (_scheduleDbWorkFn) {
+        cloner->setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+    }
     lk.unlock();
 
-    _doNextActions();
-}
+    if (MONGO_FAIL_POINT(initialSyncHangBeforeCopyingDatabases)) {
+        // This log output is used in js tests so please leave it.
+        log() << "initial sync - initialSyncHangBeforeCopyingDatabases fail point "
+                 "enabled. Blocking until fail point is disabled.";
+        while (MONGO_FAIL_POINT(initialSyncHangBeforeCopyingDatabases)) {
+            lk.lock();
+            if (!_initialSyncState->status.isOK()) {
+                lk.unlock();
+                break;
+            }
+            lk.unlock();
+            mongo::sleepsecs(1);
+        }
+    }
 
-void DataReplicator::_pauseApplier() {
-    LockGuard lk(_mutex);
-    if (_applier)
-        _applier->wait();
-    _applierPaused = true;
-    _applier.reset();
-}
+    cloner->startup();  // When the cloner is done applier starts.
+    _exec->waitForEvent(initialSyncFinishEvent);
 
-Timestamp DataReplicator::_applyUntil(Timestamp untilTimestamp) {
-    // TODO: block until all oplog buffer application is done to the given optime
-    return Timestamp();
-}
+    log() << "Initial sync attempt finishing up.";
+    lk.lock();
+    if (!_initialSyncState->status.isOK()) {
+        return _initialSyncState->status;
+    }
+    lk.unlock();
 
-Timestamp DataReplicator::_applyUntilAndPause(Timestamp untilTimestamp) {
-    //_run(&_pauseApplier);
-    return _applyUntil(untilTimestamp);
-}
+    // Check for roll back, and fail if so.
+    auto hasHadRollbackResponse = rollbackChecker.hasHadRollback();
+    lk.lock();
+    if (!hasHadRollbackResponse.isOK()) {
+        _initialSyncState->status = hasHadRollbackResponse.getStatus();
+    } else if (hasHadRollbackResponse.getValue()) {
+        _initialSyncState->status = {ErrorCodes::UnrecoverableRollbackError,
+                                     "Rollback occurred during initial sync"};
+    }
 
-TimestampStatus DataReplicator::flushAndPause() {
-    //_run(&_pauseApplier);
-    UniqueLock lk(_mutex);
-    if (_applierActive) {
-        _applierPaused = true;
+    if (!_initialSyncState->status.isOK()) {
+        return _initialSyncState->status;
+    }
+
+    // If no oplog entries were applied, then we need to store the document that we fetched before
+    // we began cloning.
+    if (_initialSyncState->appliedOps == 0) {
+        auto oplogSeedDoc = _initialSyncState->oplogSeedDoc;
         lk.unlock();
-        _applier->wait();
+
+        LOG(1) << "inserting oplog seed document: " << _initialSyncState->oplogSeedDoc;
+
+        // Store the first oplog entry, after initial sync completes.
+        const auto insertStatus =
+            _storage->insertDocuments(txn, _opts.localOplogNS, {oplogSeedDoc});
         lk.lock();
-    }
-    return TimestampStatus(_lastTimestampApplied);
-}
 
-void DataReplicator::_resetState_inlock(OperationContext* txn, Timestamp lastAppliedOpTime) {
-    invariant(!_anyActiveHandles_inlock());
-    _lastTimestampApplied = _lastTimestampFetched = lastAppliedOpTime;
-    _oplogBuffer->clear(txn);
-}
-
-void DataReplicator::slavesHaveProgressed() {
-    if (_reporter) {
-        _reporter->trigger();
-    }
-}
-
-void DataReplicator::_setInitialSyncStorageInterface(CollectionCloner::StorageInterface* si) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _storage = si;
-    if (_initialSyncState) {
-        _initialSyncState->dbsCloner.setStorageInterface(_storage);
-    }
-}
-
-TimestampStatus DataReplicator::resync(OperationContext* txn) {
-    _shutdown(txn);
-    // Drop databases and do initialSync();
-    CBHStatus cbh = _exec->scheduleWork(
-        [&](const CallbackArgs& cbData) { _storage->dropUserDatabases(makeOpCtx().get()); });
-
-    if (!cbh.isOK()) {
-        return TimestampStatus(cbh.getStatus());
+        if (!insertStatus.isOK()) {
+            _initialSyncState->status = insertStatus;
+            return _initialSyncState->status;
+        }
     }
 
-    _exec->wait(cbh.getValue());
-
-    TimestampStatus status = initialSync(txn);
-    if (status.isOK()) {
-        _resetState_inlock(txn, status.getValue());
-    }
-    return status;
+    return Status::OK();  // success
 }
 
-TimestampStatus DataReplicator::initialSync(OperationContext* txn) {
-    Timer t;
+StatusWith<OpTimeWithHash> DataReplicator::doInitialSync(OperationContext* txn,
+                                                         std::size_t maxAttempts) {
+    const Status shutdownStatus{ErrorCodes::ShutdownInProgress,
+                                "Shutting down while in doInitialSync."};
+    if (!txn) {
+        std::string msg = "Initial Sync attempted but no OperationContext*, so aborting.";
+        error() << msg;
+        return Status{ErrorCodes::InitialSyncFailure, msg};
+    }
     UniqueLock lk(_mutex);
+    if (_inShutdown || (_initialSyncState && !_initialSyncState->status.isOK())) {
+        const auto retStatus = (_initialSyncState && !_initialSyncState->status.isOK())
+            ? _initialSyncState->status
+            : shutdownStatus;
+        return retStatus;
+    }
+    _stats.initialSyncStart = _exec->now();
     if (_state != DataReplicatorState::Uninitialized) {
         if (_state == DataReplicatorState::InitialSync)
-            return TimestampStatus(ErrorCodes::InvalidRoleModification,
-                                   (str::stream() << "Already doing initial sync;try resync"));
+            return {ErrorCodes::InitialSyncActive,
+                    (str::stream() << "Initial sync in progress; try resync to start anew.")};
         else {
-            return TimestampStatus(
+            return {
                 ErrorCodes::AlreadyInitialized,
-                (str::stream() << "Cannot do initial sync in " << toString(_state) << " state."));
+                (str::stream() << "Cannot do initial sync in " << toString(_state) << " state.")};
         }
     }
 
-    _setState_inlock(DataReplicatorState::InitialSync);
-
-    // The reporter is paused for the duration of the initial sync, so shut down just in case.
-    if (_reporter) {
-        _reporter->shutdown();
-    }
-    _reporterPaused = true;
-    _applierPaused = true;
-
+    LOG(1) << "Creating oplogBuffer.";
     _oplogBuffer = _dataReplicatorExternalState->makeInitialSyncOplogBuffer(txn);
     _oplogBuffer->startup(txn);
-    ON_BLOCK_EXIT([this, txn]() {
-        _oplogBuffer->shutdown(txn);
-        _oplogBuffer.reset();
-    });
 
-    StorageInterface::get(txn)->setInitialSyncFlag(txn);
+    lk.unlock();
+    // This will call through to the storageInterfaceImpl to ReplicationCoordinatorImpl.
+    _storage->setInitialSyncFlag(txn);
+    lk.lock();
 
-    const int maxFailedAttempts = 10;
-    int failedAttempts = 0;
-    Status attemptErrorStatus(Status::OK());
-    while (failedAttempts < maxFailedAttempts) {
+    _stats.maxFailedInitialSyncAttempts = maxAttempts;
+    _stats.failedInitialSyncAttempts = 0;
+    while (_stats.failedInitialSyncAttempts < _stats.maxFailedInitialSyncAttempts) {
+        if (_inShutdown) {
+            return shutdownStatus;
+        }
+
+        Status attemptErrorStatus(Status::OK());
+
+        ON_BLOCK_EXIT([this, txn, &lk, &attemptErrorStatus]() {
+            if (!lk.owns_lock()) {
+                lk.lock();
+            }
+            if (_anyActiveHandles_inlock()) {
+                _cancelAllHandles_inlock();
+                _waitOnAndResetAll_inlock(&lk);
+                if (!attemptErrorStatus.isOK()) {
+                    _initialSyncState.reset();
+                }
+            }
+        });
+
+        _setState_inlock(DataReplicatorState::InitialSync);
+        _applierPaused = true;
+
+        LOG(2) << "Resetting sync source so a new one can be chosen for this initial sync attempt.";
+        _syncSource = HostAndPort();
+
+        _resetState_inlock(txn, OpTimeWithHash());
+
         // For testing, we may want to fail if we receive a getmore.
         if (MONGO_FAIL_POINT(failInitialSyncWithBadHost)) {
-            attemptErrorStatus = Status(ErrorCodes::InvalidSyncSource, "no sync source avail.");
-        }
-
-        Event initialSyncFinishEvent;
-        if (attemptErrorStatus.isOK() && _syncSource.empty()) {
-            attemptErrorStatus = _ensureGoodSyncSource_inlock();
-        }
-
-        RollbackChecker rollbackChecker(_exec, _syncSource);
-        if (attemptErrorStatus.isOK()) {
-            lk.unlock();
-            attemptErrorStatus = rollbackChecker.reset_sync();
-            lk.lock();
+            attemptErrorStatus =
+                Status(ErrorCodes::InvalidSyncSource,
+                       "no sync source avail(failInitialSyncWithBadHost failpoint is set).");
         }
 
         if (attemptErrorStatus.isOK()) {
-            StatusWith<Event> status = _exec->makeEvent();
-            if (!status.isOK()) {
-                attemptErrorStatus = status.getStatus();
+            invariant(_syncSource.empty());
+            for (int i = 0; i < numInitialSyncConnectAttempts; ++i) {
+                attemptErrorStatus = _ensureGoodSyncSource_inlock();
+                if (attemptErrorStatus.isOK()) {
+                    break;
+                }
+                LOG(1) << "Error getting sync source: '" << attemptErrorStatus.toString()
+                       << "', trying again in " << _opts.syncSourceRetryWait << ". Attempt "
+                       << i + 1 << " of " << numInitialSyncConnectAttempts.load();
+                sleepmillis(durationCount<Milliseconds>(_opts.syncSourceRetryWait));
+            }
+
+            if (_syncSource.empty()) {
+                attemptErrorStatus = Status(
+                    ErrorCodes::InitialSyncOplogSourceMissing,
+                    "No valid sync source found in current replica set to do an initial sync.");
             } else {
-                initialSyncFinishEvent = status.getValue();
+                attemptErrorStatus = _runInitialSyncAttempt_inlock(txn, lk, _syncSource);
+                LOG(1) << "initial sync attempt returned with status: " << attemptErrorStatus;
             }
         }
 
+        auto runTime = _initialSyncState ? _initialSyncState->timer.millis() : 0;
+        _stats.initialSyncAttemptInfos.emplace_back(
+            DataReplicator::InitialSyncAttemptInfo{runTime, attemptErrorStatus, _syncSource});
+
+        // If the status is ok now then initial sync is over. We must do this before we reset
+        // _initialSyncState and lose the DatabasesCloner's stats.
         if (attemptErrorStatus.isOK()) {
-            invariant(initialSyncFinishEvent.isValid());
-            _initialSyncState.reset(new InitialSyncState(
-                DatabasesCloner(
-                    _exec,
-                    _syncSource,
-                    stdx::bind(&DataReplicator::_onDataClonerFinish, this, stdx::placeholders::_1)),
-                initialSyncFinishEvent));
-
-            _initialSyncState->dbsCloner.setStorageInterface(_storage);
-            const NamespaceString ns(_opts.remoteOplogNS);
-            TimestampStatus tsStatus =
-                _initialSyncState->getLatestOplogTimestamp(_exec, _syncSource, ns);
-            attemptErrorStatus = tsStatus.getStatus();
-            if (attemptErrorStatus.isOK()) {
-                _initialSyncState->beginTimestamp = tsStatus.getValue();
-                long long term = OpTime::kUninitializedTerm;
-                // TODO: Read last fetched hash from storage.
-                long long lastHashFetched = 1LL;
-                OpTime lastOpTimeFetched(_initialSyncState->beginTimestamp, term);
-                _fetcher = stdx::make_unique<OplogFetcher>(
-                    _exec,
-                    OpTimeWithHash(lastHashFetched, lastOpTimeFetched),
-                    _syncSource,
-                    _opts.remoteOplogNS,
-                    uassertStatusOK(_dataReplicatorExternalState->getCurrentConfig()),
-                    _dataReplicatorExternalState.get(),
-                    stdx::bind(&DataReplicator::_enqueueDocuments,
-                               this,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2,
-                               stdx::placeholders::_3,
-                               stdx::placeholders::_4),
-                    stdx::bind(&DataReplicator::_onOplogFetchFinish,
-                               this,
-                               stdx::placeholders::_1,
-                               stdx::placeholders::_2));
-                _scheduleFetch_inlock();
+            _stats.initialSyncEnd = _exec->now();
+            log() << "Initial Sync Statistics: " << _getInitialSyncProgress_inlock();
+            if (MONGO_FAIL_POINT(initialSyncHangBeforeFinish)) {
                 lk.unlock();
-                _initialSyncState->dbsCloner.start();  // When the cloner is done applier starts.
-                invariant(_initialSyncState->finishEvent.isValid());
-                _exec->waitForEvent(_initialSyncState->finishEvent);
-                if (rollbackChecker.hasHadRollback()) {
-                    _initialSyncState->setStatus(Status(ErrorCodes::UnrecoverableRollbackError,
-                                                        "Rollback occurred during initial sync"));
+                // This log output is used in js tests so please leave it.
+                log() << "initial sync - initialSyncHangBeforeFinish fail point "
+                         "enabled. Blocking until fail point is disabled.";
+                while (MONGO_FAIL_POINT(initialSyncHangBeforeFinish)) {
+                    lk.lock();
+                    if (!_initialSyncState->status.isOK()) {
+                        lk.unlock();
+                        break;
+                    }
+                    lk.unlock();
+                    mongo::sleepsecs(1);
                 }
-                attemptErrorStatus = _initialSyncState->status;
-
-                // Re-lock DataReplicator Internals
                 lk.lock();
             }
         }
-
-        if (attemptErrorStatus.isOK()) {
-            break;  // success
+        if (_inShutdown) {
+            const auto retStatus = (_initialSyncState && !_initialSyncState->status.isOK())
+                ? _initialSyncState->status
+                : shutdownStatus;
+            return retStatus;
         }
 
-        ++failedAttempts;
+        // Cleanup
+        _cancelAllHandles_inlock();
+        _waitOnAndResetAll_inlock(&lk);
+        invariant(!_anyActiveHandles_inlock());
+
+        if (attemptErrorStatus.isOK()) {
+            break;
+        }
+
+        ++_stats.failedInitialSyncAttempts;
+        initialSyncFailedAttempts.increment();
 
         error() << "Initial sync attempt failed -- attempts left: "
-                << (maxFailedAttempts - failedAttempts) << " cause: " << attemptErrorStatus;
+                << (_stats.maxFailedInitialSyncAttempts - _stats.failedInitialSyncAttempts)
+                << " cause: " << attemptErrorStatus;
+
+        // Check if need to do more retries.
+        if (_stats.failedInitialSyncAttempts >= _stats.maxFailedInitialSyncAttempts) {
+            const std::string err =
+                "The maximum number of retries"
+                " have been exhausted for initial sync.";
+            severe() << err;
+
+            initialSyncFailures.increment();
+            _setState_inlock(DataReplicatorState::Uninitialized);
+            _stats.initialSyncEnd = _exec->now();
+            log() << "Initial Sync Statistics: " << _getInitialSyncProgress_inlock();
+            return attemptErrorStatus;
+        }
 
         // Sleep for retry time
         lk.unlock();
         sleepmillis(durationCount<Milliseconds>(_opts.initialSyncRetryWait));
         lk.lock();
-
-        // No need to print a stack
-        if (failedAttempts >= maxFailedAttempts) {
-            const std::string err =
-                "The maximum number of retries"
-                " have been exhausted for initial sync.";
-            severe() << err;
-            return Status(ErrorCodes::InitialSyncFailure, err);
-        }
     }
 
-    // Success, cleanup
-    // TODO: re-enable, find blocking call from tests
-    /*
-            _cancelAllHandles_inlock();
-            _waitOnAll_inlock();
+    _fetcherPaused = false;
+    _applierPaused = false;
 
-            _reporterPaused = false;
-            _fetcherPaused = false;
-            _fetcher.reset(nullptr);
-            _tmpFetcher.reset(nullptr);
-            _applierPaused = false;
-            _applier.reset(nullptr);
-            _applierActive = false;
-            _initialSyncState.reset(nullptr);
-            _oplogBuffer.clear();
-            _resetState_inlock(_lastTimestampApplied);
-    */
+    _lastFetched = _lastApplied;
 
-    StorageInterface::get(txn)->clearInitialSyncFlag(txn);
-    log() << "Initial sync took: " << t.millis() << " milliseconds.";
-    return TimestampStatus(_lastTimestampApplied);
+    _storage->clearInitialSyncFlag(txn);
+    _opts.setMyLastOptime(_lastApplied.opTime);
+    log() << "initial sync done; took "
+          << duration_cast<Seconds>(_stats.initialSyncEnd - _stats.initialSyncStart) << ".";
+    initialSyncCompletes.increment();
+    return _lastApplied;
 }
 
-void DataReplicator::_onDataClonerFinish(const Status& status) {
-    log() << "data clone finished, status: " << status.toString();
+void DataReplicator::_onDataClonerFinish(const Status& status, HostAndPort syncSource) {
+    log() << "data clone finished, status: " << redact(status);
+    if (status.code() == ErrorCodes::CallbackCanceled) {
+        return;
+    }
     if (!status.isOK()) {
-        // Iniitial sync failed during cloning of databases
-        _initialSyncState->setStatus(status);
+        // Initial sync failed during cloning of databases
+        error() << "Failed to clone data due to '" << redact(status) << "'";
+        {
+            LockGuard lk(_mutex);
+            _initialSyncState->status = status;
+        }
         _exec->signalEvent(_initialSyncState->finishEvent);
         return;
     }
 
+    LockGuard lk(_mutex);
+    _scheduleLastOplogEntryFetcher_inlock(
+        stdx::bind(&DataReplicator::_onApplierReadyStart, this, stdx::placeholders::_1));
+}
+
+void DataReplicator::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn callback) {
     BSONObj query = BSON(
         "find" << _opts.remoteOplogNS.coll() << "sort" << BSON("$natural" << -1) << "limit" << 1);
 
-    TimestampStatus timestampStatus(ErrorCodes::BadValue, "");
-    _tmpFetcher = stdx::make_unique<Fetcher>(
-        _exec,
-        _syncSource,
-        _opts.remoteOplogNS.db().toString(),
-        query,
-        stdx::bind(&DataReplicator::_onApplierReadyStart, this, stdx::placeholders::_1));
-    Status s = _tmpFetcher->schedule();
-    if (!s.isOK()) {
-        _initialSyncState->setStatus(s);
+    _lastOplogEntryFetcher =
+        stdx::make_unique<Fetcher>(_exec,
+                                   _syncSource,
+                                   _opts.remoteOplogNS.db().toString(),
+                                   query,
+                                   callback,
+                                   rpc::ServerSelectionMetadata(true, boost::none).toBSON(),
+                                   RemoteCommandRequest::kNoTimeout,
+                                   RemoteCommandRetryScheduler::makeRetryPolicy(
+                                       numInitialSyncOplogFindAttempts,
+                                       executor::RemoteCommandRequest::kNoTimeout,
+                                       RemoteCommandRetryScheduler::kAllRetriableErrors));
+    Status scheduleStatus = _lastOplogEntryFetcher->schedule();
+    if (!scheduleStatus.isOK()) {
+        _initialSyncState->status = scheduleStatus;
+        _exec->signalEvent(_initialSyncState->finishEvent);
     }
 }
 
 void DataReplicator::_onApplierReadyStart(const QueryResponseStatus& fetchResult) {
     // Data clone done, move onto apply.
-    TimestampStatus ts(ErrorCodes::OplogStartMissing, "");
-    _initialSyncState->_setTimestampStatus(fetchResult, &ts);
-    if (ts.isOK()) {
-        // TODO: set minvalid?
+    auto&& optimeWithHashStatus = parseOpTimeWithHash(fetchResult);
+    if (optimeWithHashStatus.isOK()) {
         LockGuard lk(_mutex);
-        _initialSyncState->stopTimestamp = ts.getValue();
-        if (_lastTimestampApplied < ts.getValue()) {
-            log() << "waiting for applier to run until ts: " << ts.getValue();
+        auto&& optimeWithHash = optimeWithHashStatus.getValue();
+        _initialSyncState->stopTimestamp = optimeWithHash.opTime.getTimestamp();
+
+        // Check if applied to/past our stopTimestamp.
+        if (_initialSyncState->beginTimestamp < _initialSyncState->stopTimestamp) {
+            invariant(_applierPaused);
+            log() << "Applying operations until " << _initialSyncState->stopTimestamp.toBSON()
+                  << " before initial sync can complete. (starting at "
+                  << _initialSyncState->beginTimestamp.toBSON() << ")";
+            _applierPaused = false;
+        } else {
+            log() << "No need to apply operations. (currently at "
+                  << _initialSyncState->stopTimestamp.toBSON() << ")";
+            if (_lastApplied.opTime.getTimestamp() < _initialSyncState->stopTimestamp) {
+                _lastApplied = optimeWithHash;
+            }
         }
-        invariant(_applierPaused);
-        _applierPaused = false;
         _doNextActions_InitialSync_inlock();
     } else {
-        _initialSyncState->setStatus(ts.getStatus());
+        _initialSyncState->status = optimeWithHashStatus.getStatus();
         _doNextActions();
     }
 }
 
 bool DataReplicator::_anyActiveHandles_inlock() const {
-    return _applierActive || (_fetcher && _fetcher->isActive()) ||
-        (_initialSyncState && _initialSyncState->dbsCloner.isActive()) ||
-        (_reporter && _reporter->isActive());
+    // If any component is active then retVal will be set to true.
+    bool retVal = false;
+
+    // For diagnostic reasons, do not return early once an active component is found, but instead
+    // log each active component.
+
+    if (_oplogFetcher && _oplogFetcher->isActive()) {
+        LOG(0 /*1*/) << "_oplogFetcher is active (_anyActiveHandles_inlock): "
+                     << _oplogFetcher->toString();
+        retVal = true;
+    }
+
+    if (_initialSyncState && _initialSyncState->dbsCloner &&
+        _initialSyncState->dbsCloner->isActive()) {
+        LOG(0 /*1*/) << "_initialSyncState::dbsCloner is active (_anyActiveHandles_inlock): "
+                     << _initialSyncState->dbsCloner->toString();
+        retVal = true;
+    }
+
+    if (_applier && _applier->isActive()) {
+        LOG(0 /*1*/) << "_applier is active (_anyActiveHandles_inlock): " << _applier->toString();
+        retVal = true;
+    }
+
+    if (_shuttingDownApplier && _shuttingDownApplier->isActive()) {
+        LOG(0 /*1*/) << "_shuttingDownApplier is active (_anyActiveHandles_inlock): "
+                     << _shuttingDownApplier->toString();
+        retVal = true;
+    }
+
+    if (!retVal) {
+        LOG(0 /*2*/)
+            << "DataReplicator::_anyActiveHandles_inlock returned false as nothing is active.";
+    }
+    return retVal;
 }
 
 void DataReplicator::_cancelAllHandles_inlock() {
-    if (_fetcher)
-        _fetcher->shutdown();
+    if (_oplogFetcher)
+        _oplogFetcher->shutdown();
     if (_applier)
-        _applier->cancel();
-    if (_reporter)
-        _reporter->shutdown();
-    if (_initialSyncState && _initialSyncState->dbsCloner.isActive())
-        _initialSyncState->dbsCloner.cancel();
+        _applier->shutdown();
+    // No need to call shutdown() on _shuttingdownApplier. This applier is assigned when the most
+    // recent applier's finish callback has been invoked. Note that isActive() will still return
+    // true if the callback is still in progress.
+    if (_initialSyncState && _initialSyncState->dbsCloner &&
+        _initialSyncState->dbsCloner->isActive()) {
+        _initialSyncState->dbsCloner->shutdown();
+    }
 }
 
-void DataReplicator::_waitOnAll_inlock() {
-    if (_fetcher)
-        _fetcher->join();
-    if (_applier)
-        _applier->wait();
-    if (_reporter)
-        _reporter->join();
-    if (_initialSyncState)
-        _initialSyncState->dbsCloner.wait();
+void DataReplicator::_waitOnAndResetAll_inlock(UniqueLock* lk) {
+    swapAndJoin_inlock(lk, _lastOplogEntryFetcher, "Waiting on fetcher (last oplog entry): ");
+    swapAndJoin_inlock(lk, _oplogFetcher, "Waiting on oplog fetcher: ");
+    swapAndJoin_inlock(lk, _applier, "Waiting on applier: ");
+    swapAndJoin_inlock(lk, _shuttingDownApplier, "Waiting on most recently completed applier: ");
+    if (_initialSyncState) {
+        swapAndJoin_inlock(lk, _initialSyncState->dbsCloner, "Waiting on databases cloner: ");
+    }
 }
 
 void DataReplicator::_doNextActions() {
-    // Can be in one of 3 main states/modes (DataReplicatiorState):
+    // Can be in one of 3 main states/modes (DataReplicatorState):
     // 1.) Initial Sync
-    // 2.) Rollback
     // 3.) Steady (Replication)
 
     // Check for shutdown flag, signal event
     LockGuard lk(_mutex);
     if (_onShutdown.isValid()) {
         if (!_anyActiveHandles_inlock()) {
+            LOG(1) << "Signaling shutdown event for DataReplicator.";
             _exec->signalEvent(_onShutdown);
             _setState_inlock(DataReplicatorState::Uninitialized);
         }
@@ -865,79 +888,57 @@ void DataReplicator::_doNextActions() {
 
     // Do work for the current state
     switch (_state) {
-        case DataReplicatorState::Rollback:
-            _doNextActions_Rollback_inlock();
-            break;
         case DataReplicatorState::InitialSync:
             _doNextActions_InitialSync_inlock();
             break;
-        case DataReplicatorState::Steady:
-            _doNextActions_Steady_inlock();
-            break;
-        default:
+        case DataReplicatorState::Uninitialized:
             return;
     }
-
-    // transition when needed
-    _changeStateIfNeeded();
 }
 
 void DataReplicator::_doNextActions_InitialSync_inlock() {
-    if (!_initialSyncState) {
-        // TODO: Error case?, reset to uninit'd
-        _setState_inlock(DataReplicatorState::Uninitialized);
-        log() << "_initialSyncState, so resetting state to Uninitialized";
+    invariant(_initialSyncState);
+
+    if (!_initialSyncState->status.isOK()) {
         return;
     }
 
-    if (!_initialSyncState->dbsCloner.isActive()) {
-        if (!_initialSyncState->dbsCloner.getStatus().isOK()) {
-            // TODO: Initial sync failed
-        } else {
-            if (!_lastTimestampApplied.isNull() &&
-                _lastTimestampApplied >= _initialSyncState->stopTimestamp) {
-                invariant(_initialSyncState->finishEvent.isValid());
-                log() << "Applier done, initial sync done, end timestamp: "
-                      << _initialSyncState->stopTimestamp
-                      << " , last applier: " << _lastTimestampApplied;
-                _setState_inlock(DataReplicatorState::Uninitialized);
-                _initialSyncState->setStatus(Status::OK());
-                _exec->signalEvent(_initialSyncState->finishEvent);
-            } else {
-                // Run steady state events to fetch/apply.
-                _doNextActions_Steady_inlock();
-            }
-        }
+    if (_initialSyncState->dbsCloner->isActive() ||
+        !_initialSyncState->dbsCloner->getStatus().isOK()) {
+        return;
     }
-}
 
-void DataReplicator::_doNextActions_Rollback_inlock() {
-    auto s = _ensureGoodSyncSource_inlock();
-    if (!s.isOK()) {
-        warning() << "Valid sync source unavailable for rollback: " << s;
+    // The DatabasesCloner has completed so make sure we apply far enough to be consistent.
+    const auto lastAppliedTS = _lastApplied.opTime.getTimestamp();
+    if (!lastAppliedTS.isNull() && lastAppliedTS >= _initialSyncState->stopTimestamp) {
+        invariant(_initialSyncState->finishEvent.isValid());
+        invariant(_initialSyncState->status.isOK());
+        _setState_inlock(DataReplicatorState::Uninitialized);
+        _exec->signalEvent(_initialSyncState->finishEvent);
+    } else {
+        // Run steady state events to fetch/apply.
+        _doNextActions_Steady_inlock();
     }
-    _doNextActions_Steady_inlock();
-    // TODO: check rollback state and do next actions
-    // move from rollback phase to rollback phase via scheduled work in exec
 }
 
 void DataReplicator::_doNextActions_Steady_inlock() {
     // Check sync source is still good.
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
+        _syncSource =
+            _opts.syncSourceSelector->chooseNewSyncSource(_lastFetched.opTime.getTimestamp());
     }
     if (_syncSource.empty()) {
+        log() << "_syncSource is empty so scheduling a retry in  " << _opts.syncSourceRetryWait;
         // No sync source, reschedule check
         Date_t when = _exec->now() + _opts.syncSourceRetryWait;
         // schedule self-callback w/executor
         // to try to get a new sync source in a bit
-        auto checkSyncSource = [this](const executor::TaskExecutor::CallbackArgs& cba) {
-            if (cba.status.code() == ErrorCodes::CallbackCanceled) {
+        auto scheduleResult = _exec->scheduleWorkAt(when, [this](const CallbackArgs& cbData) {
+            if (cbData.status == ErrorCodes::CallbackCanceled) {
                 return;
             }
             _doNextActions();
-        };
-        auto scheduleResult = _exec->scheduleWorkAt(when, checkSyncSource);
+        });
         if (!scheduleResult.isOK()) {
             severe() << "failed to schedule sync source refresh: " << scheduleResult.getStatus()
                      << ". stopping data replicator";
@@ -946,27 +947,35 @@ void DataReplicator::_doNextActions_Steady_inlock() {
         }
     } else if (!_fetcherPaused) {
         // Check if active fetch, if not start one
-        if (!_fetcher || !_fetcher->isActive()) {
-            _scheduleFetch_inlock();
+        if (!_oplogFetcher || !_oplogFetcher->isActive()) {
+            const auto scheduleStatus = _scheduleFetch_inlock();
+            if (!scheduleStatus.isOK() && scheduleStatus != ErrorCodes::ShutdownInProgress) {
+                error() << "Error scheduling fetcher '" << scheduleStatus << "'.";
+                _oplogFetcher.reset();
+                _scheduleDoNextActions();
+            }
         }
     }
 
     // Check if no active apply and ops to apply
-    if (!_applierActive && _oplogBuffer->getSize()) {
-        _scheduleApplyBatch_inlock();
-    }
-
-    // TODO(benety): Initialize from replica set config election timeout / 2.
-    Milliseconds keepAliveInterval(1000);
-    if (!_reporterPaused && (!_reporter || !_reporter->isActive()) && !_syncSource.empty()) {
-        _reporter.reset(new Reporter(
-            _exec, _opts.prepareReplSetUpdatePositionCommandFn, _syncSource, keepAliveInterval));
+    if (!_applier || !_applier->isActive()) {
+        if (_oplogBuffer && _oplogBuffer->getSize() > 0) {
+            const auto scheduleStatus = _scheduleApplyBatch_inlock();
+            if (!scheduleStatus.isOK()) {
+                if (scheduleStatus != ErrorCodes::ShutdownInProgress) {
+                    error() << "Error scheduling apply batch '" << scheduleStatus << "'.";
+                    _applier.reset();
+                    _scheduleDoNextActions();
+                }
+            }
+        } else {
+            LOG(3) << "Cannot apply a batch since we have nothing buffered.";
+        }
     }
 }
 
 StatusWith<Operations> DataReplicator::_getNextApplierBatch_inlock() {
     const int slaveDelaySecs = durationCount<Seconds>(_opts.getSlaveDelay());
-    const unsigned int slaveDelayBoundary = static_cast<unsigned int>(time(0) - slaveDelaySecs);
 
     size_t totalBytes = 0;
     Operations ops;
@@ -986,13 +995,14 @@ StatusWith<Operations> DataReplicator::_getNextApplierBatch_inlock() {
         // Check for ops that must be processed one at a time.
         if (entry.isCommand() ||
             // Index builds are achieved through the use of an insert op, not a command op.
-            // The following line is the same as what the insert code uses to detect an index build.
+            // The following line is the same as what the insert code uses to detect an index
+            // build.
             (entry.hasNamespace() && entry.getCollectionName() == "system.indexes")) {
             if (ops.empty()) {
                 // Apply commands one-at-a-time.
                 ops.push_back(std::move(entry));
                 invariant(_oplogBuffer->tryPop(txn.get(), &op));
-                dassert(ops.back().raw == op);
+                dassert(SimpleBSONObjComparator::kInstance.evaluate(ops.back().raw == op));
             }
 
             // Otherwise, apply what we have so far and come back for the command.
@@ -1003,7 +1013,7 @@ StatusWith<Operations> DataReplicator::_getNextApplierBatch_inlock() {
         if (entry.getVersion() != OplogEntry::kOplogVersion) {
             std::string message = str::stream()
                 << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
-                << entry.getVersion() << " in oplog entry: " << entry.raw;
+                << entry.getVersion() << " in oplog entry: " << redact(entry.raw);
             severe() << message;
             return {ErrorCodes::BadValue, message};
         }
@@ -1019,6 +1029,8 @@ StatusWith<Operations> DataReplicator::_getNextApplierBatch_inlock() {
         // Check slaveDelay boundary.
         if (slaveDelaySecs > 0) {
             const unsigned int opTimestampSecs = op["ts"].timestamp().getSecs();
+            const unsigned int slaveDelayBoundary =
+                static_cast<unsigned int>(time(0) - slaveDelaySecs);
 
             // Stop the batch as the lastOp is too new to be applied. If we continue
             // on, we can get ops that are way ahead of the delay and this will
@@ -1033,117 +1045,93 @@ StatusWith<Operations> DataReplicator::_getNextApplierBatch_inlock() {
         ops.push_back(std::move(entry));
         totalBytes += ops.back().raw.objsize();
         invariant(_oplogBuffer->tryPop(txn.get(), &op));
-        dassert(ops.back().raw == op);
+        dassert(SimpleBSONObjComparator::kInstance.evaluate(ops.back().raw == op));
     }
     return std::move(ops);
 }
 
-void DataReplicator::_onApplyBatchFinish(const CallbackArgs& cbData,
-                                         const TimestampStatus& ts,
-                                         const Operations& ops,
-                                         const size_t numApplied) {
-    if (ErrorCodes::CallbackCanceled == cbData.status) {
+void DataReplicator::_onApplyBatchFinish(const Status& status,
+                                         OpTimeWithHash lastApplied,
+                                         std::size_t numApplied) {
+    if (ErrorCodes::CallbackCanceled == status) {
         return;
     }
 
-    invariant(cbData.status.isOK());
     UniqueLock lk(_mutex);
+
+    // This might block in _shuttingDownApplier's destructor if it is still active here.
+    _shuttingDownApplier = std::move(_applier);
+
+    if (!status.isOK()) {
+        invariant(DataReplicatorState::InitialSync == _state);
+        error() << "Failed to apply batch due to '" << redact(status) << "'";
+        _initialSyncState->status = status;
+        _exec->signalEvent(_initialSyncState->finishEvent);
+        return;
+    }
+
+    auto fetchCount = _fetchCount.load();
+    if (fetchCount > 0) {
+        _initialSyncState->fetchedMissingDocs += fetchCount;
+        _fetchCount.store(0);
+        _onFetchMissingDocument_inlock(lastApplied, numApplied);
+        // TODO (SERVER-25662): Remove this line.
+        _applierPaused = true;
+        return;
+    }
+    // TODO (SERVER-25662): Remove this line.
+    _applierPaused = false;
+
+
     if (_initialSyncState) {
         _initialSyncState->appliedOps += numApplied;
     }
-    if (!ts.isOK()) {
-        _handleFailedApplyBatch(ts, ops);
-        return;
-    }
 
-    _lastTimestampApplied = ts.getValue();
+    _lastApplied = lastApplied;
     lk.unlock();
 
-    _opts.setMyLastOptime(OpTime(ts.getValue(), 0));
-
-    // TODO: move the reporter to the replication coordinator.
-    if (_reporter) {
-        _reporter->trigger();
-    }
+    _opts.setMyLastOptime(_lastApplied.opTime);
 
     _doNextActions();
 }
 
-void DataReplicator::_handleFailedApplyBatch(const TimestampStatus& ts, const Operations& ops) {
-    switch (_state) {
-        case DataReplicatorState::InitialSync:
-            // TODO: fetch missing doc, and retry.
-            _scheduleApplyAfterFetch(ops);
-            break;
-        case DataReplicatorState::Rollback:
-        // TODO: nothing?
-        default:
-            // fatal
-            fassert(28666, ts.getStatus());
-    }
+void DataReplicator::_onFetchMissingDocument_inlock(OpTimeWithHash lastApplied,
+                                                    std::size_t numApplied) {
+    _scheduleLastOplogEntryFetcher_inlock([this, lastApplied, numApplied](
+        const QueryResponseStatus& fetchResult, Fetcher::NextAction*, BSONObjBuilder*) {
+        auto&& lastOplogEntryOpTimeWithHashStatus = parseOpTimeWithHash(fetchResult);
+
+        if (!lastOplogEntryOpTimeWithHashStatus.isOK()) {
+            {
+                LockGuard lk(_mutex);
+                error() << "Failed to get new minValid from source " << _syncSource << " due to '"
+                        << redact(lastOplogEntryOpTimeWithHashStatus.getStatus()) << "'";
+                _initialSyncState->status = lastOplogEntryOpTimeWithHashStatus.getStatus();
+            }
+            _exec->signalEvent(_initialSyncState->finishEvent);
+            return;
+        }
+
+        const auto newOplogEnd =
+            lastOplogEntryOpTimeWithHashStatus.getValue().opTime.getTimestamp();
+        {
+            LockGuard lk(_mutex);
+            LOG(1) << "Pushing back minValid from " << _initialSyncState->stopTimestamp << " to "
+                   << newOplogEnd;
+            _initialSyncState->stopTimestamp = newOplogEnd;
+        }
+        _onApplyBatchFinish(Status::OK(), lastApplied, numApplied);
+    });
 }
 
-void DataReplicator::_scheduleApplyAfterFetch(const Operations& ops) {
-    ++_initialSyncState->fetchedMissingDocs;
-    // TODO: check collection.isCapped, like SyncTail::getMissingDoc
-    const BSONElement missingIdElem = ops.begin()->getIdElement();
-    const NamespaceString nss(ops.begin()->ns);
-    const BSONObj query = BSON("find" << nss.coll() << "filter" << missingIdElem.wrap());
-    _tmpFetcher = stdx::make_unique<Fetcher>(
-        _exec,
-        _syncSource,
-        nss.db().toString(),
-        query,
-        stdx::bind(&DataReplicator::_onMissingFetched, this, stdx::placeholders::_1, ops, nss));
-    Status s = _tmpFetcher->schedule();
-    if (!s.isOK()) {
-        // record error and take next step based on it.
-        _initialSyncState->setStatus(s);
+Status DataReplicator::_scheduleDoNextActions() {
+    auto status = _exec->scheduleWork([this](const CallbackArgs& cbData) {
+        if (cbData.status == ErrorCodes::CallbackCanceled) {
+            return;
+        }
         _doNextActions();
-    }
-}
-
-void DataReplicator::_onMissingFetched(const QueryResponseStatus& fetchResult,
-                                       const Operations& ops,
-                                       const NamespaceString nss) {
-    if (!fetchResult.isOK()) {
-        // TODO: do retries on network issues, like SyncTail::getMissingDoc
-        _initialSyncState->setStatus(fetchResult.getStatus());
-        _doNextActions();
-        return;
-    } else if (!fetchResult.getValue().documents.size()) {
-        // TODO: skip apply for this doc, like multiInitialSyncApply?
-        _initialSyncState->setStatus(
-            Status(ErrorCodes::InitialSyncFailure, "missing doc not found"));
-        _doNextActions();
-        return;
-    }
-
-    const BSONObj missingDoc = *fetchResult.getValue().documents.begin();
-    Status rs{Status::OK()};
-    auto s = _exec->scheduleDBWork(
-        ([&](const CallbackArgs& cd) { rs = _storage->insertMissingDoc(cd.txn, nss, missingDoc); }),
-        nss,
-        MODE_IX);
-    if (!s.isOK()) {
-        _initialSyncState->setStatus(s);
-        _doNextActions();
-        return;
-    }
-
-    _exec->wait(s.getValue());
-    if (!rs.isOK()) {
-        _initialSyncState->setStatus(rs);
-        _doNextActions();
-        return;
-    }
-
-    LockGuard lk(_mutex);
-    auto status = _scheduleApplyBatch_inlock(ops);
-    if (!status.isOK()) {
-        _initialSyncState->setStatus(status);
-        _exec->signalEvent(_initialSyncState->finishEvent);
-    }
+    });
+    return status.getStatus();
 }
 
 Status DataReplicator::_scheduleApplyBatch() {
@@ -1152,77 +1140,67 @@ Status DataReplicator::_scheduleApplyBatch() {
 }
 
 Status DataReplicator::_scheduleApplyBatch_inlock() {
-    if (!_applierPaused && !_applierActive) {
-        _applierActive = true;
-        auto batchStatus = _getNextApplierBatch_inlock();
-        if (!batchStatus.isOK()) {
-            return batchStatus.getStatus();
-        }
-        const Operations& ops = batchStatus.getValue();
-        if (ops.empty()) {
-            _applierActive = false;
-            auto status = _exec->scheduleWorkAt(_exec->now() + Seconds(1),
-                                                [this](const CallbackArgs&) { _doNextActions(); });
-            if (!status.isOK()) {
-                return status.getStatus();
-            }
-        }
-        invariant(!(_applier && _applier->isActive()));
-        return _scheduleApplyBatch_inlock(ops);
+    if (_applierPaused) {
+        return Status::OK();
     }
-    return Status::OK();
+
+    if (_applier && _applier->isActive()) {
+        return Status::OK();
+    }
+
+    // If the fail-point is active, delay the apply batch.
+    if (MONGO_FAIL_POINT(rsSyncApplyStop)) {
+        auto status = _exec->scheduleWorkAt(_exec->now() + Milliseconds(10),
+                                            [this](const CallbackArgs& cbData) {
+                                                if (cbData.status == ErrorCodes::CallbackCanceled) {
+                                                    return;
+                                                }
+                                                _doNextActions();
+                                            });
+        return status.getStatus();
+    }
+
+    auto batchStatus = _getNextApplierBatch_inlock();
+    if (!batchStatus.isOK()) {
+        warning() << "Failure creating next apply batch: " << redact(batchStatus.getStatus());
+        return batchStatus.getStatus();
+    }
+    const Operations& ops = batchStatus.getValue();
+    if (ops.empty()) {
+        return _scheduleDoNextActions();
+    }
+    return _scheduleApplyBatch_inlock(ops);
 }
 
 Status DataReplicator::_scheduleApplyBatch_inlock(const Operations& ops) {
-    MultiApplier::ApplyOperationFn applierFn;
-    if (_state == DataReplicatorState::Steady) {
-        applierFn = stdx::bind(&DataReplicatorExternalState::_multiSyncApply,
-                               _dataReplicatorExternalState.get(),
-                               stdx::placeholders::_1);
-    } else {
-        invariant(_state == DataReplicatorState::InitialSync);
-        // "_syncSource" has to be copied to stdx::bind result.
-        HostAndPort source = _syncSource;
-        applierFn = stdx::bind(&DataReplicatorExternalState::_multiInitialSyncApply,
-                               _dataReplicatorExternalState.get(),
-                               stdx::placeholders::_1,
-                               source);
-    }
-
+    invariant(_state == DataReplicatorState::InitialSync);
+    _fetchCount.store(0);
+    // "_syncSource" has to be copied to stdx::bind result.
+    HostAndPort source = _syncSource;
+    auto applierFn = stdx::bind(&DataReplicatorExternalState::_multiInitialSyncApply,
+                                _dataReplicatorExternalState.get(),
+                                stdx::placeholders::_1,
+                                source,
+                                &_fetchCount);
     auto multiApplyFn = stdx::bind(&DataReplicatorExternalState::_multiApply,
                                    _dataReplicatorExternalState.get(),
                                    stdx::placeholders::_1,
                                    stdx::placeholders::_2,
                                    stdx::placeholders::_3);
 
-    auto lambda = [this](const TimestampStatus& ts, const Operations& theOps) {
-        if (ErrorCodes::CallbackCanceled == ts) {
-            return;
-        }
-        CBHStatus status = _exec->scheduleWork(stdx::bind(&DataReplicator::_onApplyBatchFinish,
-                                                          this,
-                                                          stdx::placeholders::_1,
-                                                          ts,
-                                                          theOps,
-                                                          theOps.size()));
-        if (!status.isOK()) {
-            LockGuard lk(_mutex);
-            _initialSyncState->setStatus(status);
-            _exec->signalEvent(_initialSyncState->finishEvent);
-            return;
-        }
-        // block until callback done.
-        _exec->wait(status.getValue());
-    };
+    const auto lastEntry = ops.back().raw;
+    const auto opTimeWithHashStatus = parseOpTimeWithHash(lastEntry);
+    auto lastApplied = uassertStatusOK(opTimeWithHashStatus);
+    auto numApplied = ops.size();
+    auto lambda = stdx::bind(&DataReplicator::_onApplyBatchFinish,
+                             this,
+                             stdx::placeholders::_1,
+                             lastApplied,
+                             numApplied);
 
-    auto executor = _dataReplicatorExternalState->getTaskExecutor();
-    _applier = stdx::make_unique<MultiApplier>(executor, ops, applierFn, multiApplyFn, lambda);
-    return _applier->start();
-}
-
-Status DataReplicator::_scheduleFetch() {
-    LockGuard lk(_mutex);
-    return _scheduleFetch_inlock();
+    invariant(!(_applier && _applier->isActive()));
+    _applier = stdx::make_unique<MultiApplier>(_exec, ops, applierFn, multiApplyFn, lambda);
+    return _applier->startup();
 }
 
 void DataReplicator::_setState(const DataReplicatorState& newState) {
@@ -1232,70 +1210,61 @@ void DataReplicator::_setState(const DataReplicatorState& newState) {
 
 void DataReplicator::_setState_inlock(const DataReplicatorState& newState) {
     _state = newState;
-    _stateCondition.notify_all();
 }
 
 Status DataReplicator::_ensureGoodSyncSource_inlock() {
     if (_syncSource.empty()) {
-        _syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastTimestampFetched);
+        _syncSource =
+            _opts.syncSourceSelector->chooseNewSyncSource(_lastFetched.opTime.getTimestamp());
         if (!_syncSource.empty()) {
             return Status::OK();
         }
 
-        return Status{ErrorCodes::InvalidSyncSource, "No valid sync source."};
+        return Status{ErrorCodes::InvalidSyncSource,
+                      str::stream() << "No valid sync source available. Our last fetched optime: "
+                                    << _lastFetched.opTime.toString()};
     }
     return Status::OK();
 }
 
 Status DataReplicator::_scheduleFetch_inlock() {
-    if (!_fetcher) {
+    if (!_oplogFetcher) {
         if (!_ensureGoodSyncSource_inlock().isOK()) {
-            auto status = _exec->scheduleWork([this](const CallbackArgs&) { _doNextActions(); });
+            auto status = _scheduleDoNextActions();
             if (!status.isOK()) {
-                return status.getStatus();
+                return status;
             }
         }
 
-        const auto startOptime = _opts.getMyLastOptime();
-        // TODO: Read last applied hash from storage. See
-        // BackgroundSync::_readLastAppliedHash(OperationContex*).
-        long long startHash = 0LL;
-        const auto remoteOplogNS = _opts.remoteOplogNS;
+        invariant(DataReplicatorState::InitialSync == _state);
 
-        _fetcher = stdx::make_unique<OplogFetcher>(
+        const auto remoteOplogNS = _opts.remoteOplogNS;
+        _oplogFetcher = stdx::make_unique<OplogFetcher>(
             _exec,
-            OpTimeWithHash(startHash, startOptime),
+            _lastFetched,
             _syncSource,
             remoteOplogNS,
             uassertStatusOK(_dataReplicatorExternalState->getCurrentConfig()),
+            _opts.oplogFetcherMaxFetcherRestarts,
             _dataReplicatorExternalState.get(),
             stdx::bind(&DataReplicator::_enqueueDocuments,
                        this,
                        stdx::placeholders::_1,
                        stdx::placeholders::_2,
-                       stdx::placeholders::_3,
-                       stdx::placeholders::_4),
+                       stdx::placeholders::_3),
             stdx::bind(&DataReplicator::_onOplogFetchFinish,
                        this,
                        stdx::placeholders::_1,
                        stdx::placeholders::_2));
     }
-    if (!_fetcher->isActive()) {
-        Status status = _fetcher->startup();
+    if (!_oplogFetcher->isActive()) {
+        LOG(2) << "Starting OplogFetcher: " << _oplogFetcher->toString();
+        Status status = _oplogFetcher->startup();
         if (!status.isOK()) {
             return status;
         }
     }
     return Status::OK();
-}
-
-Status DataReplicator::_scheduleReport() {
-    // TODO
-    return Status::OK();
-}
-
-void DataReplicator::_changeStateIfNeeded() {
-    // TODO
 }
 
 Status DataReplicator::scheduleShutdown(OperationContext* txn) {
@@ -1307,18 +1276,17 @@ Status DataReplicator::scheduleShutdown(OperationContext* txn) {
     {
         LockGuard lk(_mutex);
         invariant(!_onShutdown.isValid());
+        _inShutdown = true;
         _onShutdown = eventStatus.getValue();
+        if (_initialSyncState) {
+            _initialSyncState->status = {ErrorCodes::ShutdownInProgress,
+                                         "Shutdown issued for the operation."};
+        }
         _cancelAllHandles_inlock();
-        _oplogBuffer->shutdown(txn);
-        _oplogBuffer.reset();
     }
 
     // Schedule _doNextActions in case nothing is active to trigger the _onShutdown event.
-    auto scheduleResult = _exec->scheduleWork([this](const CallbackArgs&) { _doNextActions(); });
-    if (scheduleResult.isOK()) {
-        return Status::OK();
-    }
-    return scheduleResult.getStatus();
+    return _scheduleDoNextActions();
 }
 
 void DataReplicator::waitForShutdown() {
@@ -1330,16 +1298,19 @@ void DataReplicator::waitForShutdown() {
     }
     _exec->waitForEvent(onShutdown);
     {
-        LockGuard lk(_mutex);
-        invariant(!_fetcher->isActive());
-        invariant(!_applierActive);
-        invariant(!_reporter->isActive());
+        UniqueLock lk(_mutex);
+        _waitOnAndResetAll_inlock(&lk);
+        _oplogBuffer.reset();
+        invariant(!_lastOplogEntryFetcher || !_lastOplogEntryFetcher->isActive());
+        invariant(!_oplogFetcher || !_oplogFetcher->isActive());
+        invariant(!_applier || !_applier->isActive());
     }
 }
 
 Status DataReplicator::_shutdown(OperationContext* txn) {
     auto status = scheduleShutdown(txn);
     if (status.isOK()) {
+        log() << "Waiting for shutdown of DataReplicator.";
         waitForShutdown();
     }
     return status;
@@ -1347,11 +1318,18 @@ Status DataReplicator::_shutdown(OperationContext* txn) {
 
 void DataReplicator::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
                                        Fetcher::Documents::const_iterator end,
-                                       const OplogFetcher::DocumentsInfo& info,
-                                       Milliseconds getMoreElapsed) {
+                                       const OplogFetcher::DocumentsInfo& info) {
     if (info.toApplyDocumentCount == 0) {
         return;
     }
+
+    {
+        LockGuard lk{_mutex};
+        if (_inShutdown) {
+            return;
+        }
+    }
+    invariant(_oplogBuffer);
 
     // Wait for enough space.
     // Gets unblocked on shutdown.
@@ -1362,89 +1340,83 @@ void DataReplicator::_enqueueDocuments(Fetcher::Documents::const_iterator begin,
     }
 
     // Buffer docs for later application.
-    fassert(40143, _oplogBuffer->pushAllNonBlocking(makeOpCtx().get(), begin, end));
+    _oplogBuffer->pushAllNonBlocking(makeOpCtx().get(), begin, end);
 
-    _lastTimestampFetched = info.lastDocument.opTime.getTimestamp();
+    _lastFetched = info.lastDocument;
 
-    // TODO: updates metrics with "info" and "getMoreElapsed".
+    // TODO: updates metrics with "info".
 
     _doNextActions();
 }
 
 void DataReplicator::_onOplogFetchFinish(const Status& status, const OpTimeWithHash& lastFetched) {
+    _fetcherPaused = true;
+    log() << "Finished fetching oplog during initial sync: " << redact(status)
+          << ". Last fetched optime and hash: " << lastFetched;
     if (status.code() == ErrorCodes::CallbackCanceled) {
         return;
     } else if (status.isOK()) {
-        _lastTimestampFetched = lastFetched.opTime.getTimestamp();
-
-        // TODO: create new fetcher?, with new query from where we left off -- d'tor fetcher
+        LockGuard lk(_mutex);
+        _lastFetched = lastFetched;
     } else {
         invariant(!status.isOK());
-        // Got an error, now decide what to do...
-        switch (status.code()) {
-            case ErrorCodes::OplogStartMissing:
-            case ErrorCodes::RemoteOplogStale: {
-                _setState(DataReplicatorState::Rollback);
-                // possible rollback
-                auto scheduleResult = _exec->scheduleWork(
-                    stdx::bind(&DataReplicator::_rollbackOperations, this, stdx::placeholders::_1));
-                if (!scheduleResult.isOK()) {
-                    error() << "Failed to schedule rollback work: " << scheduleResult.getStatus();
-                    _setState_inlock(DataReplicatorState::Uninitialized);
-                    return;
-                }
-                LockGuard lk(_mutex);
-                _applierPaused = true;
-                _fetcherPaused = true;
-                _reporterPaused = true;
-                break;
-            }
-            default: {
-                Date_t until{_exec->now() +
-                             _opts.blacklistSyncSourcePenaltyForNetworkConnectionError};
-                _opts.syncSourceSelector->blacklistSyncSource(_syncSource, until);
-                LockGuard lk(_mutex);
-                _syncSource = HostAndPort();
-            }
-        }
+        invariant(_state == DataReplicatorState::InitialSync);
+        // Do not change sync source, just log.
+        error() << "Error fetching oplog during initial sync: " << redact(status);
+        LockGuard lk(_mutex);
+        invariant(_initialSyncState);
+        _initialSyncState->status = status;
+        _exec->signalEvent(_initialSyncState->finishEvent);
+        return;
     }
 
     _doNextActions();
 }
 
-void DataReplicator::_rollbackOperations(const CallbackArgs& cbData) {
-    if (cbData.status.code() == ErrorCodes::CallbackCanceled) {
-        return;
-    }
+std::string DataReplicator::Stats::toString() const {
+    return toBSON().toString();
+}
 
-    OpTime lastOpTimeWritten(getLastTimestampApplied(), OpTime::kInitialTerm);
-    HostAndPort syncSource = getSyncSource();
-    auto rollbackStatus = _opts.rollbackFn(makeOpCtx().get(), lastOpTimeWritten, syncSource);
-    if (!rollbackStatus.isOK()) {
-        error() << "Failed rollback: " << rollbackStatus;
-        Date_t until{_exec->now() + _opts.blacklistSyncSourcePenaltyForOplogStartMissing};
-        _opts.syncSourceSelector->blacklistSyncSource(_syncSource, until);
-        LockGuard lk(_mutex);
-        _syncSource = HostAndPort();
-        _fetcher.reset();
-        _fetcherPaused = false;
-    } else {
-        // Go back to steady sync after a successful rollback.
-        auto s = _opts.setFollowerMode(MemberState::RS_SECONDARY);
-        if (!s) {
-            error() << "Failed to transition to SECONDARY after rolling back from sync source: "
-                    << _syncSource.toString();
+BSONObj DataReplicator::Stats::toBSON() const {
+    BSONObjBuilder bob;
+    append(&bob);
+    return bob.obj();
+}
+
+void DataReplicator::Stats::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("failedInitialSyncAttempts", failedInitialSyncAttempts);
+    builder->appendNumber("maxFailedInitialSyncAttempts", maxFailedInitialSyncAttempts);
+    if (initialSyncStart != Date_t()) {
+        builder->appendDate("initialSyncStart", initialSyncStart);
+        if (initialSyncEnd != Date_t()) {
+            builder->appendDate("initialSyncEnd", initialSyncEnd);
+            auto elapsed = initialSyncEnd - initialSyncStart;
+            long long elapsedMillis = duration_cast<Milliseconds>(elapsed).count();
+            builder->appendNumber("initialSyncElapsedMillis", elapsedMillis);
         }
-        // TODO: cleanup state/restart -- set _lastApplied, and other stuff
-        LockGuard lk(_mutex);
-        _applierPaused = false;
-        _fetcherPaused = false;
-        _reporterPaused = false;
-        _setState_inlock(DataReplicatorState::Steady);
     }
+    BSONArrayBuilder arrBuilder(builder->subarrayStart("initialSyncAttempts"));
+    for (unsigned int i = 0; i < initialSyncAttemptInfos.size(); ++i) {
+        arrBuilder.append(initialSyncAttemptInfos[i].toBSON());
+    }
+    arrBuilder.doneFast();
+}
 
-    _doNextActions();
-};
+std::string DataReplicator::InitialSyncAttemptInfo::toString() const {
+    return toBSON().toString();
+}
+
+BSONObj DataReplicator::InitialSyncAttemptInfo::toBSON() const {
+    BSONObjBuilder bob;
+    append(&bob);
+    return bob.obj();
+}
+
+void DataReplicator::InitialSyncAttemptInfo::append(BSONObjBuilder* builder) const {
+    builder->appendNumber("durationMillis", durationMillis);
+    builder->append("status", status.toString());
+    builder->append("syncSource", syncSource.toString());
+}
 
 }  // namespace repl
 }  // namespace mongo

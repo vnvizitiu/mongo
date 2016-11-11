@@ -31,29 +31,20 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/intrusive_ptr.hpp>
-#include <unordered_set>
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/summation.h"
 
 namespace mongo {
-/**
- * Registers an Accumulator to have the name 'key'. When an accumulator with name '$key' is found
- * during parsing of a $group stage, 'factory' will be called to construct the Accumulator.
- *
- * As an example, if your accumulator looks like {"$foo": <args>}, with a factory method 'create',
- * you would add this line:
- * REGISTER_EXPRESSION(foo, AccumulatorFoo::create);
- */
-#define REGISTER_ACCUMULATOR(key, factory)                                     \
-    MONGO_INITIALIZER(addToAccumulatorFactoryMap_##key)(InitializerContext*) { \
-        Accumulator::registerAccumulator("$" #key, (factory));                 \
-        return Status::OK();                                                   \
-    }
 
 class Accumulator : public RefCountable {
 public:
@@ -84,21 +75,6 @@ public:
     /// Reset this accumulator to a fresh state ready to receive input.
     virtual void reset() = 0;
 
-    /**
-     * Registers an Accumulator with a parsing function, so that when an accumulator with the given
-     * name is encountered during parsing of the $group stage, it will call 'factory' to construct
-     * that Accumulator.
-     *
-     * DO NOT call this method directly. Instead, use the REGISTER_ACCUMULATOR macro defined in this
-     * file.
-     */
-    static void registerAccumulator(std::string name, Factory factory);
-
-    /**
-     * Retrieves the Factory for the accumulator specified by the given name, and raises an error if
-     * there is no such Accumulator registered.
-     */
-    static Factory getFactory(StringData name);
 
     virtual bool isAssociative() const {
         return false;
@@ -108,12 +84,35 @@ public:
         return false;
     }
 
+    /**
+     * Injects the ExpressionContext so that it may be used during evaluation of the Accumulator.
+     * Construction of accumulators is done at parse time, but the ExpressionContext isn't finalized
+     * until later, at which point it is injected using this method.
+     */
+    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+        _expCtx = expCtx;
+        doInjectExpressionContext();
+    }
+
 protected:
     /// Update subclass's internal state based on input
     virtual void processInternal(const Value& input, bool merging) = 0;
 
+    /**
+     * Accumulators which need to update their internal state when attaching to a new
+     * ExpressionContext should override this method.
+     */
+    virtual void doInjectExpressionContext() {}
+
+    const boost::intrusive_ptr<ExpressionContext>& getExpressionContext() const {
+        return _expCtx;
+    }
+
     /// subclasses are expected to update this as necessary
     int _memUsageBytes = 0;
+
+private:
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
 
@@ -136,9 +135,13 @@ public:
         return true;
     }
 
+    void doInjectExpressionContext() final;
+
 private:
-    typedef std::unordered_set<Value, Value::Hash> SetType;
-    SetType set;
+    // We use boost::optional to defer initialization until the ExpressionContext containing the
+    // correct comparator is injected, since this set must use the comparator's definition of
+    // equality.
+    boost::optional<ValueUnorderedSet> _set;
 };
 
 

@@ -45,8 +45,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/logger/console_appender.h"
-#include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -456,7 +454,9 @@ Status addMongodOptions(moe::OptionSection* options) {
                            moe::Switch,
                            "declare this is a shard db of a cluster; default port 27018")
         .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("configsvr");
+        .incompatibleWith("configsvr")
+        .incompatibleWith("master")
+        .incompatibleWith("slave");
 
     sharding_options
         .addOptionChaining(
@@ -580,24 +580,16 @@ void printMongodHelp(const moe::OptionSection& options) {
 namespace {
 void sysRuntimeInfo() {
 #if defined(_SC_PAGE_SIZE)
-    log() << "  page size: " << (int)sysconf(_SC_PAGE_SIZE) << endl;
+    log() << "  page size: " << (int)sysconf(_SC_PAGE_SIZE);
 #endif
 #if defined(_SC_PHYS_PAGES)
-    log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES) << endl;
+    log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES);
 #endif
 #if defined(_SC_AVPHYS_PAGES)
-    log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES) << endl;
+    log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES);
 #endif
 }
 }  // namespace
-
-void setPlainConsoleLogger() {
-    logger::LogManager* manager = logger::globalLogManager();
-    manager->getGlobalDomain()->clearAppenders();
-    manager->getGlobalDomain()->attachAppender(logger::MessageLogDomain::AppenderAutoPtr(
-        new logger::ConsoleAppender<logger::MessageEventEphemeral>(
-            new logger::MessageEventUnadornedEncoder)));
-}
 
 bool handlePreValidationMongodOptions(const moe::Environment& params,
                                       const std::vector<std::string>& args) {
@@ -607,8 +599,9 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
         setPlainConsoleLogger();
-        log() << mongodVersion() << endl;
-        printBuildInfo();
+        auto&& vii = VersionInfoInterface::instance();
+        log() << mongodVersion(vii);
+        vii.logBuildInfo();
         return false;
     }
     if (params.count("sysinfo") && params["sysinfo"].as<bool>() == true) {
@@ -671,8 +664,8 @@ Status validateMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.queryableBackupMode")) {
         // Command line options that are disallowed when --queryableBackupMode is specified.
-        for (const auto& disallowedOption : {"replSet",
-                                             "configSvr",
+        for (const auto& disallowedOption : {"replication.replSet",
+                                             "configsvr",
                                              "upgrade",
                                              "repair",
                                              "profile",
@@ -681,14 +674,11 @@ Status validateMongodOptions(const moe::Environment& params) {
                                              "source",
                                              "only",
                                              "slavedelay",
-                                             "journal",
-                                             "storage.journal.enabled",
-                                             "dur",
                                              "autoresync",
                                              "fastsync"}) {
             if (params.count(disallowedOption)) {
                 return Status(ErrorCodes::BadValue,
-                              str::stream() << "Cannot specify both --queryableBackupMode and --"
+                              str::stream() << "Cannot specify both queryable backup mode and "
                                             << disallowedOption);
             }
         }
@@ -992,8 +982,8 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
     return Status::OK();
 }
 
-Status storeMongodOptions(const moe::Environment& params, const std::vector<std::string>& args) {
-    Status ret = storeServerOptions(params, args);
+Status storeMongodOptions(const moe::Environment& params) {
+    Status ret = storeServerOptions(params);
     if (!ret.isOK()) {
         return ret;
     }
@@ -1297,6 +1287,16 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
                       "****");
     }
 
+#ifdef _WIN32
+    // If dbPath is a default value, prepend with drive name so log entries are explicit
+    // We must resolve the dbpath before it stored in repairPath in the default case.
+    if (storageGlobalParams.dbpath == storageGlobalParams.kDefaultDbPath ||
+        storageGlobalParams.dbpath == storageGlobalParams.kDefaultConfigDbPath) {
+        boost::filesystem::path currentPath = boost::filesystem::current_path();
+        storageGlobalParams.dbpath = currentPath.root_name().string() + storageGlobalParams.dbpath;
+    }
+#endif
+
     // needs to be after things like --configsvr parsing, thus here.
     if (params.count("storage.repairPath")) {
         storageGlobalParams.repairpath = params["storage.repairPath"].as<string>();
@@ -1322,18 +1322,9 @@ Status storeMongodOptions(const moe::Environment& params, const std::vector<std:
         // trying to make this stand out more like startup warnings
         log() << endl;
         warning() << "32-bit servers don't have journaling enabled by default. "
-                  << "Please use --journal if you want durability." << endl;
+                  << "Please use --journal if you want durability.";
         log() << endl;
     }
-
-#ifdef _WIN32
-    // If dbPath is a default value, prepend with drive name so log entries are explicit
-    if (storageGlobalParams.dbpath == storageGlobalParams.kDefaultDbPath ||
-        storageGlobalParams.dbpath == storageGlobalParams.kDefaultConfigDbPath) {
-        boost::filesystem::path currentPath = boost::filesystem::current_path();
-        storageGlobalParams.dbpath = currentPath.root_name().string() + storageGlobalParams.dbpath;
-    }
-#endif
 
     setGlobalReplSettings(replSettings);
     return Status::OK();

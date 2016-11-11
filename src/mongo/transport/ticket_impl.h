@@ -28,7 +28,9 @@
 
 #pragma once
 
-#include "mongo/transport/session.h"
+#include "mongo/base/disallow_copying.h"
+#include "mongo/transport/session_id.h"
+#include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -43,12 +45,7 @@ class TicketImpl {
     MONGO_DISALLOW_COPYING(TicketImpl);
 
 public:
-    using SessionId = Session::SessionId;
-
     virtual ~TicketImpl() = default;
-
-    TicketImpl(TicketImpl&&) = default;
-    TicketImpl& operator=(TicketImpl&&) = default;
 
     /**
      * Return this ticket's session id.

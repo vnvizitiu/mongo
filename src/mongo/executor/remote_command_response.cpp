@@ -30,17 +30,65 @@
 
 #include "mongo/executor/remote_command_response.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace executor {
 
+RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code, std::string reason)
+    : status(code, reason){};
+
+RemoteCommandResponse::RemoteCommandResponse(ErrorCodes::Error code,
+                                             std::string reason,
+                                             Milliseconds millis)
+    : elapsedMillis(millis), status(code, reason) {}
+
+RemoteCommandResponse::RemoteCommandResponse(Status s) : status(std::move(s)) {
+    invariant(!isOK());
+};
+
+RemoteCommandResponse::RemoteCommandResponse(Status s, Milliseconds millis)
+    : elapsedMillis(millis), status(std::move(s)) {
+    invariant(!isOK());
+};
+
+RemoteCommandResponse::RemoteCommandResponse(BSONObj dataObj,
+                                             BSONObj metadataObj,
+                                             Milliseconds millis)
+    : data(std::move(dataObj)), metadata(std::move(metadataObj)), elapsedMillis(millis) {
+    // The buffer backing the default empty BSONObj has static duration so it is effectively
+    // owned.
+    invariant(data.isOwned() || data.objdata() == BSONObj().objdata());
+    invariant(metadata.isOwned() || metadata.objdata() == BSONObj().objdata());
+};
+
+RemoteCommandResponse::RemoteCommandResponse(Message messageArg,
+                                             BSONObj dataObj,
+                                             BSONObj metadataObj,
+                                             Milliseconds millis)
+    : message(std::make_shared<const Message>(std::move(messageArg))),
+      data(std::move(dataObj)),
+      metadata(std::move(metadataObj)),
+      elapsedMillis(millis) {
+    if (!data.isOwned()) {
+        data.shareOwnershipWith(message->sharedBuffer());
+    }
+    if (!metadata.isOwned()) {
+        metadata.shareOwnershipWith(message->sharedBuffer());
+    }
+}
+
 // TODO(amidvidy): we currently discard output docs when we use this constructor. We should
 // have RCR hold those too, but we need more machinery before that is possible.
 RemoteCommandResponse::RemoteCommandResponse(const rpc::ReplyInterface& rpcReply,
                                              Milliseconds millis)
     : RemoteCommandResponse(rpcReply.getCommandReply(), rpcReply.getMetadata(), std::move(millis)) {
+}
+
+bool RemoteCommandResponse::isOK() const {
+    return status.isOK();
 }
 
 std::string RemoteCommandResponse::toString() const {
@@ -52,7 +100,9 @@ bool RemoteCommandResponse::operator==(const RemoteCommandResponse& rhs) const {
     if (this == &rhs) {
         return true;
     }
-    return data == rhs.data && metadata == rhs.metadata && elapsedMillis == rhs.elapsedMillis;
+    SimpleBSONObjComparator bsonComparator;
+    return bsonComparator.evaluate(data == rhs.data) &&
+        bsonComparator.evaluate(metadata == rhs.metadata) && elapsedMillis == rhs.elapsedMillis;
 }
 
 bool RemoteCommandResponse::operator!=(const RemoteCommandResponse& rhs) const {

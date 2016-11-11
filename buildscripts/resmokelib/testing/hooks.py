@@ -10,6 +10,7 @@ import sys
 
 import bson
 import pymongo
+import random
 
 from . import fixtures
 from . import testcases
@@ -136,13 +137,16 @@ class JsCustomBehavior(CustomBehavior):
     def __init__(self, logger, fixture, js_filename, description, shell_options=None):
         CustomBehavior.__init__(self, logger, fixture, description)
         self.hook_test_case = testcases.JSTestCase(logger,
-                                              js_filename,
-                                              shell_options=shell_options,
-                                              test_kind="Hook")
+                                                   js_filename,
+                                                   shell_options=shell_options,
+                                                   test_kind="Hook")
+        self.test_case_is_configured = False
 
     def before_suite(self, test_report):
-        # Configure the test case after the fixture has been set up.
-        self.hook_test_case.configure(self.fixture)
+        if not self.test_case_is_configured:
+            # Configure the test case after the fixture has been set up.
+            self.hook_test_case.configure(self.fixture)
+            self.test_case_is_configured = True
 
     def after_test(self, test, test_report):
         description = "{0} after running '{1}'".format(self.description, test.short_name())
@@ -160,16 +164,209 @@ class JsCustomBehavior(CustomBehavior):
         finally:
             test_report.stopTest(self.hook_test_case)
 
+class BackgroundInitialSync(JsCustomBehavior):
+    """
+    After every test, this hook checks if a background node has finished initial sync and if so,
+    validates it, tears it down, and restarts it.
+
+    This test accepts a parameter 'n' that specifies a number of tests after which it will wait for
+    replication to finish before validating and restarting the initial sync node. It also accepts
+    a parameter 'use_resync' for whether to restart the initial sync node with resync or by
+    shutting it down and restarting it.
+
+    This requires the ReplicaSetFixture to be started with 'start_initial_sync_node=True'. If used
+    at the same time as CleanEveryN, the 'n' value passed to this hook should be equal to the 'n'
+    value for CleanEveryN.
+    """
+
+    DEFAULT_N = CleanEveryN.DEFAULT_N
+
+    def __init__(self, logger, fixture, use_resync=False, n=DEFAULT_N):
+        description = "Background Initial Sync"
+        js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+
+        self.use_resync = use_resync
+        self.n = n
+        self.tests_run = 0
+        self.random_restarts = 0
+
+
+    def after_test(self, test, test_report):
+        self.tests_run += 1
+        sync_node = self.fixture.get_initial_sync_node();
+        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+        description = "{0} after running '{1}'".format(self.description, test.short_name())
+
+        # Restarts initial sync by shutting down the node, clearing its data, and restarting it,
+        # or by calling resync if use_resync is specified.
+        def restart_init_sync():
+            if self.use_resync:
+                self.fixture.logger.info("Calling resync on initial sync node...")
+                cmd = bson.SON([("resync", 1), ("wait", 0)])
+                try:
+                    sync_node_conn.admin.command(cmd)
+                except pymongo.errors.OperationFailure as err:
+                    self.fixture.logger.exception("{0} failed".format(description))
+                    test_report.addFailure(self.hook_test_case, sys.exc_info())
+                    raise errors.TestFailure(err.args[0])
+            else:
+                # Tear down and restart the initial sync node to start initial sync again.
+                teardown_success = sync_node.teardown()
+
+                self.fixture.logger.info("Starting the initial sync node back up again...")
+                sync_node.setup()
+                sync_node.await_ready()
+                if not teardown_success:
+                    raise errors.TestFailure("%s did not exit cleanly" % (sync_node))
+
+        # If it's been 'n' tests so far, wait for the initial sync node to finish syncing.
+        if self.tests_run >= self.n:
+            self.tests_run = 0
+            self.fixture.logger.info(
+                "%d tests have been run against the fixture, waiting for initial sync"
+                " node to go into SECONDARY state",
+                self.tests_run)
+            cmd = bson.SON([("replSetTest", 1),
+                            ("waitForMemberState", 2),
+                            ("timeoutMillis", 20 * 60 * 1000)])
+            try:
+                sync_node_conn.admin.command(cmd)
+            except pymongo.errors.OperationFailure as err:
+                self.fixture.logger.exception("{0} failed".format(description))
+                test_report.addFailure(self.hook_test_case, sys.exc_info())
+                raise errors.TestFailure(err.args[0])
+
+        # Check if the initial sync node is in SECONDARY state. If it's been 'n' tests, then it
+        # should have waited to be in SECONDARY state and the test should be marked as a failure.
+        # Otherwise, we just skip the hook and will check again after the next test.
+        try:
+            state = sync_node_conn.admin.command("replSetGetStatus").get("myState")
+            if state != 2:
+                if self.tests_run == 0:
+                    msg = "Initial sync node did not catch up after waiting 20 minutes"
+                    self.fixture.logger.exception("{0} failed: {1}".format(description, msg))
+                    test_report.addFailure(self.hook_test_case, sys.exc_info())
+                    raise errors.TestFailure(msg)
+
+                self.fixture.logger.info(
+                    "Initial sync node is in state %d, not state SECONDARY (2)."
+                    " Skipping BackgroundInitialSync hook for %s",
+                    state,
+                    test.short_name())
+
+                # If we have not restarted initial sync since the last time we ran the data
+                # validation, and if we're using resync for restarts, restart initial sync with a
+                # 20% probability.
+                if self.random_restarts < 1 and self.use_resync and random.random() < 0.2:
+                    self.fixture.logger.info(
+                        "Calling resync randomly in the middle of initial sync")
+                    restart_init_sync()
+                    self.random_restarts += 1
+                return
+        except pymongo.errors.OperationFailure:
+            # replSetGetStatus can fail if the node is in STARTUP state. The node will soon go into
+            # STARTUP2 state and replSetGetStatus will succeed after the next test.
+            self.fixture.logger.info(
+                "replSetGetStatus call failed in BackgroundInitialSync hook, skipping hook for %s",
+                test.short_name())
+            return
+
+        self.random_restarts = 0
+
+        # We're in SECONDARY state so validate the data. If there's a failure restart the fixture
+        # so we don't get multiple occurrences of the same failure, and then rethrow the failure.
+        try:
+            JsCustomBehavior.after_test(self, test, test_report)
+        except errors.TestFailure as err:
+            self.fixture.logger.exception("{0} failed with {1}".format(description, err.args[0]))
+            restart_init_sync()
+            raise errors.TestFailure(err.args[0])
+
+        restart_init_sync()
+
+
+class IntermediateInitialSync(JsCustomBehavior):
+    """
+    This hook accepts a parameter 'n' that specifies a number of tests after which it will start up
+    a node to initial sync, wait for replication to finish, and then validate the data. It also
+    accepts a parameter 'use_resync' for whether to restart the initial sync node with resync or by
+    shutting it down and restarting it.
+
+    This requires the ReplicaSetFixture to be started with 'start_initial_sync_node=True'.
+    """
+
+    DEFAULT_N = CleanEveryN.DEFAULT_N
+
+    def __init__(self, logger, fixture, use_resync=False, n=DEFAULT_N):
+        description = "Intermediate Initial Sync"
+        js_filename = os.path.join("jstests", "hooks", "run_initial_sync_node_validation.js")
+        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+
+        self.use_resync = use_resync
+        self.n = n
+        self.tests_run = 0
+
+    def after_test(self, test, test_report):
+        self.tests_run += 1
+        # If we have not run 'n' tests yet, skip this hook.
+        if self.tests_run < self.n:
+            return
+        self.tests_run = 0
+
+        sync_node = self.fixture.get_initial_sync_node();
+        sync_node_conn = utils.new_mongo_client(port=sync_node.port)
+        description = "{0} after running '{1}'".format(self.description, test.short_name())
+
+        teardown_success = True
+        if self.use_resync:
+            self.fixture.logger.info("Calling resync on initial sync node...")
+            cmd = bson.SON([("resync", 1)])
+            try:
+                sync_node_conn.admin.command(cmd)
+            except pymongo.errors.OperationFailure as err:
+                self.fixture.logger.exception("{0} failed".format(description))
+                test_report.addFailure(self.hook_test_case, sys.exc_info())
+                raise errors.TestFailure(err.args[0])
+        else:
+            teardown_success = sync_node.teardown()
+
+            self.fixture.logger.info("Starting the initial sync node back up again...")
+            sync_node.setup()
+            sync_node.await_ready()
+
+        # Do initial sync round.
+        self.fixture.logger.info("Waiting for initial sync node to go into SECONDARY state")
+        cmd = bson.SON([("replSetTest", 1),
+                        ("waitForMemberState", 2),
+                        ("timeoutMillis", 20 * 60 * 1000)])
+        try:
+            sync_node_conn.admin.command(cmd)
+        except pymongo.errors.OperationFailure as err:
+            self.fixture.logger.exception("{0} failed".format(description))
+            test_report.addFailure(self.hook_test_case, sys.exc_info())
+            raise errors.TestFailure(err.args[0])
+
+        # Run data validation and dbhash checking.
+        JsCustomBehavior.after_test(self, test, test_report)
+
+        if not teardown_success:
+            raise errors.TestFailure("%s did not exit cleanly" % (sync_node))
 
 class ValidateCollections(JsCustomBehavior):
     """
     Runs full validation on all collections in all databases on every stand-alone
     node, primary replica-set node, or primary shard node.
     """
-    def __init__(self, logger, fixture):
+    def __init__(self, logger, fixture, shell_options=None):
         description = "Full collection validation"
         js_filename = os.path.join("jstests", "hooks", "run_validate_collections.js")
-        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
 
 class CheckReplDBHash(JsCustomBehavior):
@@ -177,509 +374,37 @@ class CheckReplDBHash(JsCustomBehavior):
     Checks that the dbhashes of all non-local databases and non-replicated system collections
     match on the primary and secondaries.
     """
-    def __init__(self, logger, fixture):
+    def __init__(self, logger, fixture, shell_options=None):
         description = "Check dbhashes of all replica set or master/slave members"
         js_filename = os.path.join("jstests", "hooks", "run_check_repl_dbhash.js")
-        JsCustomBehavior.__init__(self, logger, fixture, js_filename, description)
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
 
-# Old version of CheckReplDBHash used to ensure feature parity of new version.
-class CheckReplDBHashDeprecated(CustomBehavior):
+class CheckReplOplogs(JsCustomBehavior):
     """
-    Waits for replication after each test, then checks that the dbhahses
-    of all databases other than "local" match on the primary and all of
-    the secondaries. If any dbhashes do not match, logs information
-    about what was different (e.g. Different numbers of collections,
-    missing documents in a collection, mismatching documents, etc).
-
-    Compatible only with ReplFixture subclasses.
+    Checks that local.oplog.rs matches on the primary and secondaries.
     """
-
-    def __init__(self, logger, fixture):
-        if not isinstance(fixture, fixtures.ReplFixture):
-            raise TypeError("%s does not support replication" % (fixture.__class__.__name__))
-
-        description = "Check that replica-set nodes are consistent by using the dbHash command"
-        CustomBehavior.__init__(self, logger, fixture, description)
-
-        self.started = False
-        self.hook_test_case = testcases.TestCase(self.logger, "Hook", self.logger_name)
-
-    def after_test(self, test, test_report):
-        """
-        After each test, check that the dbhash of the test database is
-        the same on all nodes in the replica set or master/slave
-        fixture.
-        """
-
-        try:
-            if not self.started:
-                CustomBehavior.start_dynamic_test(self.hook_test_case, test_report)
-                self.started = True
-
-            # Wait until all operations have replicated.
-            self.fixture.await_repl()
-
-            success = True
-            sb = []  # String builder.
-
-            primary = self.fixture.get_primary()
-            primary_conn = utils.new_mongo_client(port=primary.port)
-
-            for secondary in self.fixture.get_secondaries():
-                read_preference = pymongo.ReadPreference.SECONDARY
-                secondary_conn = utils.new_mongo_client(port=secondary.port,
-                                                        read_preference=read_preference)
-                # Skip arbiters.
-                if secondary_conn.admin.command("isMaster").get("arbiterOnly", False):
-                    continue
-
-                all_matched = CheckReplDBHashDeprecated._check_all_db_hashes(primary_conn,
-                                                                             secondary_conn,
-                                                                             sb)
-                if not all_matched:
-                    sb.insert(0,
-                              "One or more databases were different between the primary on port %d"
-                              " and the secondary on port %d:"
-                              % (primary.port, secondary.port))
-
-                success = all_matched and success
-
-            if not success:
-                CheckReplDBHashDeprecated._dump_oplog(primary_conn, secondary_conn, sb)
-
-                # Adding failures to a TestReport requires traceback information, so we raise
-                # a 'self.hook_test_case.failureException' that we will catch ourselves.
-                self.hook_test_case.logger.info("\n    ".join(sb))
-                raise self.hook_test_case.failureException("The dbhashes did not match")
-        except self.hook_test_case.failureException as err:
-            self.hook_test_case.logger.exception("The dbhashes did not match.")
-            self.hook_test_case.return_code = 1
-            test_report.addFailure(self.hook_test_case, sys.exc_info())
-            test_report.stopTest(self.hook_test_case)
-            raise errors.ServerFailure(err.args[0])
-        except pymongo.errors.WTimeoutError:
-            self.hook_test_case.logger.exception("Awaiting replication timed out.")
-            self.hook_test_case.return_code = 2
-            test_report.addError(self.hook_test_case, sys.exc_info())
-            test_report.stopTest(self.hook_test_case)
-            raise errors.StopExecution("Awaiting replication timed out")
-
-    def after_suite(self, test_report):
-        """
-        If we get to this point, the #dbhash# test must have been
-        successful, so add it to the test report.
-        """
-
-        if self.started:
-            self.hook_test_case.logger.info("The dbhashes matched for all tests.")
-            self.hook_test_case.return_code = 0
-            test_report.addSuccess(self.hook_test_case)
-            # TestReport.stopTest() has already been called if there was a failure.
-            test_report.stopTest(self.hook_test_case)
-
-        self.started = False
-
-    @staticmethod
-    def _dump_oplog(primary_conn, secondary_conn, sb):
-
-        def dump_latest_docs(coll, limit=0):
-            docs = (doc for doc in coll.find().sort("$natural", pymongo.DESCENDING).limit(limit))
-            for doc in docs:
-                sb.append("    %s" % (doc))
-
-        LIMIT = 100
-        sb.append("Dumping the latest %d documents from the primary's oplog" % (LIMIT))
-        dump_latest_docs(primary_conn.local.oplog.rs, LIMIT)
-        sb.append("Dumping the latest %d documents from the secondary's oplog" % (LIMIT))
-        dump_latest_docs(secondary_conn.local.oplog.rs, LIMIT)
-
-    @staticmethod
-    def _check_all_db_hashes(primary_conn, secondary_conn, sb):
-        """
-        Returns true if for each non-local database, the dbhash command
-        returns the same MD5 hash on the primary as it does on the
-        secondary. Returns false otherwise.
-
-        Logs a message describing the differences if any database's
-        dbhash did not match.
-        """
-
-        # Overview of how we'll check that everything replicated correctly between these two nodes:
-        #
-        # - Check whether they have the same databases.
-        #     - If not, log which databases are missing where, and dump the contents of any that are
-        #       missing.
-        #
-        # - Check whether each database besides "local" gives the same md5 field as the result of
-        #   running the dbhash command.
-        #     - If not, check whether they have the same collections.
-        #         - If not, log which collections are missing where, and dump the contents of any
-        #           that are missing.
-        #     - If so, check that the hash of each non-capped collection matches.
-        #         - If any do not match, log the diff of the collection between the two nodes.
-
-        success = True
-
-        if not CheckReplDBHashDeprecated._check_dbs_present(primary_conn, secondary_conn, sb):
-            return False
-
-        for db_name in primary_conn.database_names():
-            if db_name == "local":
-                continue  # We don't expect this to match across different nodes.
-
-            matched = CheckReplDBHashDeprecated._check_db_hash(
-                primary_conn, secondary_conn, db_name, sb)
-            success = matched and success
-
-        return success
-
-    @staticmethod
-    def _check_dbs_present(primary_conn, secondary_conn, sb):
-        """
-        Returns true if the list of databases on the primary is
-        identical to the list of databases on the secondary, and false
-        otherwise.
-        """
-
-        success = True
-        primary_dbs = primary_conn.database_names()
-
-        # Can't run database_names() on secondary, so instead use the listDatabases command.
-        # TODO: Use database_names() once PYTHON-921 is resolved.
-        list_db_output = secondary_conn.admin.command("listDatabases")
-        secondary_dbs = [db["name"] for db in list_db_output["databases"]]
-
-        # There may be a difference in databases which is not considered an error, when
-        # the database only contains system collections. This difference is only logged
-        # when others are encountered, i.e., success = False.
-        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
-            set(primary_dbs), set(secondary_dbs), "database")
-
-        for missing_db in missing_on_secondary:
-            db = primary_conn[missing_db]
-            coll_names = db.collection_names()
-            non_system_colls = [name for name in coll_names if not name.startswith("system.")]
-
-            # It is only an error if there are any non-system collections in the database,
-            # otherwise it's not well defined whether they should exist or not.
-            if non_system_colls:
-                sb.append("Database %s present on primary but not on secondary." % (missing_db))
-                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
-                success = False
-
-        for missing_db in missing_on_primary:
-            db = secondary_conn[missing_db]
-
-            # Can't run collection_names() on secondary, so instead use the listCollections command.
-            # TODO: Always use collection_names() once PYTHON-921 is resolved. Then much of the
-            # logic that is duplicated here can be consolidated.
-            list_coll_output = db.command("listCollections")["cursor"]["firstBatch"]
-            coll_names = [coll["name"] for coll in list_coll_output]
-            non_system_colls = [name for name in coll_names if not name.startswith("system.")]
-
-            # It is only an error if there are any non-system collections in the database,
-            # otherwise it's not well defined if it should exist or not.
-            if non_system_colls:
-                sb.append("Database %s present on secondary but not on primary." % (missing_db))
-                CheckReplDBHashDeprecated._dump_all_collections(db, non_system_colls, sb)
-                success = False
-
-        return success
-
-    @staticmethod
-    def _check_db_hash(primary_conn, secondary_conn, db_name, sb):
-        """
-        Returns true if the dbhash for 'db_name' matches on the primary
-        and the secondary, and false otherwise.
-
-        Appends a message to 'sb' describing the differences if the
-        dbhashes do not match.
-        """
-
-        primary_hash = primary_conn[db_name].command("dbhash")
-        secondary_hash = secondary_conn[db_name].command("dbhash")
-
-        if primary_hash["md5"] == secondary_hash["md5"]:
-            return True
-
-        success = CheckReplDBHashDeprecated._check_dbs_eq(
-            primary_conn, secondary_conn, primary_hash, secondary_hash, db_name, sb)
-
-        if not success:
-            sb.append("Database %s has a different hash on the primary and the secondary"
-                      " ([ %s ] != [ %s ]):"
-                      % (db_name, primary_hash["md5"], secondary_hash["md5"]))
-
-        return success
-
-    @staticmethod
-    def _check_dbs_eq(primary_conn, secondary_conn, primary_hash, secondary_hash, db_name, sb):
-        """
-        Returns true if all non-capped collections had the same hash in
-        the dbhash response, and false otherwise.
-
-        Appends information to 'sb' about the differences between the
-        'db_name' database on the primary and the 'db_name' database on
-        the secondary, if any.
-        """
-
-        success = True
-
-        primary_db = primary_conn[db_name]
-        secondary_db = secondary_conn[db_name]
-
-        primary_coll_hashes = primary_hash["collections"]
-        secondary_coll_hashes = secondary_hash["collections"]
-
-        primary_coll_names = set(primary_coll_hashes.keys())
-        secondary_coll_names = set(secondary_coll_hashes.keys())
-
-        missing_on_primary, missing_on_secondary = CheckReplDBHashDeprecated._check_difference(
-            primary_coll_names, secondary_coll_names, "collection", sb=sb)
-
-        if missing_on_primary or missing_on_secondary:
-
-            # 'sb' already describes which collections are missing where.
-            for coll_name in missing_on_primary:
-                CheckReplDBHashDeprecated._dump_all_documents(secondary_db, coll_name, sb)
-            for coll_name in missing_on_secondary:
-                CheckReplDBHashDeprecated._dump_all_documents(primary_db, coll_name, sb)
-            return
-
-        for coll_name in primary_coll_names & secondary_coll_names:
-            primary_coll_hash = primary_coll_hashes[coll_name]
-            secondary_coll_hash = secondary_coll_hashes[coll_name]
-
-            if primary_coll_hash == secondary_coll_hash:
-                continue
-
-            # Ignore capped collections because they are not expected to match on all nodes.
-            if primary_db.command({"collStats": coll_name})["capped"]:
-                # Still fail if the collection is not capped on the secondary.
-                if not secondary_db.command({"collStats": coll_name})["capped"]:
-                    success = False
-                    sb.append("%s.%s collection is capped on primary but not on secondary."
-                              % (primary_db.name, coll_name))
-                sb.append("%s.%s collection is capped, ignoring." % (primary_db.name, coll_name))
-                continue
-            # Still fail if the collection is capped on the secondary, but not on the primary.
-            elif secondary_db.command({"collStats": coll_name})["capped"]:
-                success = False
-                sb.append("%s.%s collection is capped on secondary but not on primary."
-                          % (primary_db.name, coll_name))
-                continue
-
-            success = False
-            sb.append("Collection %s.%s has a different hash on the primary and the secondary"
-                      " ([ %s ] != [ %s ]):"
-                      % (db_name, coll_name, primary_coll_hash, secondary_coll_hash))
-            CheckReplDBHashDeprecated._check_colls_eq(primary_db, secondary_db, coll_name, sb)
-
-        if success:
-            sb.append("All collections that were expected to match did.")
-        return success
-
-    @staticmethod
-    def _check_colls_eq(primary_db, secondary_db, coll_name, sb):
-        """
-        Appends information to 'sb' about the differences or between
-        the 'coll_name' collection on the primary and the 'coll_name'
-        collection on the secondary, if any.
-        """
-
-        codec_options = bson.CodecOptions(document_class=TypeSensitiveSON)
-
-        primary_coll = primary_db.get_collection(coll_name, codec_options=codec_options)
-        secondary_coll = secondary_db.get_collection(coll_name, codec_options=codec_options)
-
-        primary_docs = CheckReplDBHashDeprecated._extract_documents(primary_coll)
-        secondary_docs = CheckReplDBHashDeprecated._extract_documents(secondary_coll)
-
-        CheckReplDBHashDeprecated._get_collection_diff(primary_docs, secondary_docs, sb)
-
-    @staticmethod
-    def _extract_documents(collection):
-        """
-        Returns a list of all documents in the collection, sorted by
-        their _id.
-        """
-
-        return [doc for doc in collection.find().sort("_id", pymongo.ASCENDING)]
-
-    @staticmethod
-    def _get_collection_diff(primary_docs, secondary_docs, sb):
-        """
-        Returns true if the documents in 'primary_docs' exactly match
-        the documents in 'secondary_docs', and false otherwise.
-
-        Appends information to 'sb' about what matched or did not match.
-        """
-
-        matched = True
-
-        # These need to be lists instead of sets because documents aren't hashable.
-        missing_on_primary = []
-        missing_on_secondary = []
-
-        p_idx = 0  # Keep track of our position in 'primary_docs'.
-        s_idx = 0  # Keep track of our position in 'secondary_docs'.
-
-        while p_idx < len(primary_docs) and s_idx < len(secondary_docs):
-            primary_doc = primary_docs[p_idx]
-            secondary_doc = secondary_docs[s_idx]
-
-            if primary_doc == secondary_doc:
-                p_idx += 1
-                s_idx += 1
-                continue
-
-            # We have mismatching documents.
-            matched = False
-
-            if primary_doc["_id"] == secondary_doc["_id"]:
-                sb.append("Mismatching document:")
-                sb.append("    primary:   %s" % (primary_doc))
-                sb.append("    secondary: %s" % (secondary_doc))
-                p_idx += 1
-                s_idx += 1
-
-            # One node was missing a document. Since the documents are sorted by _id, the doc with
-            # the smaller _id was the one that was skipped.
-            elif primary_doc["_id"] < secondary_doc["_id"]:
-                missing_on_secondary.append(primary_doc)
-
-                # Only move past the doc that we know was skipped.
-                p_idx += 1
-
-            else:  # primary_doc["_id"] > secondary_doc["_id"]
-                missing_on_primary.append(secondary_doc)
-
-                # Only move past the doc that we know was skipped.
-                s_idx += 1
-
-        # Check if there are any unmatched documents left.
-        while p_idx < len(primary_docs):
-            matched = False
-            missing_on_secondary.append(primary_docs[p_idx])
-            p_idx += 1
-        while s_idx < len(secondary_docs):
-            matched = False
-            missing_on_primary.append(secondary_docs[s_idx])
-            s_idx += 1
-
-        if not matched:
-            CheckReplDBHashDeprecated._append_differences(
-                missing_on_primary, missing_on_secondary, "document", sb)
-        else:
-            sb.append("All documents matched.")
-
-    @staticmethod
-    def _check_difference(primary_set, secondary_set, item_type_name, sb=None):
-        """
-        Returns true if the contents of 'primary_set' and
-        'secondary_set' are identical, and false otherwise. The sets
-        contain information about the primary and secondary,
-        respectively, e.g. the database names that exist on each node.
-
-        Appends information about anything that differed to 'sb'.
-        """
-
-        missing_on_primary = set()
-        missing_on_secondary = set()
-
-        for item in primary_set - secondary_set:
-            missing_on_secondary.add(item)
-
-        for item in secondary_set - primary_set:
-            missing_on_primary.add(item)
-
-        if sb is not None:
-            CheckReplDBHashDeprecated._append_differences(
-                missing_on_primary, missing_on_secondary, item_type_name, sb)
-
-        return (missing_on_primary, missing_on_secondary)
-
-    @staticmethod
-    def _append_differences(missing_on_primary, missing_on_secondary, item_type_name, sb):
-        """
-        Given two iterables representing items that were missing on the
-        primary or the secondary respectively, append the information
-        about which items were missing to 'sb', if any.
-        """
-
-        if missing_on_primary:
-            sb.append("The following %ss were present on the secondary, but not on the"
-                      " primary:" % (item_type_name))
-            for item in missing_on_primary:
-                sb.append(str(item))
-
-        if missing_on_secondary:
-            sb.append("The following %ss were present on the primary, but not on the"
-                      " secondary:" % (item_type_name))
-            for item in missing_on_secondary:
-                sb.append(str(item))
-
-    @staticmethod
-    def _dump_all_collections(database, coll_names, sb):
-        """
-        Appends the contents of each of the collections in 'coll_names'
-        to 'sb'.
-        """
-
-        if coll_names:
-            sb.append("Database %s contains the following collections: %s"
-                      % (database.name, coll_names))
-            for coll_name in coll_names:
-                CheckReplDBHashDeprecated._dump_all_documents(database, coll_name, sb)
-        else:
-            sb.append("No collections in database %s." % (database.name))
-
-    @staticmethod
-    def _dump_all_documents(database, coll_name, sb):
-        """
-        Appends the contents of 'coll_name' to 'sb'.
-        """
-
-        docs = CheckReplDBHashDeprecated._extract_documents(database[coll_name])
-        if docs:
-            sb.append("Documents in %s.%s:" % (database.name, coll_name))
-            for doc in docs:
-                sb.append("    %s" % (doc))
-        else:
-            sb.append("No documents in %s.%s." % (database.name, coll_name))
-
-class TypeSensitiveSON(bson.SON):
-    """
-    Extends bson.SON to perform additional type-checking of document values
-    to differentiate BSON types.
-    """
-
-    def items_with_types(self):
-        """
-        Returns a list of triples. Each triple consists of a field name, a
-        field value, and a field type for each field in the document.
-        """
-
-        return [(key, self[key], type(self[key])) for key in self]
-
-    def __eq__(self, other):
-        """
-        Comparison to another TypeSensitiveSON is order-sensitive and
-        type-sensitive while comparison to a regular dictionary ignores order
-        and type mismatches.
-        """
-
-        if isinstance(other, TypeSensitiveSON):
-            return (len(self) == len(other) and
-                    self.items_with_types() == other.items_with_types())
-
-        raise TypeError("TypeSensitiveSON objects cannot be compared to other types")
+    def __init__(self, logger, fixture, shell_options=None):
+        description = "Check oplogs of all replica set members"
+        js_filename = os.path.join("jstests", "hooks", "run_check_repl_oplogs.js")
+        JsCustomBehavior.__init__(self,
+                                  logger,
+                                  fixture,
+                                  js_filename,
+                                  description,
+                                  shell_options=shell_options)
 
 
 _CUSTOM_BEHAVIORS = {
     "CleanEveryN": CleanEveryN,
     "CheckReplDBHash": CheckReplDBHash,
-    "CheckReplDBHashDeprecated": CheckReplDBHashDeprecated,
+    "CheckReplOplogs": CheckReplOplogs,
     "ValidateCollections": ValidateCollections,
+    "IntermediateInitialSync": IntermediateInitialSync,
+    "BackgroundInitialSync": BackgroundInitialSync,
 }

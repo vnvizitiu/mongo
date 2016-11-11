@@ -19,8 +19,7 @@ load('jstests/multiVersion/libs/auth_helpers.js');
             rs1: {nodes: 3, settings: {chainingAllowed: false}}
         },
         configReplSetTestOptions: {settings: {chainingAllowed: false}},
-        mongos: 1,
-        other: {mongosOptions: {noAutoSplit: ""}}
+        mongos: 1
     });
 
     var mongos = st.s;
@@ -264,7 +263,7 @@ load('jstests/multiVersion/libs/auth_helpers.js');
         setupFunc();
         // Stop replication at all config server secondaries and all shard secondaries.
         stopReplicationOnSecondariesOfAllShards(st);
-        st.configRS.awaitReplication(30000);
+        st.configRS.awaitReplication();
         stopReplicationOnSecondaries(st.configRS);
 
         // Command should fail after two config servers are not replicating.

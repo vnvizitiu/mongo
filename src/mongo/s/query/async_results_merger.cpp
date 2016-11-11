@@ -114,6 +114,11 @@ Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     return Status::OK();
 }
 
+void AsyncResultsMerger::setOperationContext(OperationContext* txn) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _params.txn = txn;
+}
+
 bool AsyncResultsMerger::ready() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return ready_inlock();
@@ -177,7 +182,7 @@ bool AsyncResultsMerger::readyUnsorted_inlock() {
     return allExhausted;
 }
 
-StatusWith<boost::optional<BSONObj>> AsyncResultsMerger::nextReady() {
+StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     dassert(ready_inlock());
     if (_lifecycleState != kAlive) {
@@ -190,19 +195,19 @@ StatusWith<boost::optional<BSONObj>> AsyncResultsMerger::nextReady() {
 
     if (_eofNext) {
         _eofNext = false;
-        return {boost::none};
+        return {ClusterQueryResult()};
     }
 
     const bool hasSort = !_params.sort.isEmpty();
     return hasSort ? nextReadySorted() : nextReadyUnsorted();
 }
 
-boost::optional<BSONObj> AsyncResultsMerger::nextReadySorted() {
+ClusterQueryResult AsyncResultsMerger::nextReadySorted() {
     // Tailable cursors cannot have a sort.
     invariant(!_params.isTailable);
 
     if (_mergeQueue.empty()) {
-        return boost::none;
+        return {};
     }
 
     size_t smallestRemote = _mergeQueue.top();
@@ -211,7 +216,7 @@ boost::optional<BSONObj> AsyncResultsMerger::nextReadySorted() {
     invariant(!_remotes[smallestRemote].docBuffer.empty());
     invariant(_remotes[smallestRemote].status.isOK());
 
-    BSONObj front = _remotes[smallestRemote].docBuffer.front();
+    ClusterQueryResult front = _remotes[smallestRemote].docBuffer.front();
     _remotes[smallestRemote].docBuffer.pop();
 
     // Re-populate the merging queue with the next result from 'smallestRemote', if it has a
@@ -223,14 +228,14 @@ boost::optional<BSONObj> AsyncResultsMerger::nextReadySorted() {
     return front;
 }
 
-boost::optional<BSONObj> AsyncResultsMerger::nextReadyUnsorted() {
+ClusterQueryResult AsyncResultsMerger::nextReadyUnsorted() {
     size_t remotesAttempted = 0;
     while (remotesAttempted < _remotes.size()) {
         // It is illegal to call this method if there is an error received from any shard.
         invariant(_remotes[_gettingFromRemote].status.isOK());
 
         if (_remotes[_gettingFromRemote].hasNext()) {
-            BSONObj front = _remotes[_gettingFromRemote].docBuffer.front();
+            ClusterQueryResult front = _remotes[_gettingFromRemote].docBuffer.front();
             _remotes[_gettingFromRemote].docBuffer.pop();
 
             if (_params.isTailable && !_remotes[_gettingFromRemote].hasNext()) {
@@ -250,7 +255,7 @@ boost::optional<BSONObj> AsyncResultsMerger::nextReadyUnsorted() {
         }
     }
 
-    return boost::none;
+    return {};
 }
 
 Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
@@ -290,8 +295,11 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
         cmdObj = *remote.initialCmdObj;
     }
 
-    executor::RemoteCommandRequest request(
-        remote.getTargetHost(), _params.nsString.db().toString(), cmdObj, _metadataObj);
+    executor::RemoteCommandRequest request(remote.getTargetHost(),
+                                           _params.nsString.db().toString(),
+                                           cmdObj,
+                                           _metadataObj,
+                                           _params.txn);
 
     auto callbackStatus = _executor->scheduleRemoteCommand(
         request,
@@ -305,6 +313,14 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
     return Status::OK();
 }
 
+/*
+ * Note: When nextEvent() is called to do retries, only the remotes with retriable errors will
+ * be rescheduled because:
+ *
+ * 1. Other pending remotes still have callback assigned to them.
+ * 2. Remotes that already has some result will have a non-empty buffer.
+ * 3. Remotes that reached maximum retries will be in 'exhausted' state.
+ */
 StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
@@ -395,7 +411,7 @@ void AsyncResultsMerger::handleBatchResponse(
         // Make a best effort to parse the response and retrieve the cursor id. We need the cursor
         // id in order to issue a killCursors command against it.
         if (cbData.response.isOK()) {
-            auto cursorResponse = parseCursorResponse(cbData.response.getValue().data, remote);
+            auto cursorResponse = parseCursorResponse(cbData.response.data, remote);
             if (cursorResponse.isOK()) {
                 remote.cursorId = cursorResponse.getValue().getCursorId();
             }
@@ -424,10 +440,42 @@ void AsyncResultsMerger::handleBatchResponse(
     ScopeGuard signaller = MakeGuard(&AsyncResultsMerger::signalCurrentEventIfReady_inlock, this);
 
     StatusWith<CursorResponse> cursorResponseStatus(
-        cbData.response.isOK() ? parseCursorResponse(cbData.response.getValue().data, remote)
-                               : cbData.response.getStatus());
+        cbData.response.isOK() ? parseCursorResponse(cbData.response.data, remote)
+                               : cbData.response.status);
 
     if (!cursorResponseStatus.isOK()) {
+        // In the case a read is performed against a view, the shard primary can return an error
+        // indicating that the underlying collection may be sharded. When this occurs the return
+        // message will include an expanded view definition and collection namespace which we need
+        // to store. This allows for a second attempt at the read directly against the underlying
+        // collection.
+        if (cursorResponseStatus.getStatus() ==
+            ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
+            auto& responseObj = cbData.response.data;
+            if (!responseObj.hasField("resolvedView")) {
+                remote.status = Status(ErrorCodes::InternalError,
+                                       str::stream() << "Missing field 'resolvedView' in document: "
+                                                     << responseObj);
+                return;
+            }
+
+            auto resolvedViewObj = responseObj.getObjectField("resolvedView");
+            if (resolvedViewObj.isEmpty()) {
+                remote.status = Status(ErrorCodes::InternalError,
+                                       str::stream() << "Field 'resolvedView' must be an object: "
+                                                     << responseObj);
+                return;
+            }
+
+            ClusterQueryResult result;
+            result.setViewDefinition(resolvedViewObj.getOwned());
+
+            remote.docBuffer.push(result);
+            remote.cursorId = 0;
+            remote.status = Status::OK();
+            return;
+        }
+
         auto shard = remote.getShard();
         if (!shard) {
             remote.status = Status(cursorResponseStatus.getStatus().code(),
@@ -437,29 +485,31 @@ void AsyncResultsMerger::handleBatchResponse(
         } else {
             shard->updateReplSetMonitor(remote.getTargetHost(), cursorResponseStatus.getStatus());
 
-            // Retry initial cursor establishment if possible.  Never retry getMores to avoid
+            // If we can still retry the initial cursor establishment, reset the state so it can be
+            // retried the next time nextEvent is called. Never retry getMores to avoid
             // accidentally skipping results.
             if (!remote.cursorId && remote.retryCount < kMaxNumFailedHostRetryAttempts &&
                 shard->isRetriableError(cursorResponseStatus.getStatus().code(),
                                         Shard::RetryPolicy::kIdempotent)) {
                 invariant(remote.shardId);
+                invariant(remote.docBuffer.empty());
+
                 LOG(1) << "Initial cursor establishment failed with retriable error and will be "
                           "retried"
-                       << causedBy(cursorResponseStatus.getStatus());
+                       << causedBy(redact(cursorResponseStatus.getStatus()));
 
                 ++remote.retryCount;
+                remote.status = Status::OK();  // Reset status so it can be retried.
 
-                // Since we potentially updated the targeter that the last host it chose might be
-                // faulty, the call below may end up getting a different host.
-                remote.status = askForNextBatch_inlock(remoteIndex);
-                if (remote.status.isOK()) {
-                    return;
+                // Signal the merger thread to make it retry this remote again.
+                if (_currentEvent.isValid()) {
+                    // To prevent ourselves from signalling the event twice,
+                    // we set '_currentEvent' as invalid after signalling it.
+                    _executor->signalEvent(_currentEvent);
+                    _currentEvent = executor::TaskExecutor::EventHandle();
                 }
 
-                // If we end up here, it means we failed to schedule the retry request, which is a
-                // more
-                // severe error that should not be retried. Just pass through to the error handling
-                // logic below.
+                return;
             } else {
                 remote.status = cursorResponseStatus.getStatus();
             }
@@ -471,7 +521,7 @@ void AsyncResultsMerger::handleBatchResponse(
             remote.status = Status::OK();
 
             // Clear the results buffer and cursor id.
-            std::queue<BSONObj> emptyBuffer;
+            std::queue<ClusterQueryResult> emptyBuffer;
             std::swap(remote.docBuffer, emptyBuffer);
             remote.cursorId = 0;
         }
@@ -496,7 +546,8 @@ void AsyncResultsMerger::handleBatchResponse(
             return;
         }
 
-        remote.docBuffer.push(obj);
+        ClusterQueryResult result(obj);
+        remote.docBuffer.push(result);
         ++remote.fetchedCount;
     }
 
@@ -560,7 +611,7 @@ void AsyncResultsMerger::scheduleKillCursors_inlock() {
             BSONObj cmdObj = KillCursorsRequest(_params.nsString, {*remote.cursorId}).toBSON();
 
             executor::RemoteCommandRequest request(
-                remote.getTargetHost(), _params.nsString.db().toString(), cmdObj);
+                remote.getTargetHost(), _params.nsString.db().toString(), cmdObj, _params.txn);
 
             _executor->scheduleRemoteCommand(
                 request,
@@ -586,7 +637,7 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
     // Make '_killCursorsScheduledEvent', which we will signal as soon as we have scheduled a
     // killCursors command to run on all the remote shards.
     auto statusWithEvent = _executor->makeEvent();
-    if (statusWithEvent.getStatus().code() == ErrorCodes::ShutdownInProgress) {
+    if (ErrorCodes::isShutdownError(statusWithEvent.getStatus().code())) {
         // The underlying task executor is shutting down.
         if (!haveOutstandingBatchRequests_inlock()) {
             _lifecycleState = kKillComplete;
@@ -644,8 +695,7 @@ Status AsyncResultsMerger::RemoteCursorData::resolveShardIdToHostAndPort(
     }
 
     // TODO: Pass down an OperationContext* to use here.
-    auto findHostStatus = shard->getTargeter()->findHost(
-        readPref, RemoteCommandTargeter::selectFindHostMaxWaitTime(nullptr));
+    auto findHostStatus = shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20});
     if (!findHostStatus.isOK()) {
         return findHostStatus.getStatus();
     }
@@ -669,11 +719,11 @@ std::shared_ptr<Shard> AsyncResultsMerger::RemoteCursorData::getShard() {
 //
 
 bool AsyncResultsMerger::MergingComparator::operator()(const size_t& lhs, const size_t& rhs) {
-    const BSONObj& leftDoc = _remotes[lhs].docBuffer.front();
-    const BSONObj& rightDoc = _remotes[rhs].docBuffer.front();
+    const ClusterQueryResult& leftDoc = _remotes[lhs].docBuffer.front();
+    const ClusterQueryResult& rightDoc = _remotes[rhs].docBuffer.front();
 
-    BSONObj leftDocKey = leftDoc[ClusterClientCursorParams::kSortKeyField].Obj();
-    BSONObj rightDocKey = rightDoc[ClusterClientCursorParams::kSortKeyField].Obj();
+    BSONObj leftDocKey = (*leftDoc.getResult())[ClusterClientCursorParams::kSortKeyField].Obj();
+    BSONObj rightDocKey = (*rightDoc.getResult())[ClusterClientCursorParams::kSortKeyField].Obj();
 
     // This does not need to sort with a collator, since mongod has already mapped strings to their
     // ICU comparison keys as part of the $sortKey meta projection.

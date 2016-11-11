@@ -172,8 +172,8 @@ Status SubplanStage::planSubqueries() {
 
     for (size_t i = 0; i < _plannerParams.indices.size(); ++i) {
         const IndexEntry& ie = _plannerParams.indices[i];
-        _indexMap[ie.keyPattern] = i;
-        LOG(5) << "Subplanner: index " << i << " is " << ie.toString();
+        _indexMap[ie.name] = i;
+        LOG(5) << "Subplanner: index " << i << " is " << ie;
     }
 
     const ExtensionsCallbackReal extensionsCallback(getOpCtx(), &_collection->ns());
@@ -249,7 +249,7 @@ namespace {
 Status tagOrChildAccordingToCache(PlanCacheIndexTree* compositeCacheData,
                                   SolutionCacheData* branchCacheData,
                                   MatchExpression* orChild,
-                                  const std::map<BSONObj, size_t>& indexMap) {
+                                  const std::map<StringData, size_t>& indexMap) {
     invariant(compositeCacheData);
 
     // We want a well-formed *indexed* solution.
@@ -400,7 +400,7 @@ Status SubplanStage::choosePlanForSubqueries(PlanYieldPolicy* yieldPolicy) {
         return Status(ErrorCodes::BadValue, ss);
     }
 
-    LOG(5) << "Subplanner: fully tagged tree is " << solnRoot->toString();
+    LOG(5) << "Subplanner: fully tagged tree is " << redact(solnRoot->toString());
 
     // Takes ownership of 'solnRoot'
     _compositeSolution.reset(
@@ -412,7 +412,7 @@ Status SubplanStage::choosePlanForSubqueries(PlanYieldPolicy* yieldPolicy) {
         return Status(ErrorCodes::BadValue, ss);
     }
 
-    LOG(5) << "Subplanner: Composite solution is " << _compositeSolution->toString();
+    LOG(5) << "Subplanner: Composite solution is " << redact(_compositeSolution->toString());
 
     // Use the index tags from planning each branch to construct the composite solution,
     // and set that solution as our child stage.
@@ -499,6 +499,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Plan each branch of the $or.
     Status subplanningStatus = planSubqueries();
     if (!subplanningStatus.isOK()) {
+        if (subplanningStatus == ErrorCodes::QueryPlanKilled) {
+            // Query planning cannot continue if the plan for one of the subqueries was killed
+            // because the collection or a candidate index may have been dropped.
+            return subplanningStatus;
+        }
         return choosePlanWholeQuery(yieldPolicy);
     }
 
@@ -506,6 +511,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // the overall winning plan from the resulting index tags.
     Status subplanSelectStat = choosePlanForSubqueries(yieldPolicy);
     if (!subplanSelectStat.isOK()) {
+        if (subplanSelectStat == ErrorCodes::QueryPlanKilled) {
+            // Query planning cannot continue if the plan was killed because the collection or a
+            // candidate index may have been dropped.
+            return subplanSelectStat;
+        }
         return choosePlanWholeQuery(yieldPolicy);
     }
 

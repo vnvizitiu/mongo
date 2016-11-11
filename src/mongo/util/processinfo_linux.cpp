@@ -141,8 +141,8 @@ public:
         return _vsize;
     }
 
-    unsigned long getResidentSize() {
-        return (unsigned long)_rss * 4 * 1024;
+    unsigned long getResidentSizeInPages() {
+        return (unsigned long)_rss;
     }
 
     int _pid;
@@ -401,7 +401,7 @@ public:
             if (mongo::parseNumberFromString(meminfo, &systemMem).isOK()) {
                 return systemMem * 1024;  // convert from kB to bytes
             } else
-                log() << "Unable to collect system memory information" << endl;
+                log() << "Unable to collect system memory information";
         }
         return 0;
     }
@@ -443,7 +443,7 @@ int ProcessInfo::getVirtualMemorySize() {
 
 int ProcessInfo::getResidentSize() {
     LinuxProc p(_pid);
-    return (int)(p.getResidentSize() / (1024.0 * 1024));
+    return (int)((p.getResidentSizeInPages() * getPageSize()) / (1024.0 * 1024));
 }
 
 double ProcessInfo::getSystemMemoryPressurePercentage() {
@@ -451,14 +451,6 @@ double ProcessInfo::getSystemMemoryPressurePercentage() {
 }
 
 void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
-    // [dm] i don't think mallinfo works. (64 bit.)  ??
-    struct mallinfo malloc_info =
-        mallinfo();  // structure has same name as function that returns it. (see malloc.h)
-    info.append("heap_usage_bytes",
-                static_cast<long long>(malloc_info.uordblks) /*main arena*/ +
-                    static_cast<long long>(malloc_info.hblkhd) /*mmap blocks*/);
-    // docs claim hblkhd is included in uordblks but it isn't
-
     LinuxProc p(_pid);
     if (p._maj_flt <= std::numeric_limits<long long>::max())
         info.appendNumber("page_faults", static_cast<long long>(p._maj_flt));
@@ -480,7 +472,7 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     LinuxSysHelper::getLinuxDistro(distroName, distroVersion);
 
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno) << endl;
+        log() << "Unable to collect detailed system information: " << strerror(errno);
     }
 
     osType = "Linux";
@@ -553,7 +545,7 @@ bool ProcessInfo::blockCheckSupported() {
 bool ProcessInfo::blockInMemory(const void* start) {
     unsigned char x = 0;
     if (mincore(const_cast<void*>(alignToStartOfPage(start)), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription() << endl;
+        log() << "mincore failed: " << errnoWithDescription();
         return 1;
     }
     return x & 0x1;
@@ -564,7 +556,7 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, vector<char>
     if (mincore(const_cast<void*>(alignToStartOfPage(start)),
                 numPages * getPageSize(),
                 reinterpret_cast<unsigned char*>(&out->front()))) {
-        log() << "mincore failed: " << errnoWithDescription() << endl;
+        log() << "mincore failed: " << errnoWithDescription();
         return false;
     }
     for (size_t i = 0; i < numPages; ++i) {

@@ -31,9 +31,13 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
+#include "mongo/platform/basic.h"
+
 #ifdef _WIN32
 #define NVALGRIND
 #endif
+
+#include <memory>
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 
@@ -55,6 +59,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -62,6 +67,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/exit.h"
@@ -221,7 +227,9 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         ss << ",log_size=2GB),";
         ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
     }
-    ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())->getOpenConfig("system");
+    ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
+              ->getTableCreateConfig("system");
+    ss << WiredTigerExtensions::get(getGlobalServiceContext())->getOpenExtensionsConfig();
     ss << extraOpenOptions;
     if (_readOnly) {
         invariant(!_durable);
@@ -266,16 +274,14 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         _journalFlusher->go();
     }
 
-    if (!_readOnly) {
-        _sizeStorerUri = "table:sizeStorer";
-        WiredTigerSession session(_conn);
-        if (repair && _hasUri(session.getSession(), _sizeStorerUri)) {
-            log() << "Repairing size cache";
-            fassertNoTrace(28577, _salvageIfNeeded(_sizeStorerUri.c_str()));
-        }
-        _sizeStorer.reset(new WiredTigerSizeStorer(_conn, _sizeStorerUri));
-        _sizeStorer->fillCache();
+    _sizeStorerUri = "table:sizeStorer";
+    WiredTigerSession session(_conn);
+    if (!_readOnly && repair && _hasUri(session.getSession(), _sizeStorerUri)) {
+        log() << "Repairing size cache";
+        fassertNoTrace(28577, _salvageIfNeeded(_sizeStorerUri.c_str()));
     }
+    _sizeStorer.reset(new WiredTigerSizeStorer(_conn, _sizeStorerUri));
+    _sizeStorer->fillCache();
 
     Locker::setGlobalThrottling(&openReadTransaction, &openWriteTransaction);
 }
@@ -310,7 +316,8 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
 
 void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
-    syncSizeInfo(true);
+    if (!_readOnly)
+        syncSizeInfo(true);
     if (_conn) {
         // these must be the last things we do before _conn->close();
         if (_journalFlusher)
@@ -463,32 +470,33 @@ Status WiredTigerKVEngine::createRecordStore(OperationContext* opCtx,
     return wtRCToStatus(s->create(s, uri.c_str(), config.c_str()));
 }
 
-RecordStore* WiredTigerKVEngine::getRecordStore(OperationContext* opCtx,
-                                                StringData ns,
-                                                StringData ident,
-                                                const CollectionOptions& options) {
+std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext* opCtx,
+                                                                StringData ns,
+                                                                StringData ident,
+                                                                const CollectionOptions& options) {
     if (options.capped) {
-        return new WiredTigerRecordStore(opCtx,
-                                         ns,
-                                         _uri(ident),
-                                         _canonicalName,
-                                         options.capped,
-                                         _ephemeral,
-                                         options.cappedSize ? options.cappedSize : 4096,
-                                         options.cappedMaxDocs ? options.cappedMaxDocs : -1,
-                                         NULL,
-                                         _sizeStorer.get());
+        return stdx::make_unique<WiredTigerRecordStore>(
+            opCtx,
+            ns,
+            _uri(ident),
+            _canonicalName,
+            options.capped,
+            _ephemeral,
+            options.cappedSize ? options.cappedSize : 4096,
+            options.cappedMaxDocs ? options.cappedMaxDocs : -1,
+            nullptr,
+            _sizeStorer.get());
     } else {
-        return new WiredTigerRecordStore(opCtx,
-                                         ns,
-                                         _uri(ident),
-                                         _canonicalName,
-                                         false,
-                                         _ephemeral,
-                                         -1,
-                                         -1,
-                                         NULL,
-                                         _sizeStorer.get());
+        return stdx::make_unique<WiredTigerRecordStore>(opCtx,
+                                                        ns,
+                                                        _uri(ident),
+                                                        _canonicalName,
+                                                        false,
+                                                        _ephemeral,
+                                                        -1,
+                                                        -1,
+                                                        nullptr,
+                                                        _sizeStorer.get());
     }
 }
 
@@ -564,7 +572,7 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
             stdx::lock_guard<stdx::mutex> lk(_identToDropMutex);
             _identToDrop.push(uri);
         }
-        _sessionCache->closeAll();
+        _sessionCache->closeAllCursors();
         return false;
     }
 
@@ -576,7 +584,7 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     Date_t now = Date_t::now();
     Milliseconds delta = now - _previousCheckedDropsQueued;
 
-    if (_sizeStorerSyncTracker.intervalHasElapsed()) {
+    if (!_readOnly && _sizeStorerSyncTracker.intervalHasElapsed()) {
         _sizeStorerSyncTracker.resetLastTime();
         syncSizeInfo(false);
     }

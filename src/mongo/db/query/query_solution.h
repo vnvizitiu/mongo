@@ -30,6 +30,7 @@
 
 #include <memory>
 
+#include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
@@ -217,7 +218,9 @@ private:
 };
 
 struct TextNode : public QuerySolutionNode {
-    TextNode() {}
+    TextNode(IndexEntry index)
+        : _sort(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
+
     virtual ~TextNode() {}
 
     virtual StageType getType() const {
@@ -244,7 +247,7 @@ struct TextNode : public QuerySolutionNode {
 
     BSONObjSet _sort;
 
-    BSONObj indexKeyPattern;
+    IndexEntry index;
     std::unique_ptr<fts::FTSQuery> ftsQuery;
 
     // "Prefix" fields of a text index can handle equality predicates.  We group them with the
@@ -433,7 +436,7 @@ struct FetchNode : public QuerySolutionNode {
 };
 
 struct IndexScanNode : public QuerySolutionNode {
-    IndexScanNode();
+    IndexScanNode(IndexEntry index);
     virtual ~IndexScanNode() {}
 
     virtual void computeProperties();
@@ -467,8 +470,7 @@ struct IndexScanNode : public QuerySolutionNode {
 
     BSONObjSet _sorts;
 
-    BSONObj indexKeyPattern;
-    bool indexIsMultiKey;
+    IndexEntry index;
 
     int direction;
 
@@ -480,7 +482,6 @@ struct IndexScanNode : public QuerySolutionNode {
 
     IndexBounds bounds;
 
-    const CollatorInterface* indexCollator;
     const CollatorInterface* queryCollator;
 };
 
@@ -503,7 +504,11 @@ struct ProjectionNode : public QuerySolutionNode {
         SIMPLE_DOC,
     };
 
-    ProjectionNode(ParsedProjection proj) : fullExpression(NULL), projType(DEFAULT), parsed(proj) {}
+    ProjectionNode(ParsedProjection proj)
+        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+          fullExpression(NULL),
+          projType(DEFAULT),
+          parsed(proj) {}
 
     virtual ~ProjectionNode() {}
 
@@ -601,7 +606,8 @@ struct SortKeyGeneratorNode : public QuerySolutionNode {
 };
 
 struct SortNode : public QuerySolutionNode {
-    SortNode() : limit(0) {}
+    SortNode() : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), limit(0) {}
+
     virtual ~SortNode() {}
 
     virtual StageType getType() const {
@@ -699,7 +705,12 @@ struct SkipNode : public QuerySolutionNode {
 
 // This is a standalone stage.
 struct GeoNear2DNode : public QuerySolutionNode {
-    GeoNear2DNode() : addPointMeta(false), addDistMeta(false) {}
+    GeoNear2DNode(IndexEntry index)
+        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+          index(std::move(index)),
+          addPointMeta(false),
+          addDistMeta(false) {}
+
     virtual ~GeoNear2DNode() {}
 
     virtual StageType getType() const {
@@ -728,14 +739,19 @@ struct GeoNear2DNode : public QuerySolutionNode {
     const GeoNearExpression* nq;
     IndexBounds baseBounds;
 
-    BSONObj indexKeyPattern;
+    IndexEntry index;
     bool addPointMeta;
     bool addDistMeta;
 };
 
 // This is actually its own standalone stage.
 struct GeoNear2DSphereNode : public QuerySolutionNode {
-    GeoNear2DSphereNode() : addPointMeta(false), addDistMeta(false) {}
+    GeoNear2DSphereNode(IndexEntry index)
+        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+          index(std::move(index)),
+          addPointMeta(false),
+          addDistMeta(false) {}
+
     virtual ~GeoNear2DSphereNode() {}
 
     virtual StageType getType() const {
@@ -764,7 +780,7 @@ struct GeoNear2DSphereNode : public QuerySolutionNode {
     const GeoNearExpression* nq;
     IndexBounds baseBounds;
 
-    BSONObj indexKeyPattern;
+    IndexEntry index;
     bool addPointMeta;
     bool addDistMeta;
 };
@@ -810,7 +826,8 @@ struct ShardingFilterNode : public QuerySolutionNode {
  * into the query result stream.
  */
 struct KeepMutationsNode : public QuerySolutionNode {
-    KeepMutationsNode() {}
+    KeepMutationsNode() : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()) {}
+
     virtual ~KeepMutationsNode() {}
 
     virtual StageType getType() const {
@@ -846,7 +863,9 @@ struct KeepMutationsNode : public QuerySolutionNode {
  * *always* skip over the current key to the next key.
  */
 struct DistinctNode : public QuerySolutionNode {
-    DistinctNode() {}
+    DistinctNode(IndexEntry index)
+        : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
+
     virtual ~DistinctNode() {}
 
     virtual StageType getType() const {
@@ -860,7 +879,7 @@ struct DistinctNode : public QuerySolutionNode {
         return false;
     }
     bool hasField(const std::string& field) const {
-        return !indexKeyPattern[field].eoo();
+        return !index.keyPattern[field].eoo();
     }
     bool sortedByDiskLoc() const {
         return false;
@@ -873,10 +892,10 @@ struct DistinctNode : public QuerySolutionNode {
 
     BSONObjSet sorts;
 
-    BSONObj indexKeyPattern;
+    IndexEntry index;
     int direction;
     IndexBounds bounds;
-    // We are distinct-ing over the 'fieldNo'-th field of 'indexKeyPattern'.
+    // We are distinct-ing over the 'fieldNo'-th field of 'index.keyPattern'.
     int fieldNo;
 };
 
@@ -885,7 +904,9 @@ struct DistinctNode : public QuerySolutionNode {
  * Btree.
  */
 struct CountScanNode : public QuerySolutionNode {
-    CountScanNode() {}
+    CountScanNode(IndexEntry index)
+        : sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()), index(std::move(index)) {}
+
     virtual ~CountScanNode() {}
 
     virtual StageType getType() const {
@@ -910,7 +931,7 @@ struct CountScanNode : public QuerySolutionNode {
 
     BSONObjSet sorts;
 
-    BSONObj indexKeyPattern;
+    IndexEntry index;
 
     BSONObj startKey;
     bool startKeyInclusive;

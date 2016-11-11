@@ -44,6 +44,14 @@
         mongos.getDB(kDbName).dropDatabase();
     }
 
+    function getIndexSpecByName(coll, indexName) {
+        var indexes = coll.getIndexes().filter(function(spec) {
+            return spec.name === indexName;
+        });
+        assert.eq(1, indexes.length, 'index "' + indexName + '" not found"');
+        return indexes[0];
+    }
+
     // Fail if db is not sharded.
     assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
 
@@ -179,25 +187,84 @@
     mongos.getDB(kDbName).foo.drop();
     assert.commandWorked(
         mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
-    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
 
-    // shardCollection should succeed when it specifies the simple collation and the collection has
-    // a non-simple default collation.
+    // shardCollection should fail for the key pattern {_id: 1} if the collection has a non-simple
+    // default collation.
     mongos.getDB(kDbName).foo.drop();
     assert.commandWorked(
         mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
-    assert.commandWorked(mongos.adminCommand(
+    assert.commandFailed(mongos.adminCommand(
         {shardCollection: kDbName + '.foo', key: {_id: 1}, collation: {locale: 'simple'}}));
 
-    // shardCollection should fail when the only index available with the shard key as a prefix has
-    // a non-simple collation.
+    // shardCollection should fail for the key pattern {a: 1} if there is already an index 'a_1',
+    // but it has a non-simple collation.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(
+        mongos.getDB(kDbName).foo.createIndex({a: 1}, {collation: {locale: 'en_US'}}));
+    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
+
+    // shardCollection should succeed for the key pattern {a: 1} and collation {locale: 'simple'} if
+    // there is no index 'a_1', but there is a non-simple collection default collation.
     mongos.getDB(kDbName).foo.drop();
     assert.commandWorked(
         mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
-    // This index will inherit the collection's default collation.
-    assert.commandWorked(mongos.getDB(kDbName).foo.createIndex({a: 1}));
     assert.commandWorked(mongos.adminCommand(
         {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
+    var indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(!indexSpec.hasOwnProperty('collation'));
+
+    // shardCollection should succeed for the key pattern {a: 1} if there are two indexes on {a: 1}
+    // and one has the simple collation.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).foo.createIndex({a: 1}, {name: "a_1_simple"}));
+    assert.commandWorked(mongos.getDB(kDbName).foo.createIndex(
+        {a: 1}, {collation: {locale: 'en_US'}, name: "a_1_en_US"}));
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
+
+    // shardCollection should fail on a non-empty collection when the only index available with the
+    // shard key as a prefix has a non-simple collation.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(
+        mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
+    assert.writeOK(mongos.getDB(kDbName).foo.insert({a: 'foo'}));
+    // This index will inherit the collection's default collation.
+    assert.commandWorked(mongos.getDB(kDbName).foo.createIndex({a: 1}));
+    assert.commandFailed(mongos.adminCommand(
+        {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
+
+    //
+    // Feature compatibility version collation tests.
+    //
+
+    // shardCollection should succeed on an empty collection with a non-simple default collation
+    // if feature compatibility version is 3.4.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(
+        mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
+    assert.commandWorked(mongos.adminCommand(
+        {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
+
+    // shardCollection should succeed on an empty collection with no default collation if feature
+    // compatibility version is 3.4.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
+
+    // shardCollection should fail on a collection with a non-simple default collation if feature
+    // compatibility version is 3.2.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(
+        mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
+    assert.commandWorked(mongos.adminCommand({setFeatureCompatibilityVersion: "3.2"}));
+    assert.commandFailed(mongos.adminCommand(
+        {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
+
+    // shardCollection should succeed on an empty collection with no default collation if feature
+    // compatibility version is 3.2.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
 
     mongos.getDB(kDbName).dropDatabase();
 

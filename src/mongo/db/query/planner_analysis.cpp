@@ -33,6 +33,7 @@
 #include <set>
 #include <vector>
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index/s2_common.h"
@@ -213,13 +214,10 @@ void explodeScan(const IndexScanNode* isn,
         verify(prefix.size() == fieldsToExplode);
 
         // Copy boring fields into new child.
-        IndexScanNode* child = new IndexScanNode();
-        child->indexKeyPattern = isn->indexKeyPattern;
+        IndexScanNode* child = new IndexScanNode(isn->index);
         child->direction = isn->direction;
         child->maxScan = isn->maxScan;
         child->addKeyMetadata = isn->addKeyMetadata;
-        child->indexIsMultiKey = isn->indexIsMultiKey;
-        child->indexCollator = isn->indexCollator;
         child->queryCollator = isn->queryCollator;
 
         // Copy the filter, if there is one.
@@ -380,7 +378,7 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
 
         // Skip every field that is a union of point intervals and build the resulting sort
         // order from the remaining fields.
-        BSONObjIterator kpIt(isn->indexKeyPattern);
+        BSONObjIterator kpIt(isn->index.keyPattern);
         size_t boundsIdx = 0;
         while (kpIt.more()) {
             const OrderedIntervalList& oil = bounds.fields[boundsIdx];
@@ -412,11 +410,12 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
 
         // See if it's the order we're looking for.
         BSONObj possibleSort = resultingSortBob.obj();
-        if (!desiredSort.isPrefixOf(possibleSort)) {
+        if (!desiredSort.isPrefixOf(possibleSort, SimpleBSONElementComparator::kInstance)) {
             // We can't get the sort order from the index scan. See if we can
             // get the sort by reversing the scan.
             BSONObj reversePossibleSort = QueryPlannerCommon::reverseSortObj(possibleSort);
-            if (!desiredSort.isPrefixOf(reversePossibleSort)) {
+            if (!desiredSort.isPrefixOf(reversePossibleSort,
+                                        SimpleBSONElementComparator::kInstance)) {
                 // Can't get the sort order from the reversed index scan either. Give up.
                 return false;
             } else {
@@ -495,7 +494,7 @@ QuerySolutionNode* QueryPlannerAnalysis::analyzeSort(const CanonicalQuery& query
     BSONObj reverseSort = QueryPlannerCommon::reverseSortObj(sortObj);
     if (sorts.end() != sorts.find(reverseSort)) {
         QueryPlannerCommon::reverseScans(solnRoot);
-        LOG(5) << "Reversing ixscan to provide sort. Result: " << solnRoot->toString() << endl;
+        LOG(5) << "Reversing ixscan to provide sort. Result: " << redact(solnRoot->toString());
         return solnRoot;
     }
 
@@ -713,14 +712,14 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
 
     // Project the results.
     if (NULL != query.getProj()) {
-        LOG(5) << "PROJECTION: fetched status: " << solnRoot->fetched() << endl;
-        LOG(5) << "PROJECTION: Current plan is:\n" << solnRoot->toString() << endl;
+        LOG(5) << "PROJECTION: fetched status: " << solnRoot->fetched();
+        LOG(5) << "PROJECTION: Current plan is:\n" << redact(solnRoot->toString());
 
         ProjectionNode::ProjectionType projType = ProjectionNode::DEFAULT;
         BSONObj coveredKeyObj;
 
         if (query.getProj()->requiresDocument()) {
-            LOG(5) << "PROJECTION: claims to require doc adding fetch.\n";
+            LOG(5) << "PROJECTION: claims to require doc adding fetch.";
             // If the projection requires the entire document, somebody must fetch.
             if (!solnRoot->fetched()) {
                 FetchNode* fetch = new FetchNode();
@@ -731,18 +730,18 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
             // The only way we're here is if it's a simple projection.  That is, we can pick out
             // the fields we want to include and they're not dotted.  So we want to execute the
             // projection in the fast-path simple fashion.  Just don't know which fast path yet.
-            LOG(5) << "PROJECTION: requires fields\n";
+            LOG(5) << "PROJECTION: requires fields";
             const vector<StringData>& fields = query.getProj()->getRequiredFields();
             bool covered = true;
             for (size_t i = 0; i < fields.size(); ++i) {
                 if (!solnRoot->hasField(fields[i].toString())) {
-                    LOG(5) << "PROJECTION: not covered due to field " << fields[i] << endl;
+                    LOG(5) << "PROJECTION: not covered due to field " << fields[i];
                     covered = false;
                     break;
                 }
             }
 
-            LOG(5) << "PROJECTION: is covered?: = " << covered << endl;
+            LOG(5) << "PROJECTION: is covered?: = " << covered;
 
             // If any field is missing from the list of fields the projection wants,
             // a fetch is required.
@@ -773,12 +772,12 @@ QuerySolution* QueryPlannerAnalysis::analyzeDataAccess(const CanonicalQuery& que
                         if (STAGE_IXSCAN == leafNodes[0]->getType()) {
                             projType = ProjectionNode::COVERED_ONE_INDEX;
                             IndexScanNode* ixn = static_cast<IndexScanNode*>(leafNodes[0]);
-                            coveredKeyObj = ixn->indexKeyPattern;
+                            coveredKeyObj = ixn->index.keyPattern;
                             LOG(5) << "PROJECTION: covered via IXSCAN, using COVERED fast path";
                         } else if (STAGE_DISTINCT_SCAN == leafNodes[0]->getType()) {
                             projType = ProjectionNode::COVERED_ONE_INDEX;
                             DistinctNode* dn = static_cast<DistinctNode*>(leafNodes[0]);
-                            coveredKeyObj = dn->indexKeyPattern;
+                            coveredKeyObj = dn->index.keyPattern;
                             LOG(5) << "PROJECTION: covered via DISTINCT, using COVERED fast path";
                         }
                     }

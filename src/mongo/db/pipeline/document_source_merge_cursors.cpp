@@ -28,8 +28,9 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_merge_cursors.h"
 
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 
 namespace mongo {
 
@@ -43,7 +44,9 @@ DocumentSourceMergeCursors::DocumentSourceMergeCursors(
     const intrusive_ptr<ExpressionContext>& pExpCtx)
     : DocumentSource(pExpCtx), _cursorDescriptors(std::move(cursorDescriptors)), _unstarted(true) {}
 
-REGISTER_DOCUMENT_SOURCE(mergeCursors, DocumentSourceMergeCursors::createFromBson);
+REGISTER_DOCUMENT_SOURCE(mergeCursors,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceMergeCursors::createFromBson);
 
 const char* DocumentSourceMergeCursors::getSourceName() const {
     return "$mergeCursors";
@@ -52,7 +55,10 @@ const char* DocumentSourceMergeCursors::getSourceName() const {
 intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::create(
     std::vector<CursorDescriptor> cursorDescriptors,
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    return new DocumentSourceMergeCursors(std::move(cursorDescriptors), pExpCtx);
+    intrusive_ptr<DocumentSourceMergeCursors> source(
+        new DocumentSourceMergeCursors(std::move(cursorDescriptors), pExpCtx));
+    source->injectExpressionContext(pExpCtx);
+    return source;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
@@ -145,7 +151,7 @@ Document DocumentSourceMergeCursors::nextSafeFrom(DBClientCursor* cursor) {
     return Document::fromBsonWithMetaData(next);
 }
 
-boost::optional<Document> DocumentSourceMergeCursors::getNext() {
+DocumentSource::GetNextResult DocumentSourceMergeCursors::getNext() {
     if (_unstarted)
         start();
 
@@ -157,15 +163,15 @@ boost::optional<Document> DocumentSourceMergeCursors::getNext() {
     }
 
     if (_cursors.empty())
-        return boost::none;
+        return GetNextResult::makeEOF();
 
-    const Document next = nextSafeFrom(&((*_currentCursor)->cursor));
+    auto next = nextSafeFrom(&((*_currentCursor)->cursor));
 
     // advance _currentCursor, wrapping if needed
     if (++_currentCursor == _cursors.end())
         _currentCursor = _cursors.begin();
 
-    return next;
+    return std::move(next);
 }
 
 void DocumentSourceMergeCursors::dispose() {

@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+// CHECK_LOG_REDACTION
+
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
@@ -41,7 +43,10 @@
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/log.h"
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
 
@@ -244,7 +249,7 @@ ProgressMeter& CurOp::setMessage_inlock(const char* msg,
                                         int secondsBetween) {
     if (progressMeterTotal) {
         if (_progressMeter.isActive()) {
-            error() << "old _message: " << _message << " new message:" << msg;
+            error() << "old _message: " << redact(_message) << " new message:" << redact(msg);
             verify(!_progressMeter.isActive());
         }
         _progressMeter.reset(progressMeterTotal, secondsBetween);
@@ -311,9 +316,7 @@ void appendAsObjOrString(StringData name,
     } else {
         // Generate an abbreviated serialization for the object, by passing false as the
         // "full" argument to obj.toString().
-        const bool isArray = false;
-        const bool full = false;
-        std::string objToString = obj.toString(isArray, full);
+        std::string objToString = obj.toString();
         if (objToString.size() <= maxSize) {
             builder->append(name, objToString);
         } else {
@@ -363,6 +366,10 @@ void CurOp::reportState(BSONObjBuilder* builder) {
         appendAsObjOrString("query", _query, maxQuerySize, builder);
     }
 
+    if (!_collation.isEmpty()) {
+        appendAsObjOrString("collation", _collation, maxQuerySize, builder);
+    }
+
     if (!_originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
     }
@@ -406,7 +413,9 @@ StringData getProtoString(int op) {
     if (x)                            \
     s << " " #x ":" << (x)
 
-string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const {
+string OpDebug::report(Client* client,
+                       const CurOp& curop,
+                       const SingleThreadedLockStats& lockStats) const {
     StringBuilder s;
     if (iscommand)
         s << "command ";
@@ -414,6 +423,14 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
         s << networkOpToString(networkOp) << ' ';
 
     s << curop.getNS();
+
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+    if (clientMetadata) {
+        auto appName = clientMetadata.get().getApplicationName();
+        if (!appName.empty()) {
+            s << " appName: \"" << escape(appName) << '\"';
+        }
+    }
 
     auto query = curop.query();
 
@@ -426,28 +443,33 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
                 curCommand->redactForLogging(&cmdToLog);
                 s << curCommand->getName() << " ";
-                s << cmdToLog.toString();
+                s << redact(cmdToLog.getObject());
             } else {  // Should not happen but we need to handle curCommand == NULL gracefully.
-                s << query.toString();
+                s << redact(query);
             }
         } else {
             s << " query: ";
-            s << query.toString();
+            s << redact(query);
         }
     }
 
     auto originatingCommand = curop.originatingCommand();
     if (!originatingCommand.isEmpty()) {
-        s << " originatingCommand: " << originatingCommand;
+        s << " originatingCommand: " << redact(originatingCommand);
     }
 
     if (!curop.getPlanSummary().empty()) {
-        s << " planSummary: " << curop.getPlanSummary();
+        s << " planSummary: " << redact(curop.getPlanSummary().toString());
     }
 
     if (!updateobj.isEmpty()) {
-        s << " update: ";
-        updateobj.toString(s);
+        s << " update: " << redact(updateobj);
+    }
+
+    auto collation = curop.collation();
+    if (!collation.isEmpty()) {
+        s << " collation: ";
+        collation.toString(s);
     }
 
     OPDEBUG_TOSTRING_HELP(cursorid);
@@ -485,7 +507,7 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
     }
 
     if (!exceptionInfo.empty()) {
-        s << " exception: " << exceptionInfo.msg;
+        s << " exception: " << redact(exceptionInfo.msg);
         if (exceptionInfo.code)
             s << " code:" << exceptionInfo.code;
     }
@@ -507,7 +529,7 @@ string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockSt
         s << " protocol:" << getProtoString(networkOp);
     }
 
-    s << " " << executionTime << "ms";
+    s << " " << (executionTimeMicros / 1000) << "ms";
 
     return s.str();
 }
@@ -549,6 +571,11 @@ void OpDebug::append(const CurOp& curop,
 
     if (!updateobj.isEmpty()) {
         appendAsObjOrString("updateobj", updateobj, maxElementSize, &b);
+    }
+
+    auto collation = curop.collation();
+    if (!collation.isEmpty()) {
+        appendAsObjOrString("collation", collation, maxElementSize, &b);
     }
 
     OPDEBUG_APPEND_NUMBER(cursorid);
@@ -599,7 +626,7 @@ void OpDebug::append(const CurOp& curop,
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));
     }
-    b.append("millis", executionTime);
+    b.appendIntOrLL("millis", executionTimeMicros / 1000);
 
     if (!curop.getPlanSummary().empty()) {
         b.append("planSummary", curop.getPlanSummary());

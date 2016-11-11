@@ -46,9 +46,6 @@ namespace moe = mongo::optionenvironment;
 struct MongosGlobalParams {
     // The config server connection string
     ConnectionString configdbs;
-
-    // Whether auto-splitting is enabled
-    bool shouldAutoSplit{true};
 };
 
 extern MongosGlobalParams mongosGlobalParams;
@@ -80,7 +77,7 @@ Status validateMongosOptions(const moe::Environment& params);
  */
 Status canonicalizeMongosOptions(moe::Environment* params);
 
-Status storeMongosOptions(const moe::Environment& params, const std::vector<std::string>& args);
+Status storeMongosOptions(const moe::Environment& params);
 
 // This function should eventually go away, but needs to be here now because the sorter and
 // the version manager must know at runtime which binary it is in.

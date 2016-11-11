@@ -52,7 +52,9 @@ class OpDebug {
 public:
     OpDebug() = default;
 
-    std::string report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const;
+    std::string report(Client* client,
+                       const CurOp& curop,
+                       const SingleThreadedLockStats& lockStats) const;
 
     /**
      * Appends information about the current operation to "builder"
@@ -122,7 +124,7 @@ public:
     ExceptionInfo exceptionInfo;
 
     // response info
-    int executionTime{0};
+    long long executionTimeMicros{0};
     long long nreturned{-1};
     int responseLength{-1};
 };
@@ -174,6 +176,14 @@ public:
     }
 
     /**
+     * The BSONObj returned may not be owned by CurOp. Callers should call getOwned() if they plan
+     * to reference beyond the lifetime of this CurOp instance.
+     */
+    BSONObj collation() const {
+        return _collation;
+    }
+
+    /**
      * Returns an owned BSONObj representing the original command. Used only by the getMore
      * command.
      */
@@ -221,11 +231,19 @@ public:
         return _ns;
     }
 
-    bool shouldDBProfile(int ms) const {
+    /**
+     * Returns true iff the elapsed time of this operation is such that it should be profiled.
+     * Uses total time if the operation is done, current elapsed time otherwise.
+     */
+    bool shouldDBProfile() {
         if (_dbprofile <= 0)
             return false;
 
-        return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
+        if (_dbprofile >= 2)
+            return true;
+
+        long long opMicros = isDone() ? totalTimeMicros() : elapsedMicros();
+        return opMicros >= serverGlobalParams.slowMS * 1000LL;
     }
 
     /**
@@ -275,22 +293,21 @@ public:
     void done() {
         _end = curTimeMicros64();
     }
+    bool isDone() const {
+        return _end > 0;
+    }
 
     long long totalTimeMicros() {
         massert(12601, "CurOp not marked done yet", _end);
         return _end - startTime();
     }
-    int totalTimeMillis() {
-        return (int)(totalTimeMicros() / 1000);
-    }
+
     long long elapsedMicros() {
         return curTimeMicros64() - startTime();
     }
-    int elapsedMillis() {
-        return (int)(elapsedMicros() / 1000);
-    }
+
     int elapsedSeconds() {
-        return elapsedMillis() / 1000;
+        return static_cast<int>(elapsedMicros() / (1000 * 1000));
     }
 
     /**
@@ -299,6 +316,14 @@ public:
      */
     void setQuery_inlock(const BSONObj& query) {
         _query = query;
+    }
+
+    /**
+     * 'collation' must be either an owned BSONObj or guaranteed to outlive the OperationContext it
+     * is associated with.
+     */
+    void setCollation_inlock(const BSONObj& collation) {
+        _collation = collation;
     }
 
     /**
@@ -418,6 +443,7 @@ private:
     int _dbprofile{0};  // 0=off, 1=slow, 2=all
     std::string _ns;
     BSONObj _query;
+    BSONObj _collation;
     BSONObj _originatingCommand;  // Used by getMore to display original command.
     OpDebug _debug;
     std::string _message;

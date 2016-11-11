@@ -52,8 +52,7 @@ NetworkInterfaceASIO::AsyncConnection::AsyncConnection(std::unique_ptr<AsyncStre
                                                        rpc::ProtocolSet protocols)
     : _stream(std::move(stream)),
       _serverProtocols(protocols),
-      _clientProtocols(rpc::computeProtocolSet(WireSpec::instance().minWireVersionOutgoing,
-                                               WireSpec::instance().maxWireVersionOutgoing)) {}
+      _clientProtocols(rpc::computeProtocolSet(WireSpec::instance().outgoing)) {}
 
 AsyncStreamInterface& NetworkInterfaceASIO::AsyncConnection::stream() {
     return *_stream;
@@ -76,7 +75,7 @@ void NetworkInterfaceASIO::AsyncConnection::setServerProtocols(rpc::ProtocolSet 
 }
 
 void NetworkInterfaceASIO::_connect(AsyncOp* op) {
-    LOG(1) << "Connecting to " << op->request().target.toString();
+    log() << "Connecting to " << op->request().target.toString();
 
     tcp::resolver::query query(op->request().target.host(),
                                std::to_string(op->request().target.port()));

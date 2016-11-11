@@ -69,7 +69,9 @@ public:
     }
 
     IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
-        return coll->getIndexCatalog()->findIndexByKeyPattern(&_txn, obj);
+        std::vector<IndexDescriptor*> indexes;
+        coll->getIndexCatalog()->findIndexesByKeyPattern(&_txn, obj, false, &indexes);
+        return indexes.empty() ? nullptr : indexes[0];
     }
 
     void insert(const BSONObj& obj) {
@@ -152,7 +154,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 
@@ -223,7 +225,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 
@@ -293,7 +295,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 
@@ -365,7 +367,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMaxKey(1);
         params.bounds.endKey = objWithMinKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         // This is the direction along the index.
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
@@ -436,7 +438,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 
@@ -490,7 +492,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
         int numIndices = 20;
@@ -549,7 +551,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
         // Index 'a'+i has foo equal to 'i'.
@@ -679,7 +681,7 @@ public:
             params.bounds.isSimpleRange = true;
             params.bounds.startKey = BSON("" << 5);
             params.bounds.endKey = BSON("" << 10);
-            params.bounds.endKeyInclusive = true;
+            params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
             params.direction = 1;
             auto fetchStage = stdx::make_unique<FetchStage>(
                 &_txn, &ws, new IndexScan(&_txn, params, &ws, nullptr), nullptr, coll);
@@ -693,7 +695,7 @@ public:
             params.bounds.isSimpleRange = true;
             params.bounds.startKey = BSON("" << 4);
             params.bounds.endKey = BSON("" << 10);
-            params.bounds.endKeyInclusive = true;
+            params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
             params.direction = 1;
             auto fetchStage = stdx::make_unique<FetchStage>(
                 &_txn, &ws, new IndexScan(&_txn, params, &ws, nullptr), nullptr, coll);
@@ -704,7 +706,7 @@ public:
         member = getNextResult(&ws, ms.get());
         ASSERT_EQ(member->getState(), WorkingSetMember::RID_AND_OBJ);
         ASSERT_EQ(member->recordId, *it);
-        ASSERT_EQ(member->obj.value(), BSON("_id" << 4 << "a" << 4));
+        ASSERT_BSONOBJ_EQ(member->obj.value(), BSON("_id" << 4 << "a" << 4));
         ++it;
 
         // Doc {a: 5} gets invalidated by an update.
@@ -713,14 +715,14 @@ public:
         // Invalidated doc {a: 5} should still get returned.
         member = getNextResult(&ws, ms.get());
         ASSERT_EQ(member->getState(), WorkingSetMember::OWNED_OBJ);
-        ASSERT_EQ(member->obj.value(), BSON("_id" << 5 << "a" << 5));
+        ASSERT_BSONOBJ_EQ(member->obj.value(), BSON("_id" << 5 << "a" << 5));
         ++it;
 
         // We correctly dedup the invalidated doc and return {a: 6} next.
         member = getNextResult(&ws, ms.get());
         ASSERT_EQ(member->getState(), WorkingSetMember::RID_AND_OBJ);
         ASSERT_EQ(member->recordId, *it);
-        ASSERT_EQ(member->obj.value(), BSON("_id" << 6 << "a" << 6));
+        ASSERT_BSONOBJ_EQ(member->obj.value(), BSON("_id" << 6 << "a" << 6));
     }
 
 private:
@@ -780,7 +782,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 
@@ -854,7 +856,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = objWithMinKey(1);
         params.bounds.endKey = objWithMaxKey(1);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
         ms->addChild(new IndexScan(&_txn, params, ws.get(), NULL));
 

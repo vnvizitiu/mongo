@@ -164,20 +164,20 @@ BSONObj MongoURI::_makeAuthObjFromOptions(int maxWireVersion) const {
     return bob.obj();
 }
 
-DBClientBase* MongoURI::connect(std::string& errmsg) const {
-    double socketTimeout = 0.0;
+DBClientBase* MongoURI::connect(StringData applicationName, std::string& errmsg) const {
+    double socketTimeoutSecs = 0.0;
 
     OptionsMap::const_iterator it = _options.find("socketTimeoutMS");
     if (it != _options.end()) {
         try {
-            socketTimeout = std::stod(it->second);
+            socketTimeoutSecs = std::stod(it->second) / 1000;
         } catch (const std::exception& e) {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "Unable to parse socketTimeoutMS value" << causedBy(e));
         }
     }
 
-    auto ret = _connectString.connect(errmsg, socketTimeout);
+    auto ret = _connectString.connect(applicationName, errmsg, socketTimeoutSecs, this);
     if (!ret) {
         return ret;
     }

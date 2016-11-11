@@ -298,6 +298,10 @@ public:
      * underlying tree without getting results back.
      *
      * If a YIELD_AUTO policy is set on this executor, then this will automatically yield.
+     *
+     * Returns ErrorCodes::QueryPlanKilled if the plan executor was killed during a yield. If this
+     * error occurs, it is illegal to subsequently access the collection, since it may have been
+     * dropped.
      */
     Status executePlan();
 
@@ -428,6 +432,10 @@ private:
      * this calls into their underlying plan selection facilities. Otherwise, does nothing.
      *
      * If a YIELD_AUTO policy is set then locks are yielded during plan selection.
+     *
+     * Returns a non-OK status if query planning fails. In particular, this function returns
+     * ErrorCodes::QueryPlanKilled if plan execution cannot proceed due to a concurrent write or
+     * catalog operation.
      */
     Status pickBestPlan(YieldPolicy policy, const Collection* collection);
 

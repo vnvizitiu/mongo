@@ -54,6 +54,8 @@ class TestCase(unittest.TestCase):
         self.fixture = None
         self.return_code = None
 
+        self.is_configured = False
+
     def long_name(self):
         """
         Returns the path to the test, relative to the current working directory.
@@ -78,10 +80,14 @@ class TestCase(unittest.TestCase):
     def shortDescription(self):
         return "%s %s" % (self.test_kind, self.test_name)
 
-    def configure(self, fixture):
+    def configure(self, fixture, *args, **kwargs):
         """
         Stores 'fixture' as an attribute for later use during execution.
         """
+        if self.is_configured:
+            raise RuntimeError("configure can only be called once")
+
+        self.is_configured = True
         self.fixture = fixture
 
     def run_test(self):
@@ -178,8 +184,8 @@ class CPPIntegrationTestCase(TestCase):
         self.program_executable = program_executable
         self.program_options = utils.default_if_none(program_options, {}).copy()
 
-    def configure(self, fixture):
-        TestCase.configure(self, fixture)
+    def configure(self, fixture, *args, **kwargs):
+        TestCase.configure(self, fixture, *args, **kwargs)
 
         self.program_options["connectionString"] = self.fixture.get_connection_string()
 
@@ -222,8 +228,8 @@ class DBTestCase(TestCase):
         self.dbtest_suite = dbtest_suite
         self.dbtest_options = utils.default_if_none(dbtest_options, {}).copy()
 
-    def configure(self, fixture):
-        TestCase.configure(self, fixture)
+    def configure(self, fixture, *args, **kwargs):
+        TestCase.configure(self, fixture, *args, **kwargs)
 
         # If a dbpath was specified, then use it as a container for all other dbpaths.
         dbpath_prefix = self.dbtest_options.pop("dbpath", DBTestCase._get_dbpath_prefix())
@@ -317,8 +323,8 @@ class JSTestCase(TestCase):
         self.shell_options = utils.default_if_none(shell_options, {}).copy()
         self.num_clients = JSTestCase.DEFAULT_CLIENT_NUM
 
-    def configure(self, fixture, num_clients=DEFAULT_CLIENT_NUM):
-        TestCase.configure(self, fixture)
+    def configure(self, fixture, num_clients=DEFAULT_CLIENT_NUM, *args, **kwargs):
+        TestCase.configure(self, fixture, *args, **kwargs)
 
         if self.fixture.port is not None:
             self.shell_options["port"] = self.fixture.port
@@ -434,12 +440,12 @@ class MongosTestCase(TestCase):
         TestCase.__init__(self, logger, "mongos", self.mongos_executable)
         self.options = mongos_options.copy()
 
-    def configure(self, fixture):
+    def configure(self, fixture, *args, **kwargs):
         """
         Ensures the --test option is present in the mongos options.
         """
 
-        TestCase.configure(self, fixture)
+        TestCase.configure(self, fixture, *args, **kwargs)
         # Always specify test option to ensure the mongos will terminate.
         if "test" not in self.options:
             self.options["test"] = ""

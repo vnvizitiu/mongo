@@ -42,6 +42,51 @@ const char ParsedDistinct::kKeyField[] = "key";
 const char ParsedDistinct::kQueryField[] = "query";
 const char ParsedDistinct::kCollationField[] = "collation";
 
+StatusWith<BSONObj> ParsedDistinct::asAggregationCommand() const {
+    BSONObjBuilder aggregationBuilder;
+
+    invariant(_query);
+    const QueryRequest& qr = _query->getQueryRequest();
+    aggregationBuilder.append("aggregate", qr.nss().coll());
+
+    // Build a pipeline that accomplishes the distinct request. The building code constructs a
+    // pipeline that looks like this:
+    //
+    //      [
+    //          { $match: { ... },
+    //          { $group: { _id: null, distinct: { $addToSet: "$<key>" } } }
+    //      ]
+    BSONArrayBuilder pipelineBuilder(aggregationBuilder.subarrayStart("pipeline"));
+    if (!qr.getFilter().isEmpty()) {
+        BSONObjBuilder matchStageBuilder(pipelineBuilder.subobjStart());
+        matchStageBuilder.append("$match", qr.getFilter());
+        matchStageBuilder.doneFast();
+    }
+    BSONObjBuilder groupStageBuilder(pipelineBuilder.subobjStart());
+    {
+        BSONObjBuilder groupBuilder(groupStageBuilder.subobjStart("$group"));
+        groupBuilder.appendNull("_id");
+        {
+            BSONObjBuilder distinctBuilder(groupBuilder.subobjStart("distinct"));
+            distinctBuilder.append("$addToSet", str::stream() << "$" << _key);
+            distinctBuilder.doneFast();
+        }
+        groupBuilder.doneFast();
+    }
+    groupStageBuilder.doneFast();
+    pipelineBuilder.doneFast();
+
+    if (_query->getQueryRequest().isExplain()) {
+        aggregationBuilder.append("explain", true);
+    }
+    aggregationBuilder.append(kCollationField, qr.getCollation());
+
+    // Specify the 'cursor' option so that aggregation uses the cursor interface.
+    aggregationBuilder.append("cursor", BSONObj());
+
+    return aggregationBuilder.obj();
+}
+
 StatusWith<ParsedDistinct> ParsedDistinct::parse(OperationContext* txn,
                                                  const NamespaceString& nss,
                                                  const BSONObj& cmdObj,

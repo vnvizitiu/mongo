@@ -6,7 +6,7 @@ Import("wiredtiger")
 boostSuffix = "-1.60.0"
 snappySuffix = '-1.1.3'
 zlibSuffix = '-1.2.8'
-pcreSuffix = "-8.38"
+pcreSuffix = "-8.39"
 mozjsSuffix = '-45'
 yamlSuffix = '-0.5.3'
 icuSuffix = '-57.1'
@@ -140,6 +140,7 @@ if use_system_version_of_library("boost"):
                 env['LIBDEPS_BOOST_FILESYSTEM_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_THREAD_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_SYSTEM_SYSLIBDEP'],
+                env['LIBDEPS_BOOST_IOSTREAMS_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_CHRONO_SYSLIBDEP'],
                 env['LIBDEPS_BOOST_REGEX_SYSLIBDEP'],
             ])
@@ -155,6 +156,7 @@ else:
             boostDirectory + '/boost_thread',
             boostDirectory + '/boost_system',
             boostDirectory + '/boost_chrono',
+            boostDirectory + '/boost_iostreams',
             boostDirectory + '/boost_regex',
         ])
 
@@ -326,10 +328,10 @@ if wiredtiger:
         ])
 
 if use_system_version_of_library("asio"):
-    asioEnv = env.Clone(
-        SYSLIBDEPS=[
-            env['LIBDEPS_ASIO_SYSLIBDEP'],
-        ])
+    # Normally, we would request LIBDEPS_ASIO_SYSLIBDEP here, but on most systems, the system asio
+    # will be header only so there is no library required. In the rare case where one is, it can be
+    # injected via LIBS= on the command line.
+    asioEnv = env.Clone()
 else:
     asioEnv = env.Clone()
     asioEnv.InjectThirdPartyIncludePaths(libraries=['asio'])

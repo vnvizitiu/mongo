@@ -36,6 +36,8 @@
 
 #include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_type_endian.h"
+#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/platform/decimal128.h"
@@ -180,8 +182,7 @@ Value::Value(const BSONElement& elem) : _storage(elem.type()) {
         }
 
         case jstOID:
-            static_assert(sizeof(_storage.oid) == OID::kOIDSize,
-                          "sizeof(_storage.oid) == OID::kOIDSize");
+            MONGO_STATIC_ASSERT(sizeof(_storage.oid) == OID::kOIDSize);
             memcpy(_storage.oid, elem.OID().view().view(), OID::kOIDSize);
             break;
 
@@ -638,7 +639,9 @@ inline static int cmp(const T& left, const T& right) {
     }
 }
 
-int Value::compare(const Value& rL, const Value& rR) {
+int Value::compare(const Value& rL,
+                   const Value& rR,
+                   const StringData::ComparatorInterface* stringComparator) {
     // Note, this function needs to behave identically to BSON's compareElementValues().
     // Additionally, any changes here must be replicated in hash_combine().
     BSONType lType = rL.getType();
@@ -739,13 +742,20 @@ int Value::compare(const Value& rL, const Value& rR) {
         case jstOID:
             return memcmp(rL._storage.oid, rR._storage.oid, OID::kOIDSize);
 
+        case String: {
+            if (!stringComparator) {
+                return rL.getStringData().compare(rR.getStringData());
+            }
+
+            return stringComparator->compare(rL.getStringData(), rR.getStringData());
+        }
+
         case Code:
         case Symbol:
-        case String:
             return rL.getStringData().compare(rR.getStringData());
 
         case Object:
-            return Document::compare(rL.getDocument(), rR.getDocument());
+            return Document::compare(rL.getDocument(), rR.getDocument(), stringComparator);
 
         case Array: {
             const vector<Value>& lArr = rL.getArray();
@@ -754,7 +764,7 @@ int Value::compare(const Value& rL, const Value& rR) {
             const size_t elems = std::min(lArr.size(), rArr.size());
             for (size_t i = 0; i < elems; i++) {
                 // compare the two corresponding elements
-                ret = Value::compare(lArr[i], rArr[i]);
+                ret = Value::compare(lArr[i], rArr[i], stringComparator);
                 if (ret)
                     return ret;  // values are unequal
             }
@@ -803,7 +813,8 @@ int Value::compare(const Value& rL, const Value& rR) {
     verify(false);
 }
 
-void Value::hash_combine(size_t& seed) const {
+void Value::hash_combine(size_t& seed,
+                         const StringData::ComparatorInterface* stringComparator) const {
     BSONType type = getType();
 
     boost::hash_combine(seed, canonicalizeBSONType(type));
@@ -825,8 +836,7 @@ void Value::hash_combine(size_t& seed) const {
 
         case bsonTimestamp:
         case Date:
-            static_assert(sizeof(_storage.dateValue) == sizeof(_storage.timestampValue),
-                          "sizeof(_storage.dateValue) == sizeof(_storage.timestampValue)");
+            MONGO_STATIC_ASSERT(sizeof(_storage.dateValue) == sizeof(_storage.timestampValue));
             boost::hash_combine(seed, _storage.dateValue);
             break;
 
@@ -871,21 +881,30 @@ void Value::hash_combine(size_t& seed) const {
             break;
 
         case Code:
-        case Symbol:
-        case String: {
+        case Symbol: {
             StringData sd = getStringData();
             MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
             break;
         }
 
+        case String: {
+            StringData sd = getStringData();
+            if (stringComparator) {
+                stringComparator->hash_combine(seed, sd);
+            } else {
+                MurmurHash3_x86_32(sd.rawData(), sd.size(), seed, &seed);
+            }
+            break;
+        }
+
         case Object:
-            getDocument().hash_combine(seed);
+            getDocument().hash_combine(seed, stringComparator);
             break;
 
         case Array: {
             const vector<Value>& vec = getArray();
             for (size_t i = 0; i < vec.size(); i++)
-                vec[i].hash_combine(seed);
+                vec[i].hash_combine(seed, stringComparator);
             break;
         }
 
@@ -910,8 +929,8 @@ void Value::hash_combine(size_t& seed) const {
 
         case CodeWScope: {
             intrusive_ptr<const RCCodeWScope> cws = _storage.getCodeWScope();
-            boost::hash_combine(seed, StringData::Hasher()(cws->code));
-            boost::hash_combine(seed, BSONObj::Hasher()(cws->scope));
+            SimpleStringDataComparator::kInstance.hash_combine(seed, cws->code);
+            SimpleBSONObjComparator::kInstance.hash_combine(seed, cws->scope);
             break;
         }
     }
@@ -995,7 +1014,7 @@ bool Value::integral() const {
             // If we are able to convert the decimal to an int32_t without an rounding errors,
             // then it is integral.
             uint32_t signalingFlags = Decimal128::kNoFlag;
-            (void)_storage.getDecimal().toInt(&signalingFlags);
+            (void)_storage.getDecimal().toIntExact(&signalingFlags);
             return signalingFlags == Decimal128::kNoFlag;
         }
         default:

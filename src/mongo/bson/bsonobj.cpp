@@ -31,8 +31,6 @@
 
 #include "mongo/db/jsobj.h"
 
-#include <boost/functional/hash.hpp>
-
 #include "mongo/base/data_range.h"
 #include "mongo/bson/bson_validate.h"
 #include "mongo/db/json.h"
@@ -45,21 +43,6 @@
 namespace mongo {
 using namespace std;
 /* BSONObj ------------------------------------------------------------*/
-
-// deep (full) equality
-bool BSONObj::equal(const BSONObj& rhs) const {
-    BSONObjIterator i(*this);
-    BSONObjIterator j(rhs);
-    BSONElement l, r;
-    do {
-        // so far, equal...
-        l = i.next();
-        r = j.next();
-        if (l.eoo())
-            return r.eoo();
-    } while (l == r);
-    return false;
-}
 
 void BSONObj::_assertInvalid() const {
     StringBuilder ss;
@@ -114,8 +97,8 @@ string BSONObj::jsonString(JsonStringFormat format, int pretty, bool isArray) co
     return s.str();
 }
 
-bool BSONObj::valid() const {
-    return validateBSON(objdata(), objsize()).isOK();
+bool BSONObj::valid(BSONVersion version) const {
+    return validateBSON(objdata(), objsize(), version).isOK();
 }
 
 int BSONObj::woCompare(const BSONObj& r,
@@ -199,22 +182,15 @@ int BSONObj::woCompare(const BSONObj& r,
     return -1;
 }
 
-size_t BSONObj::Hasher::operator()(const BSONObj& obj) const {
-    size_t hash = 0;
-    BSONForEach(elem, obj) {
-        boost::hash_combine(hash, BSONElement::Hasher()(elem));
-    }
-    return hash;
-}
-
-bool BSONObj::isPrefixOf(const BSONObj& otherObj) const {
+bool BSONObj::isPrefixOf(const BSONObj& otherObj,
+                         const BSONElement::ComparatorInterface& eltCmp) const {
     BSONObjIterator a(*this);
     BSONObjIterator b(otherObj);
 
     while (a.more() && b.more()) {
         BSONElement x = a.next();
         BSONElement y = b.next();
-        if (x != y)
+        if (eltCmp.evaluate(x != y))
             return false;
     }
 
@@ -487,7 +463,6 @@ void BSONObj::dump() const {
         builder << i << '\t' << (0xff & ((unsigned)*p));
         if (*p >= 'A' && *p <= 'z')
             builder << '\t' << *p;
-        builder << endl;
         p++;
     }
 }
@@ -603,14 +578,15 @@ int BSONObj::nFields() const {
     return n;
 }
 
-std::string BSONObj::toString(bool isArray, bool full) const {
+std::string BSONObj::toString(bool redactValues) const {
     if (isEmpty())
-        return (isArray ? "[]" : "{}");
+        return "{}";
     StringBuilder s;
-    toString(s, isArray, full);
+    toString(s, false, false, redactValues);
     return s.str();
 }
-void BSONObj::toString(StringBuilder& s, bool isArray, bool full, int depth) const {
+void BSONObj::toString(
+    StringBuilder& s, bool isArray, bool full, bool redactValues, int depth) const {
     if (isEmpty()) {
         s << (isArray ? "[]" : "{}");
         return;
@@ -635,7 +611,7 @@ void BSONObj::toString(StringBuilder& s, bool isArray, bool full, int depth) con
             first = false;
         else
             s << ", ";
-        e.toString(s, !isArray, full, depth);
+        e.toString(s, !isArray, full, redactValues, depth);
     }
     s << (isArray ? " ]" : " }");
 }

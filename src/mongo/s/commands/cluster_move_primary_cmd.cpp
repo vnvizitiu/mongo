@@ -39,7 +39,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -81,7 +81,7 @@ public:
         help << " example: { moveprimary : 'foo' , to : 'localhost:9999' }";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -130,17 +130,18 @@ public:
             return false;
         }
 
-        shared_ptr<Shard> toShard = grid.shardRegistry()->getShard(txn, to);
-        if (!toShard) {
+        auto toShardStatus = grid.shardRegistry()->getShard(txn, to);
+        if (!toShardStatus.isOK()) {
             string msg(str::stream() << "Could not move database '" << dbname << "' to shard '"
                                      << to
                                      << "' because the shard does not exist");
             log() << msg;
             return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
         }
+        auto toShard = toShardStatus.getValue();
 
-        shared_ptr<Shard> fromShard = grid.shardRegistry()->getShard(txn, config->getPrimaryId());
-        invariant(fromShard);
+        auto fromShard =
+            uassertStatusOK(grid.shardRegistry()->getShard(txn, config->getPrimaryId()));
 
         if (fromShard->getId() == toShard->getId()) {
             errmsg = "it is already the primary";
@@ -151,8 +152,8 @@ public:
               << " to: " << toShard->toString();
 
         string whyMessage(str::stream() << "Moving primary shard of " << dbname);
-        auto scopedDistLock = grid.catalogClient(txn)->distLock(
-            txn, dbname + "-movePrimary", whyMessage, DistLockManager::kSingleLockAttemptTimeout);
+        auto scopedDistLock = grid.catalogClient(txn)->getDistLockManager()->lock(
+            txn, dbname + "-movePrimary", whyMessage, DistLockManager::kDefaultLockTimeout);
 
         if (!scopedDistLock.isOK()) {
             return appendCommandStatus(result, scopedDistLock.getStatus());
@@ -166,7 +167,11 @@ public:
             _buildMoveEntry(dbname, fromShard->toString(), toShard->toString(), shardedColls);
 
         auto catalogClient = grid.catalogClient(txn);
-        catalogClient->logChange(txn, "movePrimary.start", dbname, moveStartDetails);
+        catalogClient->logChange(txn,
+                                 "movePrimary.start",
+                                 dbname,
+                                 moveStartDetails,
+                                 ShardingCatalogClient::kMajorityWriteConcern);
 
         BSONArrayBuilder barr;
         barr.append(shardedColls);
@@ -200,7 +205,7 @@ public:
         toconn.done();
 
         if (!worked) {
-            log() << "clone failed" << cloneRes;
+            log() << "clone failed" << redact(cloneRes);
             errmsg = "clone failed";
             return false;
         }
@@ -287,7 +292,11 @@ public:
         BSONObj moveFinishDetails =
             _buildMoveEntry(dbname, oldPrimary, toShard->toString(), shardedColls);
 
-        catalogClient->logChange(txn, "movePrimary", dbname, moveFinishDetails);
+        catalogClient->logChange(txn,
+                                 "movePrimary",
+                                 dbname,
+                                 moveFinishDetails,
+                                 ShardingCatalogClient::kMajorityWriteConcern);
         return true;
     }
 

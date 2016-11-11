@@ -17,7 +17,7 @@ executor:
         readMode: commands
     hooks:
     - class: ValidateCollections
-    - class: CheckReplDBHashDeprecated
+    - class: CheckReplOplogs
     - class: CheckReplDBHash
     - class: CleanEveryN
       n: 20
@@ -27,4 +27,5 @@ executor:
         oplogSize: 511
         set_parameters:
           enableTestCommands: 1
+          numInitialSyncAttempts: 1
       num_nodes: 2

@@ -28,65 +28,126 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/base/disallow_copying.h"
+#include "mongo/transport/message_compressor_manager.h"
+#include "mongo/transport/session_id.h"
+#include "mongo/transport/ticket.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/message.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
+
+struct SSLPeerInfo;
+
 namespace transport {
 
 class TransportLayer;
+class Session;
+
+using SessionHandle = std::shared_ptr<Session>;
+using ConstSessionHandle = std::shared_ptr<const Session>;
 
 /**
  * This type contains data needed to associate Messages with connections
  * (on the transport side) and Messages with Client objects (on the database side).
  */
-class Session {
+class Session : public std::enable_shared_from_this<Session> {
     MONGO_DISALLOW_COPYING(Session);
 
 public:
     /**
      * Type to indicate the internal id for this session.
      */
-    using SessionId = uint64_t;
+    using Id = SessionId;
 
     /**
-     * Construct a new session.
+     * Tags for groups of connections.
      */
-    Session(HostAndPort remote, HostAndPort local, TransportLayer* tl);
+    using TagMask = uint32_t;
+
+    static const Status ClosedStatus;
+
+    static constexpr TagMask kEmptyTagMask = 0;
+    static constexpr TagMask kKeepOpen = 1;
 
     /**
      * Destroys a session, calling end() for this session in its TransportLayer.
      */
-    ~Session();
-
-    /**
-     * Move constructor and assignment operator.
-     */
-    Session(Session&& other);
-    Session& operator=(Session&& other);
+    virtual ~Session() = default;
 
     /**
      * Return the id for this session.
      */
-    SessionId id() const;
+    Id id() const {
+        return _id;
+    }
+
+    /**
+     * The TransportLayer for this Session.
+     */
+    virtual TransportLayer* getTransportLayer() const = 0;
+
+    /**
+     * Source (receive) a new Message for this Session.
+     *
+     * This method will forward to sourceMessage on this Session's transport layer.
+     */
+    virtual Ticket sourceMessage(Message* message, Date_t expiration = Ticket::kNoExpirationDate);
+
+    /**
+     * Sink (send) a new Message for this Session. This method should be used
+     * to send replies to a given host.
+     *
+     * This method will forward to sinkMessage on this Session's transport layer.
+     */
+    virtual Ticket sinkMessage(const Message& message,
+                               Date_t expiration = Ticket::kNoExpirationDate);
+
+    /**
+     * Return the X509 peer information for this connection (SSL only).
+     */
+    virtual SSLPeerInfo getX509PeerInfo() const;
 
     /**
      * Return the remote host for this session.
      */
-    const HostAndPort& remote() const;
+    virtual const HostAndPort& remote() const = 0;
 
     /**
      * Return the local host information for this session.
      */
-    const HostAndPort& local() const;
+    virtual const HostAndPort& local() const = 0;
+
+    /**
+     * Set this session's tags. This Session will register
+     * its new tags with its TransportLayer.
+     */
+    virtual void replaceTags(TagMask tags);
+
+    /**
+     * Get this session's tags.
+     */
+    virtual TagMask getTags() const;
+
+    /**
+     * Get the compressor manager for this session.
+     */
+    virtual MessageCompressorManager& getCompressorManager();
+
+protected:
+    /**
+     * Construct a new session.
+     */
+    Session();
 
 private:
-    SessionId _id;
+    const Id _id;
 
-    HostAndPort _remote;
-    HostAndPort _local;
-
-    TransportLayer* _tl;
+    TagMask _tags;
+    MessageCompressorManager _messageCompressorManager;
 };
 
 }  // namespace transport

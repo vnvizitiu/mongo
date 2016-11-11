@@ -53,37 +53,51 @@ class CollectionBulkLoaderImpl : public CollectionBulkLoader {
     MONGO_DISALLOW_COPYING(CollectionBulkLoaderImpl);
 
 public:
+    struct Stats {
+        Date_t startBuildingIndexes;
+        Date_t endBuildingIndexes;
+
+        std::string toString() const;
+        BSONObj toBSON() const;
+    };
+
     CollectionBulkLoaderImpl(OperationContext* txn,
-                             TaskRunner* runner,
                              Collection* coll,
                              const BSONObj idIndexSpec,
+                             std::unique_ptr<OldThreadPool> threadPool,
+                             std::unique_ptr<TaskRunner> runner,
                              std::unique_ptr<AutoGetOrCreateDb> autoDB,
                              std::unique_ptr<AutoGetCollection> autoColl);
     virtual ~CollectionBulkLoaderImpl();
 
-    virtual Status init(OperationContext* txn,
-                        Collection* coll,
-                        const std::vector<BSONObj>& secondaryIndexSpecs) override;
+    virtual Status init(Collection* coll, const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
     virtual Status insertDocuments(const std::vector<BSONObj>::const_iterator begin,
                                    const std::vector<BSONObj>::const_iterator end) override;
     virtual Status commit() override;
 
+    CollectionBulkLoaderImpl::Stats getStats() const;
+
     virtual std::string toString() const override;
     virtual BSONObj toBSON() const override;
 
 private:
-    TaskRunner* _runner;
+    void _releaseResources();
+    Status _runTaskReleaseResourcesOnFailure(
+        TaskRunner::SynchronousTask task,
+        TaskRunner::NextAction nextAction = TaskRunner::NextAction::kKeepOperationContext);
+
+    std::unique_ptr<OldThreadPool> _threadPool;
+    std::unique_ptr<TaskRunner> _runner;
     std::unique_ptr<AutoGetCollection> _autoColl;
     std::unique_ptr<AutoGetOrCreateDb> _autoDB;
     OperationContext* _txn = nullptr;
     Collection* _coll = nullptr;
     NamespaceString _nss;
-    MultiIndexBlock _idIndexBlock;
-    MultiIndexBlock _secondaryIndexesBlock;
-    bool _hasSecondaryIndexes = false;
+    std::unique_ptr<MultiIndexBlock> _idIndexBlock;
+    std::unique_ptr<MultiIndexBlock> _secondaryIndexesBlock;
     BSONObj _idIndexSpec;
-    bool _callAbortOnDestructor = false;
+    Stats _stats;
 };
 
 }  // namespace repl

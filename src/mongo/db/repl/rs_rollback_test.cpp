@@ -42,6 +42,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface.h"
@@ -60,6 +61,8 @@ namespace {
 
 using namespace mongo;
 using namespace mongo::repl;
+
+const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
 const OplogInterfaceMock::Operations kEmptyMockOperations;
 
@@ -138,26 +141,22 @@ private:
 
 void RSRollbackTest::setUp() {
     ServiceContextMongoDTest::setUp();
-    Client::initThreadIfNotAlready();
     _txn = cc().makeOperationContext();
     _coordinator = new ReplicationCoordinatorRollbackMock();
 
-    auto serviceContext = mongo::getGlobalServiceContext();
+    auto serviceContext = getServiceContext();
     ReplicationCoordinator::set(serviceContext,
                                 std::unique_ptr<ReplicationCoordinator>(_coordinator));
     StorageInterface::set(serviceContext, stdx::make_unique<StorageInterfaceMock>());
 
     setOplogCollectionName();
-    repl::StorageInterface::get(_txn.get())->setMinValid(_txn.get(), {OpTime{}, OpTime{}});
+    repl::StorageInterface::get(_txn.get())->setAppliedThrough(_txn.get(), OpTime{});
+    repl::StorageInterface::get(_txn.get())->setMinValid(_txn.get(), OpTime{});
 }
 
 void RSRollbackTest::tearDown() {
-    {
-        Lock::GlobalWrite globalLock(_txn->lockState());
-        BSONObjBuilder unused;
-        invariant(mongo::dbHolder().closeAll(_txn.get(), unused, false));
-    }
     _txn.reset();
+    ServiceContextMongoDTest::tearDown();
     setGlobalReplicationCoordinator(nullptr);
 }
 
@@ -166,8 +165,9 @@ void noSleep(Seconds seconds) {}
 
 TEST_F(RSRollbackTest, InconsistentMinValid) {
     repl::StorageInterface::get(_txn.get())
-        ->setMinValid(_txn.get(),
-                      {OpTime(Timestamp(Seconds(0), 0), 0), OpTime(Timestamp(Seconds(1), 0), 0)});
+        ->setAppliedThrough(_txn.get(), OpTime(Timestamp(Seconds(0), 0), 0));
+    repl::StorageInterface::get(_txn.get())
+        ->setMinValid(_txn.get(), OpTime(Timestamp(Seconds(1), 0), 0));
     auto status = syncRollback(_txn.get(),
                                OplogInterfaceMock(kEmptyMockOperations),
                                RollbackSourceMock(std::unique_ptr<OplogInterface>(
@@ -426,11 +426,13 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
                           << "key"
                           << BSON("a" << 1)
                           << "name"
-                          << "a_1");
+                          << "a_1"
+                          << "v"
+                          << static_cast<int>(kIndexVersion));
     {
         Lock::DBLock dbLock(_txn->lockState(), "test", MODE_X);
         MultiIndexBlock indexer(_txn.get(), collection);
-        ASSERT_OK(indexer.init(indexSpec));
+        ASSERT_OK(indexer.init(indexSpec).getStatus());
         WriteUnitOfWork wunit(_txn.get());
         indexer.commit();
         wunit.commit();

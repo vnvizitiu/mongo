@@ -37,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/unordered_map.h"
 
@@ -47,6 +48,7 @@ class Collection;
 
 class IndexDescriptor;
 class IndexAccessMethod;
+struct InsertDeleteOptions;
 
 /**
  * how many: 1 per Collection
@@ -81,11 +83,14 @@ public:
     /**
      * Returns the spec for the id index to create by default for this collection.
      */
-    BSONObj getDefaultIdIndexSpec() const;
+    BSONObj getDefaultIdIndexSpec(
+        ServerGlobalParams::FeatureCompatibility::Version featureCompatibilityVersion) const;
 
     IndexDescriptor* findIdIndex(OperationContext* txn) const;
 
     /**
+     * Find index by name.  The index name uniquely identifies an index.
+     *
      * @return null if cannot find
      */
     IndexDescriptor* findIndexByName(OperationContext* txn,
@@ -93,11 +98,31 @@ public:
                                      bool includeUnfinishedIndexes = false) const;
 
     /**
-     * @return null if cannot find
+     * Find index by matching key pattern and collation spec.  The key pattern and collation spec
+     * uniquely identify an index.
+     *
+     * Collation is specified as a normalized collation spec as returned by
+     * CollationInterface::getSpec.  An empty object indicates the simple collation.
+     *
+     * @return null if cannot find index, otherwise the index with a matching key pattern and
+     * collation.
      */
-    IndexDescriptor* findIndexByKeyPattern(OperationContext* txn,
-                                           const BSONObj& key,
-                                           bool includeUnfinishedIndexes = false) const;
+    IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+        OperationContext* txn,
+        const BSONObj& key,
+        const BSONObj& collationSpec,
+        bool includeUnfinishedIndexes = false) const;
+
+    /**
+     * Find indexes with a matching key pattern, putting them into the vector 'matches'.  The key
+     * pattern alone does not uniquely identify an index.
+     *
+     * Consider using 'findIndexByName' if expecting to match one index.
+     */
+    void findIndexesByKeyPattern(OperationContext* txn,
+                                 const BSONObj& key,
+                                 bool includeUnfinishedIndexes,
+                                 std::vector<IndexDescriptor*>* matches) const;
 
     /**
      * Returns an index suitable for shard key range scans.
@@ -105,6 +130,7 @@ public:
      * This index:
      * - must be prefixed by 'shardKey', and
      * - must not be a partial index.
+     * - must have the simple collation.
      *
      * If the parameter 'requireSingleKey' is true, then this index additionally must not be
      * multi-key.
@@ -186,9 +212,10 @@ public:
 
     /**
      * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
-     * empty collection can be rolled back as part of a larger WUOW.
+     * empty collection can be rolled back as part of a larger WUOW. Returns the full specification
+     * of the created index, as it is stored in this index catalog.
      */
-    Status createIndexOnEmptyCollection(OperationContext* txn, BSONObj spec);
+    StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* txn, BSONObj spec);
 
     StatusWith<BSONObj> prepareSpecForCreate(OperationContext* txn, const BSONObj& original) const;
 
@@ -310,6 +337,14 @@ public:
     // public static helpers
 
     static BSONObj fixIndexKey(const BSONObj& key);
+
+    /**
+     * Fills out 'options' in order to indicate whether to allow dups or relax
+     * index constraints, as needed by replication.
+     */
+    static void prepareInsertDeleteOptions(OperationContext* txn,
+                                           const IndexDescriptor* desc,
+                                           InsertDeleteOptions* options);
 
 private:
     static const BSONObj _idObj;  // { _id : 1 }

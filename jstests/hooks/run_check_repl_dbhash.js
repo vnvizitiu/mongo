@@ -47,7 +47,7 @@
         };
 
         this.awaitReplication = function() {
-            assert.commandWorked(primary.adminCommand({fsyncUnlock: 1}),
+            assert.commandWorked(master.adminCommand({fsyncUnlock: 1}),
                                  'failed to unlock the primary');
 
             print('Starting fsync on master to flush all pending writes');
@@ -65,8 +65,16 @@
                                'Awaiting replication failed');
             }
             print('Finished awaiting replication');
-            assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
+            assert.commandWorked(master.adminCommand({fsync: 1, lock: 1}),
                                  'failed to re-lock the primary');
+        };
+
+        this.checkReplicatedDataHashes = function() {
+            ReplSetTest({nodes: 0}).checkReplicatedDataHashes.apply(this, arguments);
+        };
+
+        this.checkReplicaSet = function() {
+            ReplSetTest({nodes: 0}).checkReplicaSet.apply(this, arguments);
         };
     };
 
@@ -78,50 +86,12 @@
     assert(primaryInfo.ismaster,
            'shell is not connected to the primary or master node: ' + tojson(primaryInfo));
 
-    var rst;
     var cmdLineOpts = db.adminCommand('getCmdLineOpts');
     assert.commandWorked(cmdLineOpts);
     var isMasterSlave = cmdLineOpts.parsed.master === true;
-    if (isMasterSlave) {
-        rst = new MasterSlaveDBHashTest(db.getMongo().host);
-    } else {
-        rst = new ReplSetTest(db.getMongo().host);
-    }
-
-    // Call getPrimary to populate rst with information about the nodes.
-    var primary = rst.getPrimary();
-    assert(primary, 'calling getPrimary() failed');
-
-    var activeException = false;
-
-    try {
-        // Lock the primary to prevent the TTL monitor from deleting expired documents in
-        // the background while we are getting the dbhashes of the replica set members.
-        assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
-                             'failed to lock the primary');
-        rst.awaitReplication(60 * 1000 * 5);  // 5min timeout
-
-        var phaseName = 'after test hook';
-        load('jstests/hooks/check_repl_dbhash.js');
-        var blacklist = [];
-        checkDBHashes(rst, blacklist, phaseName);
-    } catch (e) {
-        activeException = true;
-        throw e;
-    } finally {
-        // Allow writes on the primary.
-        var res = primary.adminCommand({fsyncUnlock: 1});
-
-        if (!res.ok) {
-            var msg = 'failed to unlock the primary, which may cause this' +
-                ' test to hang: ' + tojson(res);
-            if (activeException) {
-                print(msg);
-            } else {
-                throw new Error(msg);
-            }
-        }
-    }
+    var testFixture = isMasterSlave ? new MasterSlaveDBHashTest(db.getMongo().host)
+                                    : new ReplSetTest(db.getMongo().host);
+    testFixture.checkReplicatedDataHashes();
 
     var totalTime = Date.now() - startTime;
     print('Finished consistency checks of cluster in ' + totalTime + ' ms.');

@@ -54,6 +54,16 @@ void InclusionNode::optimize() {
     }
 }
 
+void InclusionNode::injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    for (auto&& expressionIt : _expressions) {
+        expressionIt.second->injectExpressionContext(expCtx);
+    }
+
+    for (auto&& childPair : _children) {
+        childPair.second->injectExpressionContext(expCtx);
+    }
+}
+
 void InclusionNode::serialize(MutableDocument* output, bool explain) const {
     // Always put "_id" first if it was included (implicitly or explicitly).
     if (_inclusions.find("_id") != _inclusions.end()) {
@@ -224,6 +234,18 @@ InclusionNode* InclusionNode::addChild(string field) {
     auto insertedPair = _children.emplace(
         std::make_pair(std::move(field), stdx::make_unique<InclusionNode>(std::move(childPath))));
     return insertedPair.first->second.get();
+}
+
+void InclusionNode::addPreservedPaths(std::set<std::string>* preservedPaths) const {
+    // Only our inclusion paths are preserved. This inclusion node may also have paths with
+    // associated expressions, but those paths are modified and therefore are not considered
+    // "preserved".
+    for (auto&& includedField : _inclusions) {
+        preservedPaths->insert(FieldPath::getFullyQualifiedPath(_pathToNode, includedField));
+    }
+    for (auto&& childPair : _children) {
+        childPair.second->addPreservedPaths(preservedPaths);
+    }
 }
 
 //

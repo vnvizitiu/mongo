@@ -80,7 +80,7 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
                                   string* errMsg) {
     BSONObj startingFromKey = startingFromKeyConst;
 
-    std::shared_ptr<CollectionMetadata> metadata;
+    ScopedCollectionMetadata metadata;
     {
         AutoGetCollection autoColl(txn, ns, MODE_IS);
         metadata = CollectionShardingState::get(txn, ns.toString())->getMetadata();
@@ -96,8 +96,9 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
     BSONObj keyPattern = metadata->getKeyPattern();
     if (!startingFromKey.isEmpty()) {
         if (!metadata->isValidKey(startingFromKey)) {
-            *errMsg = stream() << "could not cleanup orphaned data, start key " << startingFromKey
-                               << " does not match shard key pattern " << keyPattern;
+            *errMsg = stream() << "could not cleanup orphaned data, start key "
+                               << redact(startingFromKey) << " does not match shard key pattern "
+                               << keyPattern;
 
             warning() << *errMsg;
             return CleanupResult_Error;
@@ -108,20 +109,17 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
 
     KeyRange orphanRange;
     if (!metadata->getNextOrphanRange(startingFromKey, &orphanRange)) {
-        LOG(1) << "orphaned data cleanup requested for " << ns.toString() << " starting from "
-               << startingFromKey << ", no orphan ranges remain";
+        LOG(1) << "cleanupOrphaned requested for " << ns.toString() << " starting from "
+               << redact(startingFromKey) << ", no orphan ranges remain";
 
         return CleanupResult_Done;
     }
     orphanRange.ns = ns.ns();
     *stoppedAtKey = orphanRange.maxKey;
 
-    // We're done with this metadata now, no matter what happens
-    metadata.reset();
-
-    LOG(1) << "orphaned data cleanup requested for " << ns.toString() << " starting from "
-           << startingFromKey << ", removing next orphan range"
-           << " [" << orphanRange.minKey << "," << orphanRange.maxKey << ")";
+    LOG(0) << "cleanupOrphaned requested for " << ns.toString() << " starting from "
+           << redact(startingFromKey) << ", removing next orphan range"
+           << " [" << redact(orphanRange.minKey) << "," << redact(orphanRange.maxKey) << ")";
 
     // Metadata snapshot may be stale now, but deleter checks metadata again in write lock
     // before delete.
@@ -135,7 +133,7 @@ CleanupResult cleanupOrphanedData(OperationContext* txn,
     deleterOptions.removeSaverReason = "cleanup-cmd";
 
     if (!getDeleter()->deleteNow(txn, deleterOptions, errMsg)) {
-        warning() << *errMsg;
+        warning() << redact(*errMsg);
         return CleanupResult_Error;
     }
 
@@ -184,7 +182,7 @@ public:
         return false;
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
@@ -245,13 +243,13 @@ public:
         }
 
         ChunkVersion shardVersion;
-        Status status = shardingState->refreshMetadataNow(txn, ns, &shardVersion);
+        Status status = shardingState->refreshMetadataNow(txn, NamespaceString(ns), &shardVersion);
         if (!status.isOK()) {
             if (status.code() == ErrorCodes::RemoteChangeDetected) {
                 warning() << "Shard version in transition detected while refreshing "
                           << "metadata for " << ns << " at version " << shardVersion;
             } else {
-                errmsg = str::stream() << "failed to refresh shard metadata: " << status.reason();
+                errmsg = str::stream() << "failed to refresh shard metadata: " << redact(status);
                 return false;
             }
         }

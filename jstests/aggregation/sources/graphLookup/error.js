@@ -9,10 +9,13 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     local.drop();
     local.insert({});
 
-    var pipeline = {
+    var pipeline = {$graphLookup: 4};
+    assertErrorCode(local, pipeline, 40327, "$graphLookup spec must be an object");
+
+    pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -24,7 +27,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -36,7 +39,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -48,18 +51,29 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: -1,
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40103, "from must be a string");
+    assertErrorCode(local, pipeline, 40329, "from must be a string");
+
+    pipeline = {
+        $graphLookup: {
+            from: "",
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output"
+        }
+    };
+    assertErrorCode(local, pipeline, 40330, "from must be a valid namespace");
 
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: 0
@@ -70,7 +84,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "$output"
@@ -81,7 +95,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: 0,
             as: "output"
@@ -92,7 +106,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "$b",
             as: "output"
@@ -103,7 +117,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: 0,
             connectFromField: "b",
             as: "output"
@@ -114,7 +128,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "$a",
             connectFromField: "b",
             as: "output"
@@ -125,7 +139,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -137,7 +151,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -149,7 +163,19 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     pipeline = {
         $graphLookup: {
             from: "foreign",
-            startWith: {$const: 0},
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: "notamatch"
+        }
+    };
+    assertErrorCode(local, pipeline, 40185, "restrictSearchWithMatch must be an object");
+
+    pipeline = {
+        $graphLookup: {
+            from: "foreign",
+            startWith: {$literal: 0},
             connectToField: "a",
             connectFromField: "b",
             as: "output",
@@ -160,12 +186,13 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
 
     pipeline = {
         $graphLookup:
-            {from: "foreign", startWith: {$const: 0}, connectFromField: "b", as: "output"}
+            {from: "foreign", startWith: {$literal: 0}, connectFromField: "b", as: "output"}
     };
     assertErrorCode(local, pipeline, 40105, "connectToField was not specified");
 
     pipeline = {
-        $graphLookup: {from: "foreign", startWith: {$const: 0}, connectToField: "a", as: "output"}
+        $graphLookup:
+            {from: "foreign", startWith: {$literal: 0}, connectToField: "a", as: "output"}
     };
     assertErrorCode(local, pipeline, 40105, "connectFromField was not specified");
 
@@ -175,31 +202,93 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     assertErrorCode(local, pipeline, 40105, "startWith was not specified");
 
     pipeline = {
-        $graphLookup:
-            {from: "foreign", startWith: {$const: 0}, connectToField: "a", connectFromField: "b"}
+        $graphLookup: {
+            from: "foreign",
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b"
+        }
     };
     assertErrorCode(local, pipeline, 40105, "as was not specified");
 
     pipeline = {
         $graphLookup:
-            {startWith: {$const: 0}, connectToField: "a", connectFromField: "b", as: "output"}
+            {startWith: {$literal: 0}, connectToField: "a", connectFromField: "b", as: "output"}
     };
-    assertErrorCode(local, pipeline, 40105, "from was not specified");
+    assertErrorCode(local, pipeline, 40328, "from was not specified");
 
-    // $graphLookup can only be performed on a collection that has a unique _id index.
-    db.createCollection("unindexed", {autoIndexId: false});
+    // restrictSearchWithMatch must be a valid match expression.
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$not: {a: 1}}
+        }
+    };
+    assertErrorCode(local, pipeline, 40186, "unable to parse match expression");
+
+    // $where and $text cannot be used inside $graphLookup.
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$where: "3 > 2"}
+        }
+    };
+    assertErrorCode(local, pipeline, 40186, "cannot use $where inside $graphLookup");
 
     pipeline = {
         $graphLookup: {
-            from: "unindexed",
-            as: "out",
-            startWith: "tmp",
-            connectFromField: "x",
-            connectToField: "y"
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {$text: {$search: "some text"}}
         }
     };
+    assertErrorCode(local, pipeline, 40186, "cannot use $text inside $graphLookup");
 
-    assertErrorCode(local, pipeline, 40106, "foreign collection did not have a unique _id index");
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {
+                x: {$near: {$geometry: {type: 'Point', coordinates: [0, 0]}, $maxDistance: 100}}
+            }
+        }
+    };
+    assertErrorCode(local, pipeline, 40187, "cannot use $near inside $graphLookup");
+
+    pipeline = {
+        $graphLookup: {
+            from: 'foreign',
+            startWith: {$literal: 0},
+            connectToField: "a",
+            connectFromField: "b",
+            as: "output",
+            restrictSearchWithMatch: {
+                $and: [{
+                    x: {
+                        $near: {
+                            $geometry: {type: 'Point', coordinates: [0, 0]},
+                            $maxDistance: 100
+                        }
+                    }
+                }]
+            }
+        }
+    };
+    assertErrorCode(local, pipeline, 40187, "cannot use $near inside $graphLookup at any depth");
 
     // $graphLookup can only consume at most 100MB of memory.
     var foreign = db.foreign;

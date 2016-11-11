@@ -203,8 +203,10 @@ DBCollection.prototype._massageObject = function(q) {
         return q;
 
     if (type == "string") {
-        if (q.length == 24)
-            return {_id: q};
+        // If the string is 24 hex characters, it is most likely an ObjectId.
+        if (/^[0-9a-fA-F]{24}$/.test(q)) {
+            return {_id: ObjectId(q)};
+        }
 
         return {$where: q};
     }
@@ -268,6 +270,11 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
     var readPrefMode = connObj.getReadPrefMode();
     if (readPrefMode != null) {
         cursor.readPref(readPrefMode, connObj.getReadPrefTagSet());
+    }
+
+    var rc = connObj.getReadConcern();
+    if (rc) {
+        cursor.readConcern(rc);
     }
 
     return cursor;
@@ -680,7 +687,7 @@ DBCollection.prototype.createIndexes = function(keys, options) {
     }
 
     if (this.getMongo().writeMode() == "commands") {
-        for (i = 0; i++; i < indexSpecs.length) {
+        for (var i = 0; i < indexSpecs.length; i++) {
             delete (indexSpecs[i].ns);  // ns is passed to the first element in the command.
         }
         return this._db.runCommand({createIndexes: this.getName(), indexes: indexSpecs});
@@ -764,6 +771,19 @@ DBCollection.prototype.findAndModify = function(args) {
 };
 
 DBCollection.prototype.renameCollection = function(newName, dropTarget) {
+    if (arguments.length === 1 && typeof newName === 'object') {
+        if (newName.hasOwnProperty('dropTarget')) {
+            dropTarget = newName['dropTarget'];
+        }
+        newName = newName['to'];
+    }
+    if (typeof dropTarget === 'undefined') {
+        dropTarget = false;
+    }
+    if (typeof newName !== 'string' || typeof dropTarget !== 'boolean') {
+        throw Error(
+            'renameCollection must either take a string and an optional boolean or an object.');
+    }
     return this._db._adminCommand({
         renameCollection: this._fullName,
         to: this._db._name + "." + newName,
@@ -1026,7 +1046,7 @@ DBCollection.prototype._getIndexesCommand = function(filter) {
         throw _getErrorWithCode(res, "listIndexes failed: " + tojson(res));
     }
 
-    return new DBCommandCursor(this._mongo, res).toArray();
+    return new DBCommandCursor(res._mongo, res).toArray();
 };
 
 DBCollection.prototype.getIndexes = function(filter) {
@@ -1201,7 +1221,7 @@ DBCollection.prototype.convertToCapped = function(bytes) {
 DBCollection.prototype.exists = function() {
     var res = this._db.runCommand("listCollections", {filter: {name: this._shortName}});
     if (res.ok) {
-        var cursor = new DBCommandCursor(this._mongo, res);
+        var cursor = new DBCommandCursor(res._mongo, res);
         if (!cursor.hasNext())
             return null;
         return cursor.next();
@@ -1299,7 +1319,10 @@ DBCollection.prototype.aggregate = function(pipeline, aggregateOptions) {
     assert.commandWorked(res, "aggregate failed");
 
     if ("cursor" in res) {
-        return new DBCommandCursor(this._mongo, res);
+        if (cmd["cursor"]["batchSize"] > 0) {
+            var batchSizeValue = cmd["cursor"]["batchSize"];
+        }
+        return new DBCommandCursor(res._mongo, res, batchSizeValue);
     }
 
     return res;
@@ -1671,35 +1694,10 @@ DBCollection.prototype.unsetWriteConcern = function() {
 * @return {number}
 */
 DBCollection.prototype.count = function(query, options) {
-    var opts = Object.extend({}, options || {});
+    query = this.find(query);
 
-    var query = this.find(query);
-    if (typeof opts.skip == 'number') {
-        query.skip(opts.skip);
-    }
-
-    if (typeof opts.limit == 'number') {
-        query.limit(opts.limit);
-    }
-
-    if (typeof opts.maxTimeMS == 'number') {
-        query.maxTimeMS(opts.maxTimeMS);
-    }
-
-    if (opts.hint) {
-        query.hint(opts.hint);
-    }
-
-    if (typeof opts.readConcern == 'string') {
-        query.readConcern(opts.readConcern);
-    }
-
-    if (typeof opts.collation == 'object') {
-        query.collation(opts.collation);
-    }
-
-    // Return the result of the find
-    return query.count(true);
+    // Apply options and return the result of the find
+    return QueryHelpers._applyCountOptions(query, options).count(true);
 };
 
 /**
@@ -1754,8 +1752,9 @@ DBCollection.prototype._distinct = function(keyString, query) {
     return this._dbReadCommand({distinct: this._shortName, key: keyString, query: query || {}});
 };
 
-DBCollection.prototype.latencyStats = function() {
-    return this.aggregate([{$collStats: {latencyStats: {}}}]);
+DBCollection.prototype.latencyStats = function(options) {
+    options = options || {};
+    return this.aggregate([{$collStats: {latencyStats: options}}]);
 };
 
 /**
@@ -1797,9 +1796,11 @@ PlanCache.prototype.help = function() {
           "displays all query shapes in a collection");
     print("\tdb." + shortName + ".getPlanCache().clear() - " +
           "drops all cached queries in a collection");
-    print("\tdb." + shortName + ".getPlanCache().clearPlansByQuery(query[, projection, sort]) - " +
+    print("\tdb." + shortName +
+          ".getPlanCache().clearPlansByQuery(query[, projection, sort, collation]) - " +
           "drops query shape from plan cache");
-    print("\tdb." + shortName + ".getPlanCache().getPlansByQuery(query[, projection, sort]) - " +
+    print("\tdb." + shortName +
+          ".getPlanCache().getPlansByQuery(query[, projection, sort, collation]) - " +
           "displays the cached plans for a query shape");
     return __magicNoPrint;
 };
@@ -1807,23 +1808,30 @@ PlanCache.prototype.help = function() {
 /**
  * Internal function to parse query shape.
  */
-PlanCache.prototype._parseQueryShape = function(query, projection, sort) {
+PlanCache.prototype._parseQueryShape = function(query, projection, sort, collation) {
     if (query == undefined) {
         throw new Error("required parameter query missing");
     }
 
     // Accept query shape object as only argument.
-    // Query shape contains exactly 3 fields (query, projection and sort)
-    // as generated in the listQueryShapes() result.
-    if (typeof(query) == 'object' && projection == undefined && sort == undefined) {
+    // Query shape must contain 'query', 'projection', and 'sort', and may optionally contain
+    // 'collation'. 'collation' must be non-empty if present.
+    if (typeof(query) == 'object' && projection == undefined && sort == undefined &&
+        collation == undefined) {
         var keysSorted = Object.keys(query).sort();
         // Expected keys must be sorted for the comparison to work.
         if (bsonWoCompare(keysSorted, ['projection', 'query', 'sort']) == 0) {
             return query;
         }
+        if (bsonWoCompare(keysSorted, ['collation', 'projection', 'query', 'sort']) == 0) {
+            if (Object.keys(query.collation).length === 0) {
+                throw new Error("collation object must not be empty");
+            }
+            return query;
+        }
     }
 
-    // Extract query shape, projection and sort from DBQuery if it is the first
+    // Extract query shape, projection, sort and collation from DBQuery if it is the first
     // argument. If a sort or projection is provided in addition to DBQuery, do not
     // overwrite with the DBQuery value.
     if (query instanceof DBQuery) {
@@ -1833,10 +1841,14 @@ PlanCache.prototype._parseQueryShape = function(query, projection, sort) {
         if (sort != undefined) {
             throw new Error("cannot pass DBQuery with sort");
         }
+        if (collation != undefined) {
+            throw new Error("cannot pass DBQuery with collation");
+        }
 
         var queryObj = query._query["query"] || {};
         projection = query._fields || {};
         sort = query._query["orderby"] || {};
+        collation = query._query["collation"] || undefined;
         // Overwrite DBQuery with the BSON query.
         query = queryObj;
     }
@@ -1846,6 +1858,11 @@ PlanCache.prototype._parseQueryShape = function(query, projection, sort) {
         projection: projection == undefined ? {} : projection,
         sort: sort == undefined ? {} : sort,
     };
+
+    if (collation !== undefined) {
+        shape.collation = collation;
+    }
+
     return shape;
 };
 
@@ -1878,17 +1895,18 @@ PlanCache.prototype.clear = function() {
 /**
  * List plans for a query shape.
  */
-PlanCache.prototype.getPlansByQuery = function(query, projection, sort) {
+PlanCache.prototype.getPlansByQuery = function(query, projection, sort, collation) {
     return this
         ._runCommandThrowOnError("planCacheListPlans",
-                                 this._parseQueryShape(query, projection, sort))
+                                 this._parseQueryShape(query, projection, sort, collation))
         .plans;
 };
 
 /**
  * Drop query shape from the plan cache.
  */
-PlanCache.prototype.clearPlansByQuery = function(query, projection, sort) {
-    this._runCommandThrowOnError("planCacheClear", this._parseQueryShape(query, projection, sort));
+PlanCache.prototype.clearPlansByQuery = function(query, projection, sort, collation) {
+    this._runCommandThrowOnError("planCacheClear",
+                                 this._parseQueryShape(query, projection, sort, collation));
     return;
 };

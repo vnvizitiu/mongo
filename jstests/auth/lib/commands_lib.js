@@ -75,6 +75,14 @@ The teardown function, if present, is called immediately after
 testint whether a particular role authorizes a command for a
 particular database.
 
+8) privileges
+
+An array of privileges used when testing user-defined roles. The test case tests that a user with
+the specified privileges is authorized to run the command, and that having only a subset of the
+privileges causes an authorization failure. If an individual privilege specifies
+"removeWhenTestingAuthzFailure: false", then that privilege will not be removed when testing for
+authorization failure.
+
 */
 
 // constants
@@ -190,24 +198,249 @@ var authCommandsLib = {
               roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager)
           }]
         },
+
         {
-          testname: "applyOps",
-          command: {applyOps: "x"},
+          testname: "applyOps_empty",
+          command: {applyOps: []},
+          skipSharded: true,
           testcases: [
               {
-                runOnDb: adminDbName,
                 roles: {__system: 1},
-                privileges: [{resource: {anyResource: true}, actions: ["anyAction"]}],
-                expectFail: true
+                runOnDb: adminDbName,
               },
               {
-                runOnDb: firstDbName,
                 roles: {__system: 1},
-                privileges: [{resource: {anyResource: true}, actions: ["anyAction"]}],
-                expectFail: true
+                runOnDb: firstDbName,
               }
           ]
         },
+        {
+          testname: "applyOps_precondition",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1473353037, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "n",
+                  "ns": "",
+                  "o": {}
+              }],
+              preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["find"]},
+                    {
+                      resource: {cluster: true},
+                      actions: ["appendOplogNote"],
+                      removeWhenTestingAuthzFailure: false
+                    },
+                ],
+              },
+          ]
+        },
+        {
+          testname: "applyOps_noop",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1473353037, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "n",
+                  "ns": "",
+                  "o": {}
+              }]
+          },
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                ],
+              },
+              {
+                runOnDb: firstDbName,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["appendOplogNote"]},
+                ],
+                expectFailure: true
+              }
+          ]
+        },
+        {
+          testname: "applyOps_c_renameCollection_twoDbs",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1474051004, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "c",
+                  "ns": "test.$cmd",
+                  "o": {
+                      "renameCollection": firstDbName + ".x",
+                      "to": secondDbName + ".y",
+                      "stayTemp": false,
+                      "dropTarget": false
+                  }
+              }]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({});
+              db.getSisterDB(adminDbName).runCommand({movePrimary: firstDbName, to: shard0name});
+              db.getSisterDB(adminDbName).runCommand({movePrimary: secondDbName, to: shard0name});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+              db.getSisterDB(secondDbName).y.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {
+                      resource: {db: firstDbName, collection: "x"},
+                      actions: ["find", "dropCollection"]
+                    },
+                    {
+                      resource: {db: secondDbName, collection: "y"},
+                      actions: ["insert", "createIndex"]
+                    }
+                ]
+              },
+          ]
+        },
+        {
+          testname: "applyOps_insert",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1474051453, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "i",
+                  "ns": firstDbName + ".x",
+                  "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
+              }]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_write,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["insert"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "applyOps_upsert",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1474053682, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "u",
+                  "ns": firstDbName + ".x",
+                  "o2": {"_id": 1},
+                  "o": {"_id": 1, "data": 8}
+              }]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.merge(roles_write, {restore: 0}, true),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["update", "insert"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "applyOps_update",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1474053682, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "u",
+                  "ns": firstDbName + ".x",
+                  "o2": {"_id": 1},
+                  "o": {"_id": 1, "data": 8}
+              }],
+              alwaysUpsert: false
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.merge(roles_write, {restore: 0}, true),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["update"]},
+                ],
+              },
+          ]
+        },
+        {
+          testname: "applyOps_delete",
+          command: {
+              applyOps: [{
+                  "ts": Timestamp(1474056194, 1),
+                  "h": NumberLong(0),
+                  "v": 2,
+                  "op": "d",
+                  "ns": firstDbName + ".x",
+                  "o": {"_id": 1}
+              }]
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
+          },
+          teardown: function(db) {
+              db.getSisterDB(firstDbName).x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.merge(roles_write, {restore: 0}, true),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "x"}, actions: ["remove"]},
+                ],
+              },
+          ]
+        },
+
         {
           testname: "aggregate_readonly",
           command: {aggregate: "foo", pipeline: []},
@@ -226,6 +459,31 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_readonly_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {aggregate: "view", pipeline: []},
+          testcases: [
+              // Tests that a user with read privileges on a view can aggregate it, even if they
+              // don't have read privileges on the underlying namespace.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "view"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["find"]}]
+              }
+          ]
+        },
+        {
           testname: "aggregate_explain",
           command: {aggregate: "foo", explain: true, pipeline: [{$match: {bar: 1}}]},
           testcases: [
@@ -239,6 +497,31 @@ var authCommandsLib = {
                 roles: roles_readAny,
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_explain_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {aggregate: "view", explain: true, pipeline: [{$match: {bar: 1}}]},
+          testcases: [
+              // Tests that a user with read privileges on a view can explain an aggregation on the
+              // view, even if they don't have read privileges on the underlying namespace.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "view"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["find"]}]
               }
           ]
         },
@@ -263,6 +546,68 @@ var authCommandsLib = {
                     {resource: {db: secondDbName, collection: "foo_out"}, actions: ["insert"]},
                     {resource: {db: secondDbName, collection: "foo_out"}, actions: ["remove"]}
                 ]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_readView_writeCollection",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {aggregate: "view", pipeline: [{$out: "view_out"}]},
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {readWrite: 1, readWriteAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "view_out"}, actions: ["insert"]},
+                    {resource: {db: firstDbName, collection: "view_out"}, actions: ["remove"]}
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: secondDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "view_out"}, actions: ["insert"]},
+                    {resource: {db: secondDbName, collection: "view_out"}, actions: ["remove"]}
+                ]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_writeView",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {aggregate: "foo", pipeline: [{$out: "view"}]},
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {readWrite: 1, readWriteAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "view"}, actions: ["insert"]},
+                    {resource: {db: firstDbName, collection: "view"}, actions: ["remove"]}
+                ],
+                expectFail: true  // Cannot write to a view.
+              },
+              {
+                runOnDb: secondDbName,
+                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "view"}, actions: ["insert"]},
+                    {resource: {db: secondDbName, collection: "view"}, actions: ["remove"]}
+                ],
+                expectFail: true  // Cannot write to a view.
               }
           ]
         },
@@ -317,6 +662,42 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "aggregate_lookup_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+              db.createCollection("foo");
+          },
+          teardown: function(db) {
+              db.view.drop();
+              db.foo.drop();
+          },
+          command: {
+              aggregate: "foo",
+              pipeline: [{
+                  $lookup: {from: "view", localField: "_id", foreignField: "_id", as: "results"}
+              }]
+          },
+          testcases: [
+              // Tests that a user can successfully $lookup into a view when given read access.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges: [
+                    {resource: {db: secondDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}
+                ]
+              }
+          ]
+        },
+        {
           testname: "aggregate_graphLookup",
           command: {
               aggregate: "foo",
@@ -353,6 +734,48 @@ var authCommandsLib = {
                 privileges: [
                     {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
                     {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]}
+                ]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_graphLookup_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+              db.createCollection("foo");
+          },
+          teardown: function(db) {
+              db.view.drop();
+              db.foo.drop();
+          },
+          command: {
+              aggregate: "foo",
+              pipeline: [{
+                  $graphLookup: {
+                      from: "view",
+                      startWith: [1],
+                      connectFromField: "_id",
+                      connectToField: "viewId",
+                      as: "results"
+                  }
+              }]
+          },
+          testcases: [
+              // Tests that a user can successfully $graphLookup into a view when given read access.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]}
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges: [
+                    {resource: {db: secondDbName, collection: "view"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}
                 ]
               }
           ]
@@ -400,6 +823,133 @@ var authCommandsLib = {
                 },
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["collStats"]}]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_facet",
+          command: {
+              aggregate: "foo",
+              pipeline: [{
+                  // There are stages within the $facet stage that require additional privileges.
+                  $facet: {
+                      lookup: [{
+                          $lookup: {
+                              from: "bar",
+                              localField: "_id",
+                              foreignField: "_id",
+                              as: "results"
+                          }
+                      }],
+                      graphLookup: [{
+                          $graphLookup: {
+                              from: "baz",
+                              startWith: [1],
+                              connectFromField: "_id",
+                              connectToField: "bazId",
+                              as: "results"
+                          }
+                      }]
+                  }
+              }]
+          },
+          setup: function(db) {
+              db.createCollection("foo");
+              db.createCollection("bar");
+              db.createCollection("baz");
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.bar.drop();
+              db.baz.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "baz"}, actions: ["find"]}
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "baz"}, actions: ["find"]}
+                ]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_facet_views",
+          command: {
+              aggregate: "foo",
+              pipeline: [{
+                  $facet: {
+                      lookup: [{
+                          $lookup: {
+                              from: "view1",
+                              localField: "_id",
+                              foreignField: "_id",
+                              as: "results"
+                          }
+                      }],
+                      graphLookup: [{
+                          $graphLookup: {
+                              from: "view2",
+                              startWith: "foo",
+                              connectFromField: "_id",
+                              connectToField: "_id",
+                              as: "results"
+                          }
+                      }]
+                  }
+              }]
+          },
+          setup: function(db) {
+              db.createCollection("foo");
+              db.createView("view1", "bar", [
+                  {$lookup: {from: "qux", localField: "_id", foreignField: "_id", as: "results"}}
+              ]);
+              db.createView("view2", "baz", [{
+                                $graphLookup: {
+                                    from: "quz",
+                                    startWith: [1],
+                                    connectFromField: "_id",
+                                    connectToField: "_id",
+                                    as: "results"
+                                }
+                            }]);
+          },
+          teardown: function(db) {
+              db.foo.drop();
+              db.view1.drop();
+              db.view2.drop();
+          },
+          testcases: [
+              // Tests that a user can successfully $lookup and $graphLookup into views when the
+              // lookups are nested within a $facet.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "view1"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "view2"}, actions: ["find"]}
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "view1"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "view2"}, actions: ["find"]}
+                ]
               }
           ]
         },
@@ -559,6 +1109,267 @@ var authCommandsLib = {
                 roles: Object.extend({restore: 1}, roles_dbAdminAny),
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["collMod"]}]
+              }
+          ]
+        },
+        {
+          testname: "collMod_views",
+          setup: function(db) {
+              db.createView("view", "foo", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {collMod: "view", viewOn: "bar", pipeline: [{$limit: 7}]},
+          testcases: [
+              // Tests that a user who can modify a view (but not read it) may modify it to be a
+              // view on a namespace the user also cannot read.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges:
+                    [{resource: {db: firstDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              // Tests that a user who can both read and modify a view has read privileges on the
+              // view's underlying namespace.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              }
+          ]
+        },
+        {
+          testname: "collMod_views_lookup",
+          setup: function(db) {
+              db.createView("view", "foo", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {
+              collMod: "view",
+              viewOn: "bar",
+              pipeline: [
+                  {$lookup: {from: "baz", localField: "_id", foreignField: "_id", as: "results"}}
+              ]
+          },
+          testcases: [
+              // Tests that a user who can modify a view (but not read it) may modify it to depend
+              // on namespaces the user also cannot read, including namespaces accessed via $lookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges:
+                    [{resource: {db: firstDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              // Tests that a user who can both read and modify a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $lookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              }
+          ]
+        },
+        {
+          testname: "collMod_views_graphLookup",
+          setup: function(db) {
+              db.createView("view", "foo", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {
+              collMod: "view",
+              viewOn: "bar",
+              pipeline: [{
+                  $graphLookup: {
+                      from: "baz",
+                      startWith: [1],
+                      connectFromField: "_id",
+                      connectToField: "bazId",
+                      as: "results"
+                  }
+              }]
+          },
+          testcases: [
+              // Tests that a user who can modify a view (but not read it) may modify it to depend
+              // on namespaces the user also cannot read, including namespaces accessed via
+              // $graphLookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges:
+                    [{resource: {db: firstDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["collMod"]}]
+              },
+              // Tests that a user who can both read and modify a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $graphLookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              }
+          ]
+        },
+        {
+          testname: "collMod_views_facet",
+          setup: function(db) {
+              db.createView("view", "foo", []);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {
+              collMod: "view",
+              viewOn: "bar",
+              pipeline: [{
+                  $facet: {
+                      lookup: [{
+                          $lookup: {
+                              from: "baz",
+                              localField: "_id",
+                              foreignField: "_id",
+                              as: "results"
+                          }
+                      }],
+                      graphLookup: [{
+                          $graphLookup: {
+                              from: "qux",
+                              startWith: "blah",
+                              connectFromField: "_id",
+                              connectToField: "_id",
+                              as: "results"
+                          }
+                      }]
+                  }
+              }]
+          },
+          testcases: [
+              // Tests that a user who can modify a view (but not read it) may modify it to depend
+              // on namespaces the user also cannot read, including namespaces accessed via $lookup
+              // and $graphLookup that are nested within a $facet.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges:
+                    [{resource: {db: firstDbName, collection: "view"}, actions: ["collMod"]}],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["collMod"]}],
+              },
+              // Tests that a user who can both read and modify a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $lookup and
+              // $graphLookup that are nested within a $facet.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "baz"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "qux"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_dbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "baz"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "qux"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["collMod", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
               }
           ]
         },
@@ -799,6 +1610,48 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "_configsvrCommitChunkMerge",
+          command: {_configsvrCommitChunkMerge: "x.y"},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCommitChunkMigration",
+          command: {_configsvrCommitChunkMigration: "x.y"},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCommitChunkSplit",
+          command: {_configsvrCommitChunkSplit: "x.y"},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
+        {
           testname: "create",
           command: {create: "x"},
           teardown: function(db) {
@@ -830,6 +1683,272 @@ var authCommandsLib = {
                 roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
                 privileges:
                     [{resource: {db: secondDbName, collection: "x"}, actions: ["insert"]}]
+              }
+          ]
+        },
+        {
+          testname: "create_views",
+          command: {create: "view", viewOn: "collection", pipeline: [{$match: {}}]},
+          teardown: function(db) {
+              db.view.drop();
+          },
+          testcases: [
+              // Tests that a user who can create a view (but not read it) can create a view on a
+              // namespace the user also cannot read.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [{
+                    resource: {db: firstDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [{
+                    resource: {db: secondDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }]
+              },
+              // Tests that a user who can both create and read a view has read privileges on the
+              // view's underlying namespace.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "collection"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "collection"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              }
+          ]
+        },
+        {
+          testname: "create_views_lookup",
+          command: {
+              create: "view",
+              viewOn: "foo",
+              pipeline: [
+                  {$lookup: {from: "bar", localField: "_id", foreignField: "_id", as: "results"}}
+              ]
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          testcases: [
+              // Tests that a user who can create a view (but not read it) may create a view that
+              // depends on namespaces the user also cannot read, including namespaces accessed via
+              // $lookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [{
+                    resource: {db: firstDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [{
+                    resource: {db: secondDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              // Tests that a user who can both create and read a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $lookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ]
+              }
+          ]
+        },
+        {
+          testname: "create_views_graphLookup",
+          command: {
+              create: "view",
+              viewOn: "foo",
+              pipeline: [{
+                  $graphLookup: {
+                      from: "bar",
+                      startWith: [1],
+                      connectFromField: "_id",
+                      connectToField: "barId",
+                      as: "results"
+                  }
+              }]
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          testcases: [
+              // Tests that a user who can create a view (but not read it) may create a view that
+              // depends on namespaces the user also cannot read, including namespaces accessed via
+              // $graphLookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [{
+                    resource: {db: firstDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [{
+                    resource: {db: secondDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              // Tests that a user who can both create and read a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $graphLookup.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
+              }
+          ]
+        },
+        {
+          testname: "create_views_facet",
+          command: {
+              create: "view",
+              viewOn: "foo",
+              pipeline: [{
+                  $facet: {
+                      lookup: [{
+                          $lookup: {
+                              from: "bar",
+                              localField: "_id",
+                              foreignField: "_id",
+                              as: "results"
+                          }
+                      }],
+                      graphLookup: [{
+                          $graphLookup: {
+                              from: "baz",
+                              startWith: "foo",
+                              connectFromField: "_id",
+                              connectToField: "_id",
+                              as: "results"
+                          }
+                      }]
+                  }
+              }]
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          testcases: [
+              // Tests that a user who can create a view (but not read it) may create a view that
+              // depends on namespaces the user also cannot read, including namespaces accessed via
+              // $lookup and $graphLookup that are nested within a $facet.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [{
+                    resource: {db: firstDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [{
+                    resource: {db: secondDbName, collection: "view"},
+                    actions: ["createCollection"]
+                }],
+              },
+              // Tests that a user who can both create and read a view has read privileges on all
+              // the view's dependent namespaces, including namespaces accessed via $lookup and
+              // $graphLookup that are nested within a $facet.
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: firstDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: firstDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [
+                    {resource: {db: secondDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "bar"}, actions: ["find"]},
+                    {resource: {db: secondDbName, collection: "baz"}, actions: ["find"]},
+                    {
+                      resource: {db: secondDbName, collection: "view"},
+                      actions: ["createCollection", "find"],
+                      removeWhenTestingAuthzFailure: false
+                    }
+                ],
               }
           ]
         },
@@ -1077,6 +2196,31 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "drop_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          command: {drop: "view"},
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdmin),
+                privileges: [{
+                    resource: {db: firstDbName, collection: "view"},
+                    actions: ["dropCollection"]
+                }]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: Object.extend({restore: 1}, roles_writeDbAdminAny),
+                privileges: [{
+                    resource: {db: secondDbName, collection: "view"},
+                    actions: ["dropCollection"]
+                }]
+              }
+          ]
+        },
+        {
           testname: "dropDatabase",
           command: {dropDatabase: 1},
           setup: function(db) {
@@ -1206,6 +2350,31 @@ var authCommandsLib = {
                 roles: roles_readAny,
                 privileges:
                     [{resource: {db: secondDbName, collection: "foo"}, actions: ["find"]}]
+              }
+          ]
+        },
+        {
+          testname: "find_views",
+          setup: function(db) {
+              db.createView("view", "collection", [{$match: {}}]);
+          },
+          teardown: function(db) {
+              db.view.drop();
+          },
+          command: {find: "view"},
+          testcases: [
+              // Tests that a user with read access to a view can perform a find on it, even if they
+              // don't have read access to the underlying namespace.
+              {
+                runOnDb: firstDbName,
+                roles: roles_read,
+                privileges: [{resource: {db: firstDbName, collection: "view"}, actions: ["find"]}]
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_readAny,
+                privileges:
+                    [{resource: {db: secondDbName, collection: "view"}, actions: ["find"]}]
               }
           ]
         },
@@ -1350,6 +2519,24 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 roles: roles_monitoring,
                 privileges: [{resource: {cluster: true}, actions: ["getCmdLineOpts"]}]
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "getDiagnosticData",
+          command: {getDiagnosticData: 1},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_monitoring,
+                privileges: [
+                    {resource: {cluster: true}, actions: ["serverStatus"]},
+                    {resource: {cluster: true}, actions: ["replSetGetStatus"]},
+                    {resource: {db: "local", collection: "oplog.rs"}, actions: ["collStats"]},
+                ]
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
@@ -2377,6 +3564,21 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "replSetStepUp",
+          command: {replSetStepUp: "x"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {cluster: true}, actions: ["replSetStateChange"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
           testname: "replSetSyncFrom",
           command: {replSetSyncFrom: "x"},
           skipSharded: true,
@@ -2434,6 +3636,23 @@ var authCommandsLib = {
                 roles: roles_monitoring,
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               }
+          ]
+        },
+        {
+          testname: "setFeatureCompatibilityVersion",
+          command: {setFeatureCompatibilityVersion: "x"},
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager),
+                privileges: [{
+                    resource: {db: '$setFeatureCompatibilityVersion', collection: 'version'},
+                    actions: ['update']
+                }],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
           ]
         },
         {
@@ -2725,6 +3944,35 @@ var authCommandsLib = {
         {
           testname: "_configsvrRemoveShardFromZone",
           command: {_configsvrRemoveShardFromZone: shard0name, zone: 'z'},
+          skipSharded: true,
+          testcases: [
+              {runOnDb: adminDbName, roles: {__system: 1}, expectFail: true},
+          ]
+        },
+        {
+          testname: "updateZoneKeyRange",
+          command: {updateZoneKeyRange: 'test.foo', min: {x: 1}, max: {x: 5}, zone: 'z'},
+          skipStandalone: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                // updateZoneKeyRange only checks that you can write on config.tags,
+                // that's why readWriteAnyDatabase passes.
+                roles: Object.extend({readWriteAnyDatabase: 1}, roles_clusterManager),
+                privileges: [
+                    {resource: {db: 'config', collection: 'shards'}, actions: ['find']},
+                    {
+                      resource: {db: 'config', collection: 'tags'},
+                      actions: ['find', 'update', 'remove']
+                    },
+                ],
+                expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrUpdateZoneKeyRange",
+          command: {_configsvrUpdateZoneKeyRange: 'test.foo', min: {x: 1}, max: {x: 5}, zone: 'z'},
           skipSharded: true,
           testcases: [
               {runOnDb: adminDbName, roles: {__system: 1}, expectFail: true},

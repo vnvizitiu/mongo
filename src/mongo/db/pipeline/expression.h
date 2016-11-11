@@ -38,6 +38,7 @@
 #include "mongo/base/init.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/stdx/functional.h"
@@ -281,8 +282,31 @@ public:
      */
     static void registerExpression(std::string key, Parser parser);
 
+    /**
+     * Injects the ExpressionContext so that it may be used during evaluation of the Expression.
+     * Construction of expressions is done at parse time, but the ExpressionContext isn't finalized
+     * until later, at which point it is injected using this method.
+     */
+    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+        _expCtx = expCtx;
+        doInjectExpressionContext();
+    }
+
 protected:
     typedef std::vector<boost::intrusive_ptr<Expression>> ExpressionVector;
+
+    /**
+     * Expressions which need to update their internal state when attaching to a new
+     * ExpressionContext should override this method.
+     */
+    virtual void doInjectExpressionContext() {}
+
+    const boost::intrusive_ptr<ExpressionContext>& getExpressionContext() const {
+        return _expCtx;
+    }
+
+private:
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 
 
@@ -321,6 +345,8 @@ public:
     virtual void validateArguments(const ExpressionVector& args) const {}
 
     static ExpressionVector parseArguments(BSONElement bsonExpr, const VariablesParseState& vps);
+
+    void doInjectExpressionContext() final;
 
 protected:
     ExpressionNary() {}
@@ -392,6 +418,7 @@ class ExpressionFromAccumulator
 public:
     Value evaluateInternal(Variables* vars) const final {
         Accumulator accum;
+        accum.injectExpressionContext(this->getExpressionContext());
         const size_t n = this->vpOperand.size();
         // If a single array arg is given, loop through it passing each member to the accumulator.
         // If a single, non-array arg is given, pass it directly to the accumulator.
@@ -538,7 +565,10 @@ public:
     Value serialize(bool explain) const final;
 
     static boost::intrusive_ptr<ExpressionCoerceToBool> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const boost::intrusive_ptr<Expression>& pExpression);
+
+    void doInjectExpressionContext() final;
 
 private:
     explicit ExpressionCoerceToBool(const boost::intrusive_ptr<Expression>& pExpression);
@@ -619,7 +649,9 @@ public:
 
     const char* getOpName() const;
 
-    static boost::intrusive_ptr<ExpressionConstant> create(const Value& pValue);
+    static boost::intrusive_ptr<ExpressionConstant> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, const Value& pValue);
+
     static boost::intrusive_ptr<Expression> parse(BSONElement bsonExpr,
                                                   const VariablesParseState& vps);
 
@@ -646,6 +678,8 @@ public:
     void addDependencies(DepsTracker* deps) const final;
 
     static boost::intrusive_ptr<Expression> parse(BSONElement expr, const VariablesParseState& vps);
+
+    void doInjectExpressionContext() final;
 
 private:
     ExpressionDateToString(const std::string& format,               // the format string
@@ -777,6 +811,8 @@ public:
 
     static boost::intrusive_ptr<Expression> parse(BSONElement expr, const VariablesParseState& vps);
 
+    void doInjectExpressionContext() final;
+
 private:
     ExpressionFilter(std::string varName,
                      Variables::Id varId,
@@ -859,6 +895,8 @@ public:
 
     static boost::intrusive_ptr<Expression> parse(BSONElement expr, const VariablesParseState& vps);
 
+    void doInjectExpressionContext() final;
+
     struct NameAndExpression {
         NameAndExpression() {}
         NameAndExpression(std::string name, boost::intrusive_ptr<Expression> expression)
@@ -900,6 +938,8 @@ public:
     void addDependencies(DepsTracker* deps) const final;
 
     static boost::intrusive_ptr<Expression> parse(BSONElement expr, const VariablesParseState& vps);
+
+    void doInjectExpressionContext() final;
 
 private:
     ExpressionMap(
@@ -1026,6 +1066,8 @@ public:
         return _expressions;
     }
 
+    void doInjectExpressionContext() final;
+
 private:
     ExpressionObject(
         std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>&& expressions);
@@ -1052,6 +1094,10 @@ public:
 };
 
 class ExpressionPow final : public ExpressionFixedArity<ExpressionPow, 2> {
+public:
+    static boost::intrusive_ptr<Expression> create(Value base, Value exp);
+
+private:
     Value evaluateInternal(Variables* vars) const final;
     const char* getOpName() const final;
 };
@@ -1071,6 +1117,8 @@ public:
     static boost::intrusive_ptr<Expression> parse(BSONElement expr,
                                                   const VariablesParseState& vpsIn);
     Value serialize(bool explain) const final;
+
+    void doInjectExpressionContext() final;
 
 private:
     boost::intrusive_ptr<Expression> _input;
@@ -1232,7 +1280,7 @@ public:
 };
 
 
-class ExpressionSwitch final : public ExpressionFixedArity<ExpressionSwitch, 1> {
+class ExpressionSwitch final : public Expression {
 public:
     void addDependencies(DepsTracker* deps) const final;
     Value evaluateInternal(Variables* vars) const final;
@@ -1240,7 +1288,8 @@ public:
     static boost::intrusive_ptr<Expression> parse(BSONElement expr,
                                                   const VariablesParseState& vpsIn);
     Value serialize(bool explain) const final;
-    const char* getOpName() const final;
+
+    void doInjectExpressionContext() final;
 
 private:
     using ExpressionPair =
@@ -1327,7 +1376,7 @@ public:
 };
 
 
-class ExpressionZip final : public ExpressionFixedArity<ExpressionZip, 1> {
+class ExpressionZip final : public Expression {
 public:
     void addDependencies(DepsTracker* deps) const final;
     Value evaluateInternal(Variables* vars) const final;
@@ -1335,7 +1384,8 @@ public:
     static boost::intrusive_ptr<Expression> parse(BSONElement expr,
                                                   const VariablesParseState& vpsIn);
     Value serialize(bool explain) const final;
-    const char* getOpName() const final;
+
+    void doInjectExpressionContext() final;
 
 private:
     bool _useLongestLength = false;

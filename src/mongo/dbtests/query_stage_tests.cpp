@@ -118,7 +118,9 @@ public:
     IndexDescriptor* getIndex(const BSONObj& obj) {
         AutoGetCollectionForRead ctx(&_txn, ns());
         Collection* collection = ctx.getCollection();
-        return collection->getIndexCatalog()->findIndexByKeyPattern(&_txn, obj);
+        std::vector<IndexDescriptor*> indexes;
+        collection->getIndexCatalog()->findIndexesByKeyPattern(&_txn, obj, false, &indexes);
+        return indexes.empty() ? nullptr : indexes[0];
     }
 
     static int numObj() {
@@ -147,7 +149,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSONObj();
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = -1;
 
         ASSERT_EQUALS(countResults(params), 21);
@@ -165,7 +167,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 30);
-        params.bounds.endKeyInclusive = false;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
         params.direction = 1;
 
         ASSERT_EQUALS(countResults(params), 10);
@@ -183,7 +185,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 30);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
         ASSERT_EQUALS(countResults(params), 11);
@@ -202,7 +204,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 30);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
         ASSERT_EQUALS(countResults(params, BSON("foo" << 25)), 1);
@@ -221,7 +223,7 @@ public:
         params.bounds.isSimpleRange = true;
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 30);
-        params.bounds.endKeyInclusive = true;
+        params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
         ASSERT_THROWS(countResults(params, BSON("baz" << 25)), MsgAssertionException);

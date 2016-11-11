@@ -32,16 +32,17 @@
 
 #include "mongo/s/chunk.h"
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/platform/random.h"
-#include "mongo/s/balancer/balancer.h"
-#include "mongo/s/balancer/balancer_configuration.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharding_raii.h"
@@ -62,6 +63,18 @@ namespace {
 
 const uint64_t kTooManySplitPoints = 4;
 
+// Test whether we should split once data * splitTestFactor > chunkSize (approximately)
+const int splitTestFactor = 5;
+
+/**
+ * Generates a random value for _dataWritten so that a mongos restart wouldn't cause delay in
+ * splitting.
+ */
+int mkDataWritten() {
+    PseudoRandom r(static_cast<int64_t>(time(0)));
+    return r.nextInt32(grid.getBalancerConfiguration()->getMaxChunkSizeBytes() / splitTestFactor);
+}
+
 }  // namespace
 
 Chunk::Chunk(OperationContext* txn, ChunkManager* manager, const ChunkType& from)
@@ -80,7 +93,7 @@ Chunk::Chunk(OperationContext* txn, ChunkManager* manager, const ChunkType& from
     uassert(13327, "Chunk ns must match server ns", ns == _manager->getns());
     uassert(10172, "Chunk needs a min", !_min.isEmpty());
     uassert(10173, "Chunk needs a max", !_max.isEmpty());
-    uassert(10171, "Chunk needs a server", grid.shardRegistry()->getShard(txn, _shardId));
+    uassert(10171, "Chunk needs a server", grid.shardRegistry()->getShard(txn, _shardId).isOK());
 }
 
 Chunk::Chunk(ChunkManager* info,
@@ -96,12 +109,6 @@ Chunk::Chunk(ChunkManager* info,
       _lastmod(lastmod),
       _jumbo(false),
       _dataWritten(initialDataWritten) {}
-
-int Chunk::mkDataWritten() {
-    PseudoRandom r(static_cast<int64_t>(time(0)));
-    return r.nextInt32(grid.getBalancerConfiguration()->getMaxChunkSizeBytes() /
-                       ChunkManager::SplitHeuristics::splitTestFactor);
-}
 
 bool Chunk::containsKey(const BSONObj& shardKey) const {
     return getMin().woCompare(shardKey) <= 0 && shardKey.woCompare(getMax()) < 0;
@@ -189,14 +196,16 @@ std::vector<BSONObj> Chunk::_determineSplitPoints(OperationContext* txn, bool at
         uint64_t chunkSize = _manager->getCurrentDesiredChunkSize();
 
         // Note: One split point for every 1/2 chunk size.
-        const uint64_t estNumSplitPoints = _dataWritten / chunkSize * 2;
+        const uint64_t chunkBytesWritten = getBytesWritten();
+        const uint64_t estNumSplitPoints = chunkBytesWritten / chunkSize * 2;
 
         if (estNumSplitPoints >= kTooManySplitPoints) {
             // The current desired chunk size will split the chunk into lots of small chunk and at
             // the worst case this can result into thousands of chunks. So check and see if a bigger
             // value can be used.
-            chunkSize = std::min(
-                _dataWritten, Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes());
+            chunkSize =
+                std::min(chunkBytesWritten,
+                         Grid::get(txn)->getBalancerConfiguration()->getMaxChunkSizeBytes());
         }
 
         splitPoints =
@@ -264,7 +273,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
 
     // Normally, we'd have a sound split point here if the chunk is not empty.
     // It's also a good place to sanity check.
-    if (_min == splitPoints.front()) {
+    if (SimpleBSONObjComparator::kInstance.evaluate(_min == splitPoints.front())) {
         string msg(str::stream() << "not splitting chunk " << toString() << ", split point "
                                  << splitPoints.front()
                                  << " is exactly on chunk bounds");
@@ -272,7 +281,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
         return Status(ErrorCodes::CannotSplit, msg);
     }
 
-    if (_max == splitPoints.back()) {
+    if (SimpleBSONObjComparator::kInstance.evaluate(_max == splitPoints.back())) {
         string msg(str::stream() << "not splitting chunk " << toString() << ", split point "
                                  << splitPoints.back()
                                  << " is exactly on chunk bounds");
@@ -287,6 +296,7 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
                                                              _manager->getVersion(),
                                                              _min,
                                                              _max,
+                                                             getLastmod(),
                                                              splitPoints);
     if (!splitStatus.isOK()) {
         return splitStatus.getStatus();
@@ -298,17 +308,33 @@ StatusWith<boost::optional<ChunkRange>> Chunk::split(OperationContext* txn,
     return splitStatus.getValue();
 }
 
+uint64_t Chunk::getBytesWritten() const {
+    return _dataWritten;
+}
+
+void Chunk::addBytesWritten(uint64_t bytesWrittenIncrement) {
+    _dataWritten += bytesWrittenIncrement;
+}
+
+void Chunk::setBytesWritten(uint64_t newBytesWritten) {
+    _dataWritten = newBytesWritten;
+}
+
 bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
     LastError::Disabled d(&LastError::get(cc()));
 
+    addBytesWritten(dataWritten);
+
+    const uint64_t chunkBytesWritten = getBytesWritten();
+
     try {
-        _dataWritten += dataWritten;
         uint64_t splitThreshold = _manager->getCurrentDesiredChunkSize();
+
         if (_minIsInf() || _maxIsInf()) {
             splitThreshold = static_cast<uint64_t>((double)splitThreshold * 0.9);
         }
 
-        if (_dataWritten < splitThreshold / ChunkManager::SplitHeuristics::splitTestFactor) {
+        if (chunkBytesWritten < splitThreshold / splitTestFactor) {
             return false;
         }
 
@@ -319,26 +345,6 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
 
         TicketHolderReleaser releaser(&(_manager->_splitHeuristics._splitTickets));
 
-        LOG(1) << "about to initiate autosplit: " << *this << " dataWritten: " << _dataWritten
-               << " splitThreshold: " << splitThreshold;
-
-        size_t splitCount = 0;
-        auto splitStatus = split(txn, Chunk::autoSplitInternal, &splitCount);
-        if (!splitStatus.isOK()) {
-            // Split would have issued a message if we got here. This means there wasn't enough
-            // data to split, so don't want to try again until considerable more data
-            _dataWritten = 0;
-            return false;
-        }
-
-        if (_maxIsInf() || _minIsInf()) {
-            // we don't want to reset _dataWritten since we kind of want to check the other side
-            // right away
-        } else {
-            // we're splitting, so should wait a bit
-            _dataWritten = 0;
-        }
-
         const auto balancerConfig = Grid::get(txn)->getBalancerConfiguration();
 
         Status refreshStatus = balancerConfig->refreshAndCheck(txn);
@@ -347,7 +353,33 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
             return false;
         }
 
+        bool shouldAutoSplit = balancerConfig->getShouldAutoSplit();
+        if (!shouldAutoSplit) {
+            return false;
+        }
+
+        LOG(1) << "about to initiate autosplit: " << *this << " dataWritten: " << chunkBytesWritten
+               << " splitThreshold: " << splitThreshold;
+
+        size_t splitCount = 0;
+        auto splitStatus = split(txn, Chunk::autoSplitInternal, &splitCount);
+        if (!splitStatus.isOK()) {
+            // Split would have issued a message if we got here. This means there wasn't enough data
+            // to split, so don't want to try again until we have considerably more data.
+            setBytesWritten(0);
+            return false;
+        }
+
+        if (_maxIsInf() || _minIsInf()) {
+            // we don't want to reset _dataWritten since we kind of want to check the other side
+            // right away
+        } else {
+            // we're splitting, so should wait a bit
+            setBytesWritten(0);
+        }
+
         bool shouldBalance = balancerConfig->shouldBalanceForAutoSplit();
+
         if (shouldBalance) {
             auto collStatus = grid.catalogClient(txn)->getCollection(txn, _manager->getns());
             if (!collStatus.isOK()) {
@@ -376,8 +408,8 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
             // We need to use the latest chunk manager (after the split) in order to have the most
             // up-to-date view of the chunk we are about to move
             auto scopedCM = uassertStatusOK(ScopedChunkManager::getExisting(txn, nss));
-            auto suggestedChunk =
-                scopedCM.cm()->findIntersectingChunk(txn, suggestedMigrateChunk->getMin());
+            auto suggestedChunk = scopedCM.cm()->findIntersectingChunkWithSimpleCollation(
+                txn, suggestedMigrateChunk->getMin());
 
             ChunkType chunkToMove;
             chunkToMove.setNS(nss.ns());
@@ -386,7 +418,7 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
             chunkToMove.setMax(suggestedChunk->getMax());
             chunkToMove.setVersion(suggestedChunk->getLastmod());
 
-            Status rebalanceStatus = Balancer::get(txn)->rebalanceSingleChunk(txn, chunkToMove);
+            Status rebalanceStatus = configsvr_client::rebalanceChunk(txn, chunkToMove);
             if (!rebalanceStatus.isOK()) {
                 msgassertedNoTraceWithStatus(10412, rebalanceStatus);
             }
@@ -398,7 +430,7 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
     } catch (const DBException& e) {
         // TODO: Make this better - there are lots of reasons a split could fail
         // Random so that we don't sync up with other failed splits
-        _dataWritten = mkDataWritten();
+        setBytesWritten(mkDataWritten());
 
         // if the collection lock is taken (e.g. we're migrating), it is fine for the split to fail.
         warning() << "could not autosplit collection " << _manager->getns() << causedBy(e);
@@ -407,7 +439,7 @@ bool Chunk::splitIfShould(OperationContext* txn, long dataWritten) {
 }
 
 ConnectionString Chunk::_getShardConnectionString(OperationContext* txn) const {
-    const auto shard = grid.shardRegistry()->getShard(txn, getShardId());
+    const auto shard = uassertStatusOK(grid.shardRegistry()->getShard(txn, getShardId()));
     return shard->getConnString();
 }
 

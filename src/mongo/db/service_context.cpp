@@ -34,6 +34,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/service_entry_point.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/system_clock_source.h"
@@ -115,7 +119,8 @@ Status validateStorageOptions(
 }
 
 ServiceContext::ServiceContext()
-    : _tickSource(stdx::make_unique<SystemTickSource>()),
+    : _transportLayerManager(stdx::make_unique<transport::TransportLayerManager>()),
+      _tickSource(stdx::make_unique<SystemTickSource>()),
       _fastClockSource(stdx::make_unique<SystemClockSource>()),
       _preciseClockSource(stdx::make_unique<SystemClockSource>()) {}
 
@@ -125,8 +130,8 @@ ServiceContext::~ServiceContext() {
 }
 
 ServiceContext::UniqueClient ServiceContext::makeClient(std::string desc,
-                                                        AbstractMessagingPort* p) {
-    std::unique_ptr<Client> client(new Client(std::move(desc), this, p));
+                                                        transport::SessionHandle session) {
+    std::unique_ptr<Client> client(new Client(std::move(desc), this, std::move(session)));
     auto observer = _clientObservers.cbegin();
     try {
         for (; observer != _clientObservers.cend(); ++observer) {
@@ -148,6 +153,18 @@ ServiceContext::UniqueClient ServiceContext::makeClient(std::string desc,
         invariant(_clients.insert(client.get()).second);
     }
     return UniqueClient(client.release());
+}
+
+transport::TransportLayer* ServiceContext::getTransportLayer() const {
+    return _transportLayerManager.get();
+}
+
+ServiceEntryPoint* ServiceContext::getServiceEntryPoint() const {
+    return _serviceEntryPoint.get();
+}
+
+Status ServiceContext::addAndStartTransportLayer(std::unique_ptr<transport::TransportLayer> tl) {
+    return _transportLayerManager->addAndStartTransportLayer(std::move(tl));
 }
 
 TickSource* ServiceContext::getTickSource() const {
@@ -172,6 +189,10 @@ void ServiceContext::setFastClockSource(std::unique_ptr<ClockSource> newSource) 
 
 void ServiceContext::setPreciseClockSource(std::unique_ptr<ClockSource> newSource) {
     _preciseClockSource = std::move(newSource);
+}
+
+void ServiceContext::setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep) {
+    _serviceEntryPoint = std::move(sep);
 }
 
 void ServiceContext::ClientDeleter::operator()(Client* client) const {
@@ -282,7 +303,7 @@ void ServiceContext::setKillAllOperations() {
     }
 }
 
-void ServiceContext::_killOperation_inlock(OperationContext* opCtx, ErrorCodes::Error killCode) {
+void ServiceContext::killOperation(OperationContext* opCtx, ErrorCodes::Error killCode) {
     opCtx->markKilled(killCode);
 
     for (const auto listener : _killOpListeners) {
@@ -292,20 +313,6 @@ void ServiceContext::_killOperation_inlock(OperationContext* opCtx, ErrorCodes::
             std::terminate();
         }
     }
-}
-
-bool ServiceContext::killOperation(unsigned int opId) {
-    for (LockedClientsCursor cursor(this); Client* client = cursor.next();) {
-        stdx::lock_guard<Client> lk(*client);
-
-        OperationContext* opCtx = client->getOperationContext();
-        if (opCtx && opCtx->getOpID() == opId) {
-            _killOperation_inlock(opCtx, ErrorCodes::Interrupted);
-            return true;
-        }
-    }
-
-    return false;
 }
 
 void ServiceContext::killAllUserOperations(const OperationContext* txn,
@@ -321,7 +328,7 @@ void ServiceContext::killAllUserOperations(const OperationContext* txn,
 
         // Don't kill ourself.
         if (toKill && toKill->getOpID() != txn->getOpID()) {
-            _killOperation_inlock(toKill, killCode);
+            killOperation(toKill, killCode);
         }
     }
 }

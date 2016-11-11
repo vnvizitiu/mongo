@@ -41,13 +41,9 @@
 
     s.printShardingStatus();
 
-    assert.throws(function() {
-        assert.commandWorked(s.s0.adminCommand({
-            movechunk: "test.foo",
-            find: {x: 50},
-            to: s.getOther(s.getPrimaryShard("test")).name
-        }));
-    }, [], "move should fail");
+    // This is a large chunk, which should not be able to move
+    assert.commandFailed(s.s0.adminCommand(
+        {movechunk: "test.foo", find: {x: 50}, to: s.getOther(s.getPrimaryShard("test")).name}));
 
     for (var i = 0; i < 20; i += 2) {
         try {
@@ -67,8 +63,6 @@
         print("chunk diff: " + x);
         return x < 2;
     }, "no balance happened", 8 * 60 * 1000, 2000);
-
-    assert.eq(coll.count(), coll.find().itcount());
 
     s.stop();
 })();

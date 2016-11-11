@@ -93,13 +93,6 @@ public:
              BSONObjBuilder& result) {
         ShardingState* const shardingState = ShardingState::get(txn);
 
-        // Active state of TO-side migrations (MigrateStatus) is serialized by distributed
-        // collection lock.
-        if (shardingState->migrationDestinationManager()->isActive()) {
-            errmsg = "migrate already in progress";
-            return false;
-        }
-
         // Pending deletes (for migrations) are serialized by the distributed collection lock,
         // we are sure we registered a delete for a range *before* we can migrate-in a
         // subrange.
@@ -113,10 +106,14 @@ public:
             return false;
         }
 
+        const ShardId toShard(cmdObj["toShardName"].String());
+        const ShardId fromShard(cmdObj["fromShardName"].String());
+
         if (!shardingState->enabled()) {
             if (!cmdObj["configServer"].eoo()) {
                 dassert(cmdObj["configServer"].type() == String);
-                shardingState->initializeFromConfigConnString(txn, cmdObj["configServer"].String());
+                shardingState->initializeFromConfigConnString(
+                    txn, cmdObj["configServer"].String(), toShard.toString());
             } else {
                 errmsg = str::stream()
                     << "cannot start recv'ing chunk, "
@@ -127,26 +124,20 @@ public:
             }
         }
 
-        if (!cmdObj["toShardName"].eoo()) {
-            dassert(cmdObj["toShardName"].type() == String);
-            shardingState->setShardName(cmdObj["toShardName"].String());
-        }
 
-        const string ns = cmdObj.firstElement().String();
+        const NamespaceString nss(cmdObj.firstElement().String());
 
-        BSONObj min = cmdObj["min"].Obj().getOwned();
-        BSONObj max = cmdObj["max"].Obj().getOwned();
+        const auto chunkRange = uassertStatusOK(ChunkRange::fromBSON(cmdObj));
 
         // Refresh our collection manager from the config server, we need a collection manager to
         // start registering pending chunks. We force the remote refresh here to make the behavior
         // consistent and predictable, generally we'd refresh anyway, and to be paranoid.
         ChunkVersion currentVersion;
 
-        Status status = shardingState->refreshMetadataNow(txn, ns, &currentVersion);
+        Status status = shardingState->refreshMetadataNow(txn, nss, &currentVersion);
         if (!status.isOK()) {
-            errmsg = str::stream() << "cannot start recv'ing chunk "
-                                   << "[" << min << "," << max << ")" << causedBy(status.reason());
-
+            errmsg = str::stream() << "cannot start receiving chunk "
+                                   << redact(chunkRange.toString()) << causedBy(redact(status));
             warning() << errmsg;
             return false;
         }
@@ -159,23 +150,34 @@ public:
 
         BSONObj shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
 
-        const string fromShard(cmdObj["from"].String());
+        auto statusWithFromShardConnectionString = ConnectionString::parse(cmdObj["from"].String());
+        if (!statusWithFromShardConnectionString.isOK()) {
+            errmsg = str::stream()
+                << "cannot start receiving chunk " << redact(chunkRange.toString())
+                << causedBy(redact(statusWithFromShardConnectionString.getStatus()));
+
+            warning() << errmsg;
+            return false;
+        }
 
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
-        Status startStatus =
-            shardingState->migrationDestinationManager()->start(ns,
-                                                                migrationSessionId,
-                                                                fromShard,
-                                                                min,
-                                                                max,
-                                                                shardKeyPattern,
-                                                                currentVersion.epoch(),
-                                                                writeConcern);
-        if (!startStatus.isOK()) {
-            return appendCommandStatus(result, startStatus);
-        }
+        auto scopedRegisterReceiveChunk(
+            uassertStatusOK(shardingState->registerReceiveChunk(nss, chunkRange, fromShard)));
+
+        uassertStatusOK(shardingState->migrationDestinationManager()->start(
+            nss,
+            std::move(scopedRegisterReceiveChunk),
+            migrationSessionId,
+            statusWithFromShardConnectionString.getValue(),
+            fromShard,
+            toShard,
+            chunkRange.getMin(),
+            chunkRange.getMax(),
+            shardKeyPattern,
+            currentVersion.epoch(),
+            writeConcern));
 
         result.appendBool("started", true);
         return true;
@@ -304,9 +306,22 @@ public:
              int,
              string& errmsg,
              BSONObjBuilder& result) {
-        ShardingState::get(txn)->migrationDestinationManager()->abort();
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
-        return true;
+        auto const mdm = ShardingState::get(txn)->migrationDestinationManager();
+
+        auto migrationSessionIdStatus(MigrationSessionId::extractFromBSON(cmdObj));
+
+        if (migrationSessionIdStatus.isOK()) {
+            const bool ok = mdm->abort(migrationSessionIdStatus.getValue());
+            mdm->report(result);
+            return ok;
+        } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {
+            mdm->abortWithoutSessionIdCheck();
+            mdm->report(result);
+            return true;
+        }
+
+        uassertStatusOK(migrationSessionIdStatus.getStatus());
+        MONGO_UNREACHABLE;
     }
 
 } recvChunkAbortCommand;

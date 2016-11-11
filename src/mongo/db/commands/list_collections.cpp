@@ -31,6 +31,9 @@
 #include <vector>
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
@@ -39,14 +42,19 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/query/cursor_request.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -104,26 +112,10 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
  * Does not add any information about the system.namespaces collection, or non-existent collections.
  */
 void _addWorkingSetMember(OperationContext* txn,
-                          const Collection* collection,
+                          const BSONObj& maybe,
                           const MatchExpression* matcher,
                           WorkingSet* ws,
                           QueuedDataStage* root) {
-    if (!collection) {
-        return;
-    }
-
-    StringData collectionName = collection->ns().coll();
-    if (collectionName == "system.namespaces") {
-        return;
-    }
-
-    BSONObjBuilder b;
-    b.append("name", collectionName);
-
-    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(txn);
-    b.append("options", options.toBSON());
-
-    BSONObj maybe = b.obj();
     if (matcher && !matcher->matchesBSON(maybe)) {
         return;
     }
@@ -135,6 +127,53 @@ void _addWorkingSetMember(OperationContext* txn,
     member->obj = Snapshotted<BSONObj>(SnapshotId(), maybe);
     member->transitionToOwnedObj();
     root->pushBack(id);
+}
+
+BSONObj buildViewBson(const ViewDefinition& view) {
+    BSONObjBuilder b;
+    b.append("name", view.name().coll());
+    b.append("type", "view");
+
+    BSONObjBuilder optionsBuilder(b.subobjStart("options"));
+    optionsBuilder.append("viewOn", view.viewOn().coll());
+    optionsBuilder.append("pipeline", view.pipeline());
+    if (view.defaultCollator()) {
+        optionsBuilder.append("collation", view.defaultCollator()->getSpec().toBSON());
+    }
+    optionsBuilder.doneFast();
+
+    BSONObj info = BSON("readOnly" << true);
+    b.append("info", info);
+    return b.obj();
+}
+
+BSONObj buildCollectionBson(OperationContext* txn, const Collection* collection) {
+
+    if (!collection) {
+        return {};
+    }
+
+    StringData collectionName = collection->ns().coll();
+    if (collectionName == "system.namespaces") {
+        return {};
+    }
+
+    BSONObjBuilder b;
+    b.append("name", collectionName);
+    b.append("type", "collection");
+
+    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(txn);
+    b.append("options", options.toBSON());
+
+    BSONObj info = BSON("readOnly" << storageGlobalParams.readOnly);
+    b.append("info", info);
+
+    auto idIndex = collection->getIndexCatalog()->findIdIndex(txn);
+    if (idIndex) {
+        b.append("idIndex", idIndex->infoObj());
+    }
+
+    return b.obj();
 }
 
 class CmdListCollections : public Command {
@@ -156,7 +195,7 @@ public:
         help << "list collections for this db";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
@@ -202,7 +241,8 @@ public:
 
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
-        Status parseCursorStatus = parseCommandCursorOptions(jsobj, defaultBatchSize, &batchSize);
+        Status parseCursorStatus =
+            CursorRequest::parseCommandCursorOptions(jsobj, defaultBatchSize, &batchSize);
         if (!parseCursorStatus.isOK()) {
             return appendCommandStatus(result, parseCursorStatus);
         }
@@ -210,7 +250,7 @@ public:
         ScopedTransaction scopedXact(txn, MODE_IS);
         AutoGetDb autoDb(txn, dbname, MODE_S);
 
-        const Database* db = autoDb.getDb();
+        Database* db = autoDb.getDb();
 
         auto ws = make_unique<WorkingSet>();
         auto root = make_unique<QueuedDataStage>(txn, ws.get());
@@ -219,22 +259,39 @@ public:
             if (auto collNames = _getExactNameMatches(matcher.get())) {
                 for (auto&& collName : *collNames) {
                     auto nss = NamespaceString(db->name(), collName);
-                    _addWorkingSetMember(
-                        txn, db->getCollection(nss), matcher.get(), ws.get(), root.get());
+                    Collection* collection = db->getCollection(nss);
+                    BSONObj collBson = buildCollectionBson(txn, collection);
+                    if (!collBson.isEmpty()) {
+                        _addWorkingSetMember(txn, collBson, matcher.get(), ws.get(), root.get());
+                    }
                 }
             } else {
                 for (auto&& collection : *db) {
-                    _addWorkingSetMember(txn, collection, matcher.get(), ws.get(), root.get());
+                    BSONObj collBson = buildCollectionBson(txn, collection);
+                    if (!collBson.isEmpty()) {
+                        _addWorkingSetMember(txn, collBson, matcher.get(), ws.get(), root.get());
+                    }
                 }
+            }
+
+            // Skipping views is only necessary for internal cloning operations.
+            bool skipViews = filterElt.type() == mongo::Object &&
+                SimpleBSONObjComparator::kInstance.evaluate(
+                    filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
+            if (!skipViews) {
+                db->getViewCatalog()->iterate(txn, [&](const ViewDefinition& view) {
+                    BSONObj viewBson = buildViewBson(view);
+                    if (!viewBson.isEmpty()) {
+                        _addWorkingSetMember(txn, viewBson, matcher.get(), ws.get(), root.get());
+                    }
+                });
             }
         }
 
-        const std::string cursorNamespace = str::stream() << dbname << ".$cmd." << getName();
-        dassert(NamespaceString(cursorNamespace).isValid());
-        dassert(NamespaceString(cursorNamespace).isListCollectionsCursorNS());
+        const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbname);
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            txn, std::move(ws), std::move(root), cursorNamespace, PlanExecutor::YIELD_MANUAL);
+            txn, std::move(ws), std::move(root), cursorNss.ns(), PlanExecutor::YIELD_MANUAL);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
@@ -266,12 +323,12 @@ public:
             ClientCursor* cursor =
                 new ClientCursor(CursorManager::getGlobalCursorManager(),
                                  exec.release(),
-                                 cursorNamespace,
+                                 cursorNss.ns(),
                                  txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
             cursorId = cursor->cursorid();
         }
 
-        appendCursorResponseObject(cursorId, cursorNamespace, firstBatch.arr(), &result);
+        appendCursorResponseObject(cursorId, cursorNss.ns(), firstBatch.arr(), &result);
 
         return true;
     }

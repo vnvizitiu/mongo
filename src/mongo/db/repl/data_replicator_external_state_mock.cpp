@@ -45,6 +45,10 @@ executor::TaskExecutor* DataReplicatorExternalStateMock::getTaskExecutor() const
     return taskExecutor;
 }
 
+OldThreadPool* DataReplicatorExternalStateMock::getDbWorkThreadPool() const {
+    return dbWorkThreadPool;
+}
+
 OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOpTime() {
     return {currentTerm, lastCommittedOpTime};
 }
@@ -82,10 +86,15 @@ StatusWith<OpTime> DataReplicatorExternalStateMock::_multiApply(
     return multiApplyFn(txn, std::move(ops), applyOperation);
 }
 
-void DataReplicatorExternalStateMock::_multiSyncApply(MultiApplier::OperationPtrs* ops) {}
+Status DataReplicatorExternalStateMock::_multiSyncApply(MultiApplier::OperationPtrs* ops) {
+    return Status::OK();
+}
 
-void DataReplicatorExternalStateMock::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                                             const HostAndPort& source) {}
+Status DataReplicatorExternalStateMock::_multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                                               const HostAndPort& source,
+                                                               AtomicUInt32* fetchCount) {
+    return Status::OK();
+}
 
 }  // namespace repl
 }  // namespace mongo

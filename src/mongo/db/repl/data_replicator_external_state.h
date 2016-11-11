@@ -41,6 +41,8 @@
 
 namespace mongo {
 
+class OldThreadPool;
+
 namespace executor {
 class TaskExecutor;
 }  // namespace executor
@@ -72,6 +74,11 @@ public:
      * Returns task executor for scheduling tasks to be run asynchronously.
      */
     virtual executor::TaskExecutor* getTaskExecutor() const = 0;
+
+    /**
+     * Returns shared db worker thread pool for collection cloning.
+     */
+    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
      * Returns the current term and last committed optime.
@@ -125,16 +132,17 @@ private:
      *
      * Used exclusively by the DataReplicator to construct a MultiApplier.
      */
-    virtual void _multiSyncApply(MultiApplier::OperationPtrs* ops) = 0;
+    virtual Status _multiSyncApply(MultiApplier::OperationPtrs* ops) = 0;
 
     /**
-     * Used by _multiApply() to write operations to database during initial sync.
-     * Fetches missing documents from "source".
+     * Used by _multiApply() to write operations to database during initial sync. `fetchCount` is a
+     * pointer to a counter that is incremented every time we fetch a missing document.
      *
      * Used exclusively by the DataReplicator to construct a MultiApplier.
      */
-    virtual void _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
-                                        const HostAndPort& source) = 0;
+    virtual Status _multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                          const HostAndPort& source,
+                                          AtomicUInt32* fetchCount) = 0;
 
     // Provides DataReplicator with access to _multiApply, _multiSyncApply and
     // _multiInitialSyncApply.

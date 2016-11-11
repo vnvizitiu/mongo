@@ -69,10 +69,6 @@ public:
     // should be made to wait for it to become free.
     static const Milliseconds kSingleLockAttemptTimeout;
 
-    // If timeout is passed to the lock call, what is the default frequency with which the lock will
-    // be checked for availability.
-    static const Milliseconds kDefaultLockRetryInterval;
-
     /**
      * RAII type for distributed lock. Not meant to be shared across multiple threads.
      */
@@ -131,12 +127,10 @@ public:
      * Returns ErrorCodes::DistributedClockSkewed when a clock skew is detected.
      * Returns ErrorCodes::LockBusy if the lock is being held.
      */
-    virtual StatusWith<ScopedDistLock> lock(
-        OperationContext* txn,
-        StringData name,
-        StringData whyMessage,
-        Milliseconds waitFor = kDefaultLockTimeout,
-        Milliseconds lockTryInterval = kDefaultLockRetryInterval) = 0;
+    StatusWith<ScopedDistLock> lock(OperationContext* txn,
+                                    StringData name,
+                                    StringData whyMessage,
+                                    Milliseconds waitFor);
 
     /**
      * Same behavior as lock(...) above, except takes a specific lock session ID "lockSessionID"
@@ -146,13 +140,35 @@ public:
      * immediately reacquired if "lockSessionID" matches that of the lock, rather than waiting for
      * the inactive lock to expire.
      */
-    virtual StatusWith<ScopedDistLock> lockWithSessionID(
-        OperationContext* txn,
-        StringData name,
-        StringData whyMessage,
-        const OID lockSessionID,
-        Milliseconds waitFor = kDefaultLockTimeout,
-        Milliseconds lockTryInterval = kDefaultLockRetryInterval) = 0;
+    virtual StatusWith<DistLockHandle> lockWithSessionID(OperationContext* txn,
+                                                         StringData name,
+                                                         StringData whyMessage,
+                                                         const OID& lockSessionID,
+                                                         Milliseconds waitFor) = 0;
+
+    /**
+     * Specialized locking method, which only succeeds if the specified lock name is not held by
+     * anyone. Uses local write concern and does not attempt to overtake the lock or check whether
+     * the lock lease has expired.
+     */
+    virtual StatusWith<DistLockHandle> tryLockWithLocalWriteConcern(OperationContext* txn,
+                                                                    StringData name,
+                                                                    StringData whyMessage,
+                                                                    const OID& lockSessionID) = 0;
+
+    /**
+     * Unlocks the given lockHandle. Will attempt to retry again later if the config
+     * server is not reachable.
+     */
+    virtual void unlock(OperationContext* txn, const DistLockHandle& lockHandle) = 0;
+
+    /**
+     * Unlocks the lock specified by "lockHandle" and "name". Will attempt to retry again later if
+     * the config server is not reachable.
+     */
+    virtual void unlock(OperationContext* txn,
+                        const DistLockHandle& lockHandle,
+                        StringData name) = 0;
 
     /**
      * Makes a best-effort attempt to unlock all locks owned by the given processID.
@@ -161,14 +177,9 @@ public:
 
 protected:
     /**
-     * Unlocks the given lockHandle. Will attempt to retry again later if the config
-     * server is not reachable.
-     */
-    virtual void unlock(OperationContext* txn, const DistLockHandle& lockHandle) = 0;
-
-    /**
      * Checks if the lockHandle still exists in the config server.
      */
     virtual Status checkStatus(OperationContext* txn, const DistLockHandle& lockHandle) = 0;
 };
-}
+
+}  // namespace mongo

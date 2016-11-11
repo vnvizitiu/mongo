@@ -32,7 +32,7 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/metadata_loader.h"
-#include "mongo/s/catalog/replset/sharding_catalog_test_fixture.h"
+#include "mongo/s/catalog/sharding_catalog_test_fixture.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 
@@ -51,7 +51,7 @@ public:
 protected:
     void setUp() override {
         ShardingCatalogTestFixture::setUp();
-        getMessagingPort()->setRemote(HostAndPort("FakeRemoteClient:34567"));
+        setRemote(HostAndPort("FakeRemoteClient:34567"));
         configTargeter()->setFindHostReturnValue(configHost);
         _maxCollVersion = ChunkVersion(1, 0, OID::gen());
         _loader.reset(new MetadataLoader);
@@ -157,14 +157,13 @@ TEST_F(MetadataLoaderFixture, DroppedColl) {
     collType.setDropped(true);
     ASSERT_OK(collType.validate());
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_EQUALS(status.code(), ErrorCodes::NamespaceNotFound);
     });
     expectFindOnConfigSendBSONObjVector(std::vector<BSONObj>{collType.toBSON()});
@@ -173,14 +172,13 @@ TEST_F(MetadataLoaderFixture, DroppedColl) {
 
 TEST_F(MetadataLoaderFixture, EmptyColl) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_EQUALS(status.code(), ErrorCodes::NamespaceNotFound);
     });
     expectFindOnConfigSendErrorCode(ErrorCodes::NamespaceNotFound);
@@ -190,14 +188,13 @@ TEST_F(MetadataLoaderFixture, EmptyColl) {
 TEST_F(MetadataLoaderFixture, BadColl) {
     BSONObj badCollToSend = BSON(CollectionType::fullNs("test.foo"));
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_EQUALS(status.code(), ErrorCodes::NoSuchKey);
     });
     expectFindOnConfigSendBSONObjVector(std::vector<BSONObj>{badCollToSend});
@@ -218,15 +215,14 @@ TEST_F(MetadataLoaderFixture, BadChunk) {
     ASSERT(!chunkInfo.validate().isOK());
 
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
-        ASSERT_EQUALS(status.code(), ErrorCodes::FailedToParse);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
+        ASSERT_EQUALS(status.code(), ErrorCodes::NoSuchKey);
     });
 
     expectFindOnConfigSendBSONObjVector(std::vector<BSONObj>{collType.toBSON()});
@@ -245,14 +241,13 @@ TEST_F(MetadataLoaderFixture, NoChunksIsDropped) {
     collType.setEpoch(epoch);
 
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         // This is interpreted as a dropped ns, since we drop the chunks first
         ASSERT_EQUALS(status.code(), ErrorCodes::NamespaceNotFound);
     });
@@ -283,14 +278,13 @@ TEST_F(MetadataLoaderFixture, CheckNumChunk) {
     ASSERT(chunkType.validate().isOK());
 
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         std::cout << "status: " << status << std::endl;
         ASSERT_OK(status);
         ASSERT_EQUALS(0U, metadata.getNumChunks());
@@ -308,14 +302,13 @@ TEST_F(MetadataLoaderFixture, CheckNumChunk) {
 
 TEST_F(MetadataLoaderFixture, SingleChunkCheckNumChunk) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_OK(status);
         ASSERT_EQUALS(1U, metadata.getNumChunks());
     });
@@ -328,14 +321,13 @@ TEST_F(MetadataLoaderFixture, SingleChunkCheckNumChunk) {
 
 TEST_F(MetadataLoaderFixture, SingleChunkGetNext) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ChunkType chunkInfo;
         ASSERT_TRUE(metadata.getNextChunk(metadata.getMinKey(), &chunkInfo));
     });
@@ -348,16 +340,15 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetNext) {
 
 TEST_F(MetadataLoaderFixture, SingleChunkGetShardKey) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ChunkType chunkInfo;
-        ASSERT_TRUE(metadata.getKeyPattern().equal(BSON("a" << 1)));
+        ASSERT_BSONOBJ_EQ(metadata.getKeyPattern(), BSON("a" << 1));
     });
 
     expectFindOnConfigSendCollectionDefault();
@@ -368,14 +359,13 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetShardKey) {
 
 TEST_F(MetadataLoaderFixture, SingleChunkGetMaxCollVersion) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_TRUE(getMaxCollVersion().equals(metadata.getCollVersion()));
     });
 
@@ -386,14 +376,13 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetMaxCollVersion) {
 }
 TEST_F(MetadataLoaderFixture, SingleChunkGetMaxShardVersion) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         ASSERT_TRUE(getMaxShardVersion().equals(metadata.getShardVersion()));
     });
     expectFindOnConfigSendCollectionDefault();
@@ -404,14 +393,13 @@ TEST_F(MetadataLoaderFixture, SingleChunkGetMaxShardVersion) {
 
 TEST_F(MetadataLoaderFixture, NoChunks) {
     auto future = launchAsync([this] {
-        MetadataLoader loader;
         CollectionMetadata metadata;
-        auto status = loader.makeCollectionMetadata(operationContext(),
-                                                    catalogClient(),
-                                                    "test.foo",
-                                                    "shard0000",
-                                                    NULL, /* no old metadata */
-                                                    &metadata);
+        auto status = MetadataLoader::makeCollectionMetadata(operationContext(),
+                                                             catalogClient(),
+                                                             "test.foo",
+                                                             "shard0000",
+                                                             NULL, /* no old metadata */
+                                                             &metadata);
         // NSNotFound because we're reloading with no old metadata
         ASSERT_EQUALS(status.code(), ErrorCodes::NamespaceNotFound);
     });
@@ -419,204 +407,6 @@ TEST_F(MetadataLoaderFixture, NoChunks) {
     expectFindOnConfigSendErrorCode(ErrorCodes::NamespaceNotFound);
 
     future.timed_get(kFutureTimeout);
-}
-
-TEST_F(MetadataLoaderFixture, PromotePendingNA) {
-    unique_ptr<ChunkType> chunk(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << MINKEY));
-    chunk->setMax(BSON("x" << 0));
-    chunk->setVersion(ChunkVersion(1, 0, OID::gen()));
-
-    OwnedPointerVector<ChunkType> chunks;
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
-
-    // Metadata of different epoch
-    (*chunks.vector().begin())->setVersion(ChunkVersion(1, 0, OID::gen()));
-
-    CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
-
-    Status status = loader().promotePendingChunks(&afterMetadata, &remoteMetadata);
-    ASSERT_OK(status);
-
-    ChunkType pending;
-    pending.setMin(BSON("x" << 0));
-    pending.setMax(BSON("x" << 10));
-
-    unique_ptr<CollectionMetadata> cloned(afterMetadata.clonePlusPending(pending));
-    status = loader().promotePendingChunks(cloned.get(), &remoteMetadata);
-    ASSERT_OK(status);
-    ASSERT_EQUALS(remoteMetadata.getNumPending(), 0u);
-}
-
-TEST_F(MetadataLoaderFixture, PromotePendingNAVersion) {
-    OID epoch = OID::gen();
-
-    unique_ptr<ChunkType> chunk(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << MINKEY));
-    chunk->setMax(BSON("x" << 0));
-    chunk->setVersion(ChunkVersion(1, 1, epoch));
-
-    OwnedPointerVector<ChunkType> chunks;
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
-
-    // Metadata of same epoch, but lower version
-    (*chunks.vector().begin())->setVersion(ChunkVersion(1, 0, epoch));
-
-    CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
-
-    Status status = loader().promotePendingChunks(&afterMetadata, &remoteMetadata);
-    ASSERT_OK(status);
-
-    ChunkType pending;
-    pending.setMin(BSON("x" << 0));
-    pending.setMax(BSON("x" << 10));
-
-    unique_ptr<CollectionMetadata> cloned(afterMetadata.clonePlusPending(pending));
-    status = loader().promotePendingChunks(cloned.get(), &remoteMetadata);
-    ASSERT_OK(status);
-    ASSERT_EQUALS(remoteMetadata.getNumPending(), 0u);
-}
-
-TEST_F(MetadataLoaderFixture, PromotePendingGoodOverlap) {
-    OID epoch = OID::gen();
-
-    //
-    // Setup chunk range for remote metadata
-    //
-
-    OwnedPointerVector<ChunkType> chunks;
-
-    unique_ptr<ChunkType> chunk(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << MINKEY));
-    chunk->setMax(BSON("x" << 0));
-    chunk->setVersion(ChunkVersion(1, 0, epoch));
-    chunks.mutableVector().push_back(chunk.release());
-
-    chunk.reset(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << 10));
-    chunk->setMax(BSON("x" << 20));
-    chunks.mutableVector().push_back(chunk.release());
-
-    chunk.reset(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << 30));
-    chunk->setMax(BSON("x" << MAXKEY));
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
-
-    //
-    // Setup chunk and pending range for afterMetadata
-    //
-
-    chunks.clear();
-
-    chunk.reset(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << 0));
-    chunk->setMax(BSON("x" << 10));
-    chunk->setVersion(ChunkVersion(1, 0, epoch));
-
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
-
-    ChunkType pending;
-    pending.setMin(BSON("x" << MINKEY));
-    pending.setMax(BSON("x" << 0));
-
-    unique_ptr<CollectionMetadata> cloned(afterMetadata.clonePlusPending(pending));
-
-    pending.setMin(BSON("x" << 10));
-    pending.setMax(BSON("x" << 20));
-
-    cloned = cloned->clonePlusPending(pending);
-
-    pending.setMin(BSON("x" << 20));
-    pending.setMax(BSON("x" << 30));
-
-    cloned = cloned->clonePlusPending(pending);
-
-    pending.setMin(BSON("x" << 30));
-    pending.setMax(BSON("x" << MAXKEY));
-
-    cloned = cloned->clonePlusPending(pending);
-
-    Status status = loader().promotePendingChunks(cloned.get(), &remoteMetadata);
-    ASSERT_OK(status);
-
-    ASSERT_EQUALS(remoteMetadata.getNumPending(), 1u);
-    ASSERT(remoteMetadata.keyIsPending(BSON("x" << 25)));
-}
-
-TEST_F(MetadataLoaderFixture, PromotePendingBadOverlap) {
-    OID epoch = OID::gen();
-
-    //
-    // Setup chunk range for remote metadata
-    //
-
-    OwnedPointerVector<ChunkType> chunks;
-
-    unique_ptr<ChunkType> chunk(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << MINKEY));
-    chunk->setMax(BSON("x" << 0));
-    chunk->setVersion(ChunkVersion(1, 0, epoch));
-
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata remoteMetadata;
-    getMetadataFor(chunks, &remoteMetadata);
-
-    //
-    // Setup chunk and pending range for afterMetadata
-    //
-
-    chunks.clear();
-
-    chunk.reset(new ChunkType());
-    chunk->setNS("foo.bar");
-    chunk->setShard(ShardId("shard0000"));
-    chunk->setMin(BSON("x" << 15));
-    chunk->setMax(BSON("x" << MAXKEY));
-    chunk->setVersion(ChunkVersion(1, 0, epoch));
-
-    chunks.mutableVector().push_back(chunk.release());
-
-    CollectionMetadata afterMetadata;
-    getMetadataFor(chunks, &afterMetadata);
-
-    ChunkType pending;
-    pending.setMin(BSON("x" << MINKEY));
-    pending.setMax(BSON("x" << 1));
-
-    unique_ptr<CollectionMetadata> cloned(afterMetadata.clonePlusPending(pending));
-    cloned = cloned->clonePlusPending(pending);
-
-    Status status = loader().promotePendingChunks(cloned.get(), &remoteMetadata);
-    ASSERT_EQUALS(status.code(), ErrorCodes::RemoteChangeDetected);
 }
 
 }  // namespace

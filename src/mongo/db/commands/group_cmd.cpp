@@ -44,6 +44,7 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -94,7 +95,7 @@ private:
         help << "http://dochub.mongodb.org/core/aggregation";
     }
 
-    virtual Status checkAuthForCommand(ClientBasic* client,
+    virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
         std::string ns = parseNs(dbname, cmdObj);
@@ -199,7 +200,7 @@ private:
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
-        if (curOp->shouldDBProfile(curOp->elapsedMillis())) {
+        if (curOp->shouldDBProfile()) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(planExecutor.get(), &execStatsBob);
             curOp->debug().execStats = execStatsBob.obj();
@@ -265,6 +266,13 @@ private:
         }
         if (collationEltStatus.isOK()) {
             request->collation = collationElt.embeddedObject().getOwned();
+        }
+        if (!request->collation.isEmpty() &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k32) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
+                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
         }
 
         BSONElement reduce = p["$reduce"];
