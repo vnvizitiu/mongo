@@ -45,6 +45,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/rpc/protocol.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -59,14 +60,19 @@ static Counter64 gleWtimeouts;
 static ServerStatusMetricField<Counter64> gleWtimeoutsDisplay("getLastError.wtimeouts",
                                                               &gleWtimeouts);
 
-StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
+MONGO_FP_DECLARE(hangBeforeWaitingForWriteConcern);
+
+bool commandSpecifiesWriteConcern(const BSONObj& cmdObj) {
+    return cmdObj.hasField(WriteConcernOptions::kWriteConcernField);
+}
+
+StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                                                     const BSONObj& cmdObj,
-                                                    const std::string& dbName,
-                                                    const bool supportsWriteConcern) {
+                                                    const std::string& dbName) {
     // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
     // interpreted identically to {w:1}.
     auto wcResult = WriteConcernOptions::extractWCFromCommand(
-        cmdObj, dbName, repl::ReplicationCoordinator::get(txn)->getGetLastErrorDefault());
+        cmdObj, dbName, repl::ReplicationCoordinator::get(opCtx)->getGetLastErrorDefault());
     if (!wcResult.isOK()) {
         return wcResult.getStatus();
     }
@@ -75,52 +81,32 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* txn,
 
     if (writeConcern.usedDefault) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-            !txn->getClient()->isInDirectClient()) {
+            !opCtx->getClient()->isInDirectClient()) {
             // This is here only for backwards compatibility with 3.2 clusters which have commands
             // that do not specify write concern when writing to the config server.
             writeConcern = {
                 WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(30)};
         }
-    } else if (supportsWriteConcern) {
-        // If it supports writeConcern and does not use the default, validate the writeConcern.
-        Status wcStatus = validateWriteConcern(txn, writeConcern, dbName);
+    } else {
+        Status wcStatus = validateWriteConcern(opCtx, writeConcern, dbName);
         if (!wcStatus.isOK()) {
             return wcStatus;
         }
-    } else {
-        // This command doesn't do writes so it should not be passed a writeConcern. If we did not
-        // use the default writeConcern, one was provided when it shouldn't have been by the user.
-        return {ErrorCodes::InvalidOptions, "Command does not support writeConcern"};
     }
 
     return writeConcern;
 }
 
-Status validateWriteConcern(OperationContext* txn,
+Status validateWriteConcern(OperationContext* opCtx,
                             const WriteConcernOptions& writeConcern,
                             StringData dbName) {
     if (writeConcern.syncMode == WriteConcernOptions::SyncMode::JOURNAL &&
-        !txn->getServiceContext()->getGlobalStorageEngine()->isDurable()) {
+        !opCtx->getServiceContext()->getGlobalStorageEngine()->isDurable()) {
         return Status(ErrorCodes::BadValue,
                       "cannot use 'j' option when a host does not have journaling enabled");
     }
 
-    // Remote callers of the config server (as in callers making network calls, not the internal
-    // logic) should never be making non-majority writes against the config server, because sharding
-    // is not resilient against rollbacks of metadata writes.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-        dbName != NamespaceString::kLocalDb && !writeConcern.validForConfigServers()) {
-        // The only cases where we allow non-majority writes are from within the config servers
-        // themselves, because these wait for write concern explicitly.
-        if (!txn->getClient()->isInDirectClient()) {
-            return {ErrorCodes::BadValue,
-                    str::stream() << "w:'majority' is the only valid write concern when writing "
-                                     "to config servers, got: "
-                                  << writeConcern.toBSON()};
-        }
-    }
-
-    const auto replMode = repl::ReplicationCoordinator::get(txn)->getReplicationMode();
+    const auto replMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
 
     if (replMode == repl::ReplicationCoordinator::modeNone && writeConcern.wNumNodes > 1) {
         return Status(ErrorCodes::BadValue, "cannot use 'w' > 1 when a host is not replicated");
@@ -174,13 +160,15 @@ void WriteConcernResult::appendTo(const WriteConcernOptions& writeConcern,
                !result->asTempObj()["waited"].eoo()));
 }
 
-Status waitForWriteConcern(OperationContext* txn,
+Status waitForWriteConcern(OperationContext* opCtx,
                            const OpTime& replOpTime,
                            const WriteConcernOptions& writeConcern,
                            WriteConcernResult* result) {
     LOG(2) << "Waiting for write concern. OpTime: " << replOpTime
            << ", write concern: " << writeConcern.toBSON();
-    auto replCoord = repl::ReplicationCoordinator::get(txn);
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeWaitingForWriteConcern);
 
     // Next handle blocking on disk
     Timer syncTimer;
@@ -196,10 +184,10 @@ Status waitForWriteConcern(OperationContext* txn,
         case WriteConcernOptions::SyncMode::FSYNC: {
             StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
             if (!storageEngine->isDurable()) {
-                result->fsyncFiles = storageEngine->flushAllFiles(true);
+                result->fsyncFiles = storageEngine->flushAllFiles(opCtx, true);
             } else {
                 // We only need to commit the journal if we're durable
-                txn->recoveryUnit()->waitUntilDurable();
+                opCtx->recoveryUnit()->waitUntilDurable();
             }
             break;
         }
@@ -208,10 +196,10 @@ Status waitForWriteConcern(OperationContext* txn,
                 // Wait for ops to become durable then update replication system's
                 // knowledge of this.
                 OpTime appliedOpTime = replCoord->getMyLastAppliedOpTime();
-                txn->recoveryUnit()->waitUntilDurable();
+                opCtx->recoveryUnit()->waitUntilDurable();
                 replCoord->setMyLastDurableOpTimeForward(appliedOpTime);
             } else {
-                txn->recoveryUnit()->waitUntilDurable();
+                opCtx->recoveryUnit()->waitUntilDurable();
             }
             break;
     }
@@ -234,7 +222,7 @@ Status waitForWriteConcern(OperationContext* txn,
 
     // Replica set stepdowns and gle mode changes are thrown as errors
     repl::ReplicationCoordinator::StatusAndDuration replStatus =
-        replCoord->awaitReplication(txn, replOpTime, writeConcernWithPopulatedSyncMode);
+        replCoord->awaitReplication(opCtx, replOpTime, writeConcernWithPopulatedSyncMode);
     if (replStatus.status == ErrorCodes::WriteConcernFailed) {
         gleWtimeouts.increment();
         result->err = "timeout";

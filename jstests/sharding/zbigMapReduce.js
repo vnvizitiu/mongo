@@ -17,7 +17,7 @@ function setupTest() {
     var config = s.getDB("config");
 
     assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-    s.ensurePrimaryShard('test', 'test-rs0');
+    s.ensurePrimaryShard('test', s.shard0.shardName);
     assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {"_id": 1}}));
     return s;
 }
@@ -46,7 +46,7 @@ function runTest(s) {
             bulk.insert({i: idInc++, val: valInc++, y: str});
         }
     }
-    assert.writeOK(bulk.execute());
+    assert.writeOK(bulk.execute({w: 2, wtimeout: 10 * 60 * 1000}));
 
     jsTest.log("Documents inserted, doing double-checks of insert...");
 
@@ -146,7 +146,7 @@ function runTest(s) {
             bulk.insert({i: idInc++, val: valInc++, y: str});
         }
         // wait for replication to catch up
-        assert.writeOK(bulk.execute({w: 2}));
+        assert.writeOK(bulk.execute({w: 2, wtimeout: 10 * 60 * 1000}));
     }
 
     jsTest.log("No errors...");
@@ -221,9 +221,9 @@ function runTest(s) {
     // that replication can keep up even on slow machines.
     s.stopBalancer();
     s._rs[0].test.awaitReplication();
-    assert.eq(51200, primary.getDB("test")[outcol].count(), "Wrong count");
+    assert.eq(51200, primary.getDB("test")[outcol].find().itcount(), "Wrong count");
     for (var i = 0; i < secondaries.length; ++i) {
-        assert.eq(51200, secondaries[i].getDB("test")[outcol].count(), "Wrong count");
+        assert.eq(51200, secondaries[i].getDB("test")[outcol].find().itcount(), "Wrong count");
     }
 }
 

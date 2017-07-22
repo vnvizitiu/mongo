@@ -31,6 +31,7 @@
 
 #include <string>
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
@@ -203,6 +204,10 @@ public:
         return ConstDataView(_data);
     }
 
+    ConstDataRange toCDR() const {
+        return ConstDataRange(_data, kOIDSize);
+    }
+
 private:
     // Internal mutable view
     DataView _view() {
@@ -235,8 +240,6 @@ enum JsonStringFormat {
     /** 10gen format, which is close to JS format.  This form is understandable by
         javascript running inside the Mongo server via eval() */
     TenGen,
-    /** Javascript JSON compatible */
-    JS
 };
 
 inline bool operator==(const OID& lhs, const OID& rhs) {

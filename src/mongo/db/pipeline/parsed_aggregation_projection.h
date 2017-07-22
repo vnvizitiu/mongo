@@ -41,11 +41,9 @@ namespace mongo {
 
 class BSONObj;
 class Document;
-struct ExpressionContext;
+class ExpressionContext;
 
 namespace parsed_aggregation_projection {
-
-enum class ProjectionType { kExclusion, kInclusion, kComputed };
 
 /**
  * This class ensures that the specification was valid: that none of the paths specified conflict
@@ -117,14 +115,10 @@ public:
      *
      * Throws a UserException if 'spec' is an invalid projection specification.
      */
-    static std::unique_ptr<ParsedAggregationProjection> create(const BSONObj& spec);
+    static std::unique_ptr<ParsedAggregationProjection> create(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& spec);
 
     virtual ~ParsedAggregationProjection() = default;
-
-    /**
-     * Returns the type of projection represented by this ParsedAggregationProjection.
-     */
-    virtual ProjectionType getType() const = 0;
 
     /**
      * Parse the user-specified BSON object 'spec'. By the time this is called, 'spec' has already
@@ -140,11 +134,6 @@ public:
     virtual void optimize() {}
 
     /**
-     * Inject the ExpressionContext into any expressions contained within this projection.
-     */
-    virtual void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx) {}
-
-    /**
      * Add any dependencies needed by this projection or any sub-expressions to 'deps'.
      */
     virtual DocumentSource::GetDepsReturn addDependencies(DepsTracker* deps) const {
@@ -154,17 +143,20 @@ public:
     /**
      * Apply the projection transformation.
      */
-    Document applyTransformation(Document input) {
+    Document applyTransformation(const Document& input) {
         return applyProjection(input);
     }
 
 protected:
-    ParsedAggregationProjection() = default;
+    ParsedAggregationProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : _expCtx(expCtx){};
 
     /**
      * Apply the projection to 'input'.
      */
-    virtual Document applyProjection(Document input) const = 0;
+    virtual Document applyProjection(const Document& input) const = 0;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
 };
 }  // namespace parsed_aggregation_projection
 }  // namespace mongo

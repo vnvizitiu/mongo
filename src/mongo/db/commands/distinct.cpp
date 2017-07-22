@@ -45,11 +45,12 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
@@ -58,7 +59,6 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/view_response_formatter.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -71,9 +71,9 @@ using std::stringstream;
 
 namespace dps = ::mongo::dotted_path_support;
 
-class DistinctCommand : public Command {
+class DistinctCommand : public BasicCommand {
 public:
-    DistinctCommand() : Command("distinct") {}
+    DistinctCommand() : BasicCommand("distinct") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -87,7 +87,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -111,30 +111,20 @@ public:
         help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
     }
 
-    virtual Status explain(OperationContext* txn,
+    virtual Status explain(OperationContext* opCtx,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata&,
+                           ExplainOptions::Verbosity verbosity,
                            BSONObjBuilder* out) const {
-        const string ns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(ns);
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
-        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, true);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true);
         if (!parsedDistinct.isOK()) {
             return parsedDistinct.getStatus();
         }
 
-        if (!parsedDistinct.getValue().getQuery()->getQueryRequest().getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
-        }
-
-        AutoGetCollectionOrViewForRead ctx(txn, ns);
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -144,14 +134,19 @@ public:
             if (!viewAggregation.isOK()) {
                 return viewAggregation.getStatus();
             }
-            std::string errmsg;
-            (void)Command::findCommand("aggregate")
-                ->run(txn, dbname, viewAggregation.getValue(), 0, errmsg, *out);
-            return Status::OK();
+
+            auto viewAggRequest =
+                AggregationRequest::parseFromBSON(nss, viewAggregation.getValue(), verbosity);
+            if (!viewAggRequest.isOK()) {
+                return viewAggRequest.getStatus();
+            }
+
+            return runAggregate(
+                opCtx, nss, viewAggRequest.getValue(), viewAggregation.getValue(), *out);
         }
 
         auto executor = getExecutorDistinct(
-            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
+            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return executor.getStatus();
         }
@@ -160,32 +155,19 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        const string ns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(ns);
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
-        const ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto parsedDistinct = ParsedDistinct::parse(txn, nss, cmdObj, extensionsCallback, false);
+        const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        auto parsedDistinct = ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false);
         if (!parsedDistinct.isOK()) {
             return appendCommandStatus(result, parsedDistinct.getStatus());
         }
 
-        if (!parsedDistinct.getValue().getQuery()->getQueryRequest().getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::InvalidOptions,
-                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
-        }
-
-        AutoGetCollectionOrViewForRead ctx(txn, ns);
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -195,17 +177,16 @@ public:
             if (!viewAggregation.isOK()) {
                 return appendCommandStatus(result, viewAggregation.getStatus());
             }
-            BSONObjBuilder aggResult;
 
-            (void)Command::findCommand("aggregate")
-                ->run(txn, dbname, viewAggregation.getValue(), options, errmsg, aggResult);
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
 
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult.asTempObj())) {
-                result.appendElements(aggResult.obj());
+            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
+                result.appendElements(aggResult);
                 return false;
             }
 
-            ViewResponseFormatter formatter(aggResult.obj());
+            ViewResponseFormatter formatter(aggResult);
             Status formatStatus = formatter.appendAsDistinctResponse(&result);
             if (!formatStatus.isOK()) {
                 return appendCommandStatus(result, formatStatus);
@@ -214,14 +195,14 @@ public:
         }
 
         auto executor = getExecutorDistinct(
-            txn, collection, ns, &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
+            opCtx, collection, nss.ns(), &parsedDistinct.getValue(), PlanExecutor::YIELD_AUTO);
         if (!executor.isOK()) {
             return appendCommandStatus(result, executor.getStatus());
         }
 
         {
-            stdx::lock_guard<Client>(*txn->getClient());
-            CurOp::get(txn)->setPlanSummary_inlock(
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            CurOp::get(opCtx)->setPlanSummary_inlock(
                 Explain::getPlanSummary(executor.getValue().get()));
         }
 
@@ -276,13 +257,13 @@ public:
         }
 
 
-        auto curOp = CurOp::get(txn);
+        auto curOp = CurOp::get(opCtx);
 
         // Get summary information about the plan.
         PlanSummaryStats stats;
         Explain::getSummaryStats(*executor.getValue(), &stats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(txn, stats.indexesUsed);
+            collection->infoCache()->notifyOfQuery(opCtx, stats.indexesUsed);
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 

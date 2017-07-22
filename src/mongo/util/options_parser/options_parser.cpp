@@ -416,7 +416,7 @@ Status addBoostVariablesToEnvironment(const po::variables_map& vm,
                 optionValue = Value(mapValue);
             }
 
-            environment->set(iterator->_dottedName, optionValue);
+            environment->set(iterator->_dottedName, optionValue).transitional_ignore();
         }
     }
     return Status::OK();
@@ -605,7 +605,7 @@ Status addConstraints(const OptionSection& options, Environment* dest) {
     std::vector<std::shared_ptr<Constraint>>::const_iterator citerator;
     for (citerator = constraints_vector.begin(); citerator != constraints_vector.end();
          citerator++) {
-        dest->addConstraint(citerator->get());
+        dest->addConstraint(citerator->get()).transitional_ignore();
     }
 
     return Status::OK();
@@ -896,9 +896,13 @@ Status OptionsParser::readConfigFile(const std::string& filename, std::string* c
         configVector.resize(nread);
     }
 
+    // config file cannot have null bytes
+    if (end(configVector) != std::find(begin(configVector), end(configVector), '\0')) {
+        return Status(ErrorCodes::FailedToParse, "Config file has null bytes");
+    }
+
     // Copy the vector contents into our result string
     *contents = std::string(configVector.begin(), configVector.end());
-
     return Status::OK();
 }
 

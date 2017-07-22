@@ -56,9 +56,9 @@ using std::string;
  *   writeConcern: <BSONObj>
  * }
  */
-class ConfigSvrAddShardToZoneCommand : public Command {
+class ConfigSvrAddShardToZoneCommand : public BasicCommand {
 public:
-    ConfigSvrAddShardToZoneCommand() : Command("_configsvrAddShardToZone") {}
+    ConfigSvrAddShardToZoneCommand() : BasicCommand("_configsvrAddShardToZone") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
@@ -87,11 +87,9 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             uasserted(ErrorCodes::IllegalOperation,
@@ -100,8 +98,8 @@ public:
 
         auto parsedRequest = uassertStatusOK(AddShardToZoneRequest::parseFromConfigCommand(cmdObj));
 
-        uassertStatusOK(Grid::get(txn)->catalogManager()->addShardToZone(
-            txn, parsedRequest.getShardName(), parsedRequest.getZoneName()));
+        uassertStatusOK(ShardingCatalogManager::get(opCtx)->addShardToZone(
+            opCtx, parsedRequest.getShardName(), parsedRequest.getZoneName()));
 
         return true;
     }

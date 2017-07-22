@@ -41,15 +41,14 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/server_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-ParsedDelete::ParsedDelete(OperationContext* txn, const DeleteRequest* request)
-    : _txn(txn), _request(request) {}
+ParsedDelete::ParsedDelete(OperationContext* opCtx, const DeleteRequest* request)
+    : _opCtx(opCtx), _request(request) {}
 
 Status ParsedDelete::parseRequest() {
     dassert(!_canonicalQuery.get());
@@ -61,14 +60,6 @@ Status ParsedDelete::parseRequest() {
     // DeleteStage would not return the deleted document.
     invariant(_request->getProj().isEmpty() || _request->shouldReturnDeleted());
 
-    if (!_request->getCollation().isEmpty() &&
-        serverGlobalParams.featureCompatibility.version.load() ==
-            ServerGlobalParams::FeatureCompatibility::Version::k32) {
-        return Status(ErrorCodes::InvalidOptions,
-                      "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                      "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
-    }
-
     if (CanonicalQuery::isSimpleIdQuery(_request->getQuery())) {
         return Status::OK();
     }
@@ -79,7 +70,7 @@ Status ParsedDelete::parseRequest() {
 Status ParsedDelete::parseQueryToCQ() {
     dassert(!_canonicalQuery.get());
 
-    const ExtensionsCallbackReal extensionsCallback(_txn, &_request->getNamespaceString());
+    const ExtensionsCallbackReal extensionsCallback(_opCtx, &_request->getNamespaceString());
 
     // The projection needs to be applied after the delete operation, so we do not specify a
     // projection during canonicalization.
@@ -99,7 +90,7 @@ Status ParsedDelete::parseQueryToCQ() {
         qr->setLimit(1);
     }
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(_txn, std::move(qr), extensionsCallback);
+    auto statusWithCQ = CanonicalQuery::canonicalize(_opCtx, std::move(qr), extensionsCallback);
 
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
@@ -114,7 +105,7 @@ const DeleteRequest* ParsedDelete::getRequest() const {
 
 PlanExecutor::YieldPolicy ParsedDelete::yieldPolicy() const {
     if (_request->isGod()) {
-        return PlanExecutor::YIELD_MANUAL;
+        return PlanExecutor::NO_YIELD;
     }
     if (_request->getYieldPolicy() == PlanExecutor::YIELD_AUTO && isIsolated()) {
         return PlanExecutor::WRITE_CONFLICT_RETRY_ONLY;  // Don't yield locks.

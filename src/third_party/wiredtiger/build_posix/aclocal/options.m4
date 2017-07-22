@@ -57,7 +57,7 @@ AH_TEMPLATE(
     HAVE_CRC32_HARDWARE, [Define to 1 to configure CRC32 hardware support.])
 AC_MSG_CHECKING(if --enable-crc32-hardware option specified)
 AC_ARG_ENABLE(crc32-hardware,
-	AC_HELP_STRING([--enable-crc32-hardware],
+	AS_HELP_STRING([--enable-crc32-hardware],
 	    [Enable CRC32 hardware support.]), r=$enableval, r=yes)
 case "$r" in
 no)	wt_cv_enable_crc32_hardware=no;;
@@ -243,6 +243,15 @@ no)	wt_cv_enable_strict=no;;
 *)	wt_cv_enable_strict=yes;;
 esac
 AC_MSG_RESULT($wt_cv_enable_strict)
+
+AC_MSG_CHECKING(if --with-timestamp-size option specified)
+AC_ARG_WITH(timestamp-size,
+	[AS_HELP_STRING([--with-timestamp-size=NUM],
+	    [Size of transaction timestamps in bytes, default 8.])],
+	    [with_timestamp_size=$withval],
+	    [with_timestamp_size=8])
+AC_MSG_RESULT($with_timestamp_size)
+AC_DEFINE_UNQUOTED(WT_TIMESTAMP_SIZE, [$with_timestamp_size], [Size of a transaction timestamp in bytes])
 
 AH_TEMPLATE(HAVE_VERBOSE, [Enable verbose message configuration.])
 AC_MSG_CHECKING(if --enable-verbose option specified)

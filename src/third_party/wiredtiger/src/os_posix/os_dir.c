@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -28,8 +28,6 @@ __wt_posix_directory_list(WT_FILE_SYSTEM *file_system,
 	int tret;
 	char **entries;
 
-	WT_UNUSED(file_system);
-
 	session = (WT_SESSION_IMPL *)wt_session;
 
 	*dirlistp = NULL;
@@ -39,7 +37,13 @@ __wt_posix_directory_list(WT_FILE_SYSTEM *file_system,
 	dirallocsz = 0;
 	entries = NULL;
 
+	/*
+	 * If opendir fails, we should have a NULL pointer with an error value,
+	 * but various static analysis programs remain unconvinced, check both.
+	 */
 	WT_SYSCALL_RETRY(((dirp = opendir(directory)) == NULL ? -1 : 0), ret);
+	if (dirp == NULL && ret == 0)
+		ret = EINVAL;
 	if (ret != 0)
 		WT_RET_MSG(session, ret,
 		    "%s: directory-list: opendir", directory);

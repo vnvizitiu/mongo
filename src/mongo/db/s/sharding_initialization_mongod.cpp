@@ -36,19 +36,24 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
+#include "mongo/db/logical_time_metadata_hook.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/shard_server_catalog_cache_loader.h"
+#include "mongo/db/s/sharding_egress_metadata_hook_for_mongod.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/catalog/sharding_catalog_manager_impl.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_remote.h"
-#include "mongo/s/sharding_egress_metadata_hook_for_mongod.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
 
-Status initializeGlobalShardingStateForMongod(OperationContext* txn,
+Status initializeGlobalShardingStateForMongod(OperationContext* opCtx,
                                               const ConnectionString& configCS,
                                               StringData distLockProcessId) {
     auto targeterFactory = stdx::make_unique<RemoteCommandTargeterFactoryImpl>();
@@ -80,21 +85,25 @@ Status initializeGlobalShardingStateForMongod(OperationContext* txn,
     auto shardFactory =
         stdx::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
+    std::unique_ptr<CatalogCache> catalogCache =
+        (serverGlobalParams.clusterRole == ClusterRole::ConfigServer)
+        ? stdx::make_unique<CatalogCache>()
+        : stdx::make_unique<CatalogCache>(stdx::make_unique<ShardServerCatalogCacheLoader>(
+              stdx::make_unique<ConfigServerCatalogCacheLoader>()));
+
     return initializeGlobalShardingState(
-        txn,
+        opCtx,
         configCS,
         distLockProcessId,
         std::move(shardFactory),
-        []() { return stdx::make_unique<rpc::ShardingEgressMetadataHookForMongod>(); },
-        [](ShardingCatalogClient* catalogClient, std::unique_ptr<executor::TaskExecutor> executor)
-            -> std::unique_ptr<ShardingCatalogManager> {
-                if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                    return stdx::make_unique<ShardingCatalogManagerImpl>(catalogClient,
-                                                                         std::move(executor));
-                } else {
-                    return nullptr;  // Only config servers get a real ShardingCatalogManager
-                }
-            });
+        std::move(catalogCache),
+        [opCtx] {
+            auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+            hookList->addHook(
+                stdx::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
+            hookList->addHook(stdx::make_unique<rpc::ShardingEgressMetadataHookForMongod>());
+            return hookList;
+        });
 }
 
 }  // namespace mongo

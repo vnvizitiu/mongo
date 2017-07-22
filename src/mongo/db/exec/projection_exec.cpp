@@ -28,17 +28,21 @@
 
 #include "mongo/db/exec/projection_exec.h"
 
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
 using std::max;
 using std::string;
+
+namespace mmb = mongo::mutablebson;
 
 namespace {
 
@@ -267,13 +271,6 @@ Status ProjectionExec::transform(WorkingSetMember* member) const {
             matchDetails.requestElemMatchKey();
             verify(NULL != _queryExpression);
             verify(_queryExpression->matchesBSON(member->obj.value(), &matchDetails));
-
-            // Performing a positional projection requires valid MatchDetails. For example,
-            // ambiguity caused by multiple implicit array traversal predicates can lead to invalid
-            // match details.
-            if (!matchDetails.isValid()) {
-                return Status(ErrorCodes::InternalError, "ambiguous positional projection");
-            }
         }
 
         Status projStatus = transform(member->obj.value(), &bob, &matchDetails);
@@ -291,9 +288,9 @@ Status ProjectionExec::transform(WorkingSetMember* member) const {
             }
         }
 
-        BSONObjIterator it(_source);
-        while (it.more()) {
-            BSONElement specElt = it.next();
+        mmb::Document projectedDoc;
+
+        for (auto&& specElt : _source) {
             if (mongoutils::str::equals("_id", specElt.fieldName())) {
                 continue;
             }
@@ -313,9 +310,16 @@ Status ProjectionExec::transform(WorkingSetMember* member) const {
             BSONElement keyElt;
             // We can project a field that doesn't exist.  We just ignore it.
             if (member->getFieldDotted(specElt.fieldName(), &keyElt) && !keyElt.eoo()) {
-                bob.appendAs(keyElt, specElt.fieldName());
+                FieldRef projectedFieldPath{specElt.fieldNameStringData()};
+                auto setElementStatus =
+                    pathsupport::setElementAtPath(projectedFieldPath, keyElt, &projectedDoc);
+                if (!setElementStatus.isOK()) {
+                    return setElementStatus;
+                }
             }
         }
+
+        bob.appendElements(projectedDoc.getObject());
     }
 
     for (MetaMap::const_iterator it = _meta.begin(); it != _meta.end(); ++it) {
@@ -406,10 +410,6 @@ Status ProjectionExec::transform(const BSONObj& in,
         arrayDetails.requestElemMatchKey();
 
         if (matcher->second->matchesBSON(in, &arrayDetails)) {
-            // Since we create a special matcher for each $elemMatch projection, we should always
-            // have valid MatchDetails.
-            invariant(arrayDetails.isValid());
-
             FieldMap::const_iterator fieldIt = _fields.find(elt.fieldName());
             if (_fields.end() == fieldIt) {
                 return Status(ErrorCodes::BadValue,
@@ -475,7 +475,7 @@ void ProjectionExec::appendArray(BSONObjBuilder* bob, const BSONObj& array, bool
                 BSONObjBuilder subBob;
                 BSONObjIterator jt(elt.embeddedObject());
                 while (jt.more()) {
-                    append(&subBob, jt.next());
+                    append(&subBob, jt.next()).transitional_ignore();
                 }
                 bob->append(bob->numStr(index++), subBob.obj());
                 break;
@@ -518,7 +518,7 @@ Status ProjectionExec::append(BSONObjBuilder* bob,
         BSONObjBuilder subBob;
         BSONObjIterator it(elt.embeddedObject());
         while (it.more()) {
-            subfm.append(&subBob, it.next(), details, arrayOpType);
+            subfm.append(&subBob, it.next(), details, arrayOpType).transitional_ignore();
         }
         bob->append(elt.fieldName(), subBob.obj());
     } else {

@@ -34,14 +34,14 @@ namespace mongo {
 
 class DocumentSourceOut final : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> liteParse(
+    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
         const AggregationRequest& request, const BSONElement& spec);
 
     // virtuals from DocumentSource
     ~DocumentSourceOut() final;
     GetNextResult getNext() final;
     const char* getSourceName() const final;
-    Value serialize(bool explain = false) const final;
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
     bool needsPrimaryShard() const final {
         return true;

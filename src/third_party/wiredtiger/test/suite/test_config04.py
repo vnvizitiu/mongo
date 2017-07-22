@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2016 MongoDB, Inc.
+# Public Domain 2014-2017 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -153,10 +153,6 @@ class test_config04(wttest.WiredTigerTestCase):
             self.wiredtiger_open('.', 'create,eviction_target=86,' +
                                  'eviction_trigger=86'),
             "/eviction target must be lower than the eviction trigger/")
-
-    def test_hazard_max(self):
-        # Note: There isn't any direct way to know that this was set.
-        self.common_test('hazard_max=50')
 
     def test_invalid_config(self):
         msg = '/Unbalanced brackets/'

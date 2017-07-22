@@ -28,7 +28,9 @@
 
 #pragma once
 
-#include "mongo/base/owned_pointer_vector.h"
+#include <memory>
+#include <vector>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
@@ -90,6 +92,8 @@ public:
     bool isHashedPattern() const;
 
     const KeyPattern& getKeyPattern() const;
+
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const;
 
     const BSONObj& toBSON() const;
 
@@ -164,7 +168,7 @@ public:
      *   { a : { b : { $eq : "hi" } } } --> returns {} because the query language treats this as
      *                                                 a : { $eq : { b : ... } }
      */
-    StatusWith<BSONObj> extractShardKeyFromQuery(OperationContext* txn,
+    StatusWith<BSONObj> extractShardKeyFromQuery(OperationContext* opCtx,
                                                  const BSONObj& basicQuery) const;
     BSONObj extractShardKeyFromQuery(const CanonicalQuery& query) const;
 
@@ -223,8 +227,9 @@ public:
 
 private:
     // Ordered, parsed paths
-    const OwnedPointerVector<FieldRef> _keyPatternPaths;
+    std::vector<std::unique_ptr<FieldRef>> _keyPatternPaths;
 
-    const KeyPattern _keyPattern;
+    KeyPattern _keyPattern;
 };
-}
+
+}  // namespace mongo

@@ -40,12 +40,15 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
@@ -65,7 +68,7 @@ using std::stringstream;
 
 namespace repl {
 
-void appendReplicationInfo(OperationContext* txn, BSONObjBuilder& result, int level) {
+void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int level) {
     ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
     if (replCoord->getSettings().usingReplSets()) {
         IsMasterResponse isMasterResponse;
@@ -93,10 +96,10 @@ void appendReplicationInfo(OperationContext* txn, BSONObjBuilder& result, int le
         int n = 0;
         list<BSONObj> src;
         {
-            const char* localSources = "local.sources";
-            AutoGetCollectionForRead ctx(txn, localSources);
-            unique_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(
-                txn, localSources, ctx.getCollection(), PlanExecutor::YIELD_MANUAL));
+            const NamespaceString localSources{"local.sources"};
+            AutoGetCollectionForReadCommand ctx(opCtx, localSources);
+            auto exec = InternalPlanner::collectionScan(
+                opCtx, localSources.ns(), ctx.getCollection(), PlanExecutor::NO_YIELD);
             BSONObj obj;
             PlanExecutor::ExecState state;
             while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
@@ -123,7 +126,7 @@ void appendReplicationInfo(OperationContext* txn, BSONObjBuilder& result, int le
             }
 
             if (level > 1) {
-                wassert(!txn->lockState()->isLocked());
+                wassert(!opCtx->lockState()->isLocked());
                 // note: there is no so-style timeout on this connection; perhaps we should have
                 // one.
                 ScopedDbConnection conn(s["host"].valuestr());
@@ -158,7 +161,7 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         if (!getGlobalReplicationCoordinator()->isReplEnabled()) {
             return BSONObj();
         }
@@ -166,8 +169,12 @@ public:
         int level = configElement.numberInt();
 
         BSONObjBuilder result;
-        appendReplicationInfo(txn, result, level);
-        getGlobalReplicationCoordinator()->processReplSetGetRBID(&result);
+        appendReplicationInfo(opCtx, result, level);
+
+        auto rbid = ReplicationProcess::get(opCtx)->getRollbackID(opCtx);
+        if (rbid.isOK()) {
+            result.append("rbid", rbid.getValue());
+        }
 
         return result.obj();
     }
@@ -181,7 +188,7 @@ public:
         return false;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
         if (!replCoord->isReplEnabled()) {
             return BSONObj();
@@ -193,18 +200,18 @@ public:
 
         const std::string& oplogNS =
             replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet
-            ? rsOplogName
+            ? NamespaceString::kRsOplogNamespace.ns()
             : masterSlaveOplogName;
         BSONObj o;
         uassert(17347,
                 "Problem reading earliest entry from oplog",
-                Helpers::getSingleton(txn, oplogNS.c_str(), o));
+                Helpers::getSingleton(opCtx, oplogNS.c_str(), o));
         result.append("earliestOptime", o["ts"].timestamp());
         return result.obj();
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster : public Command {
+class CmdIsMaster : public BasicCommand {
 public:
     virtual bool requiresAuth() {
         return false;
@@ -223,31 +230,29 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
-    CmdIsMaster() : Command("isMaster", true, "ismaster") {}
-    virtual bool run(OperationContext* txn,
+    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
+    virtual bool run(OperationContext* opCtx,
                      const string&,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
         */
         if (cmdObj["forShell"].trueValue()) {
-            LastError::get(txn->getClient()).disable();
+            LastError::get(opCtx->getClient()).disable();
         }
 
         // Tag connections to avoid closing them on stepdown.
         auto hangUpElement = cmdObj["hangUpOnStepDown"];
         if (!hangUpElement.eoo() && !hangUpElement.trueValue()) {
-            auto session = txn->getClient()->session();
+            auto session = opCtx->getClient()->session();
             if (session) {
                 session->replaceTags(session->getTags() |
                                      executor::NetworkInterface::kMessagingPortKeepOpen);
             }
         }
 
-        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(txn->getClient());
+        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
         if (!seenIsMaster) {
             clientMetadataIsMasterState.setSeenIsMaster();
@@ -270,22 +275,79 @@ public:
 
             invariant(swParseClientMetadata.getValue());
 
-            swParseClientMetadata.getValue().get().logClientMetadata(txn->getClient());
+            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
 
             clientMetadataIsMasterState.setClientMetadata(
-                txn->getClient(), std::move(swParseClientMetadata.getValue()));
+                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
         }
 
-        appendReplicationInfo(txn, result, 0);
+        // Parse the optional 'internalClient' field. This is provided by incoming connections from
+        // mongod and mongos.
+        auto internalClientElement = cmdObj["internalClient"];
+        if (internalClientElement) {
+            auto session = opCtx->getClient()->session();
+            if (session) {
+                session->replaceTags(session->getTags() | transport::Session::kInternalClient);
+            }
+
+            uassert(ErrorCodes::TypeMismatch,
+                    str::stream() << "'internalClient' must be of type Object, but was of type "
+                                  << typeName(internalClientElement.type()),
+                    internalClientElement.type() == BSONType::Object);
+
+            bool foundMaxWireVersion = false;
+            for (auto&& elem : internalClientElement.Obj()) {
+                auto fieldName = elem.fieldNameStringData();
+                if (fieldName == "minWireVersion") {
+                    // We do not currently use 'internalClient.minWireVersion'.
+                    continue;
+                } else if (fieldName == "maxWireVersion") {
+                    foundMaxWireVersion = true;
+
+                    uassert(ErrorCodes::TypeMismatch,
+                            str::stream() << "'maxWireVersion' field of 'internalClient' must be "
+                                             "of type int, but was of type "
+                                          << typeName(elem.type()),
+                            elem.type() == BSONType::NumberInt);
+
+                    // All incoming connections from mongod/mongos of earlier versions should be
+                    // closed if the featureCompatibilityVersion is bumped to 3.6.
+                    if (elem.numberInt() >= WireSpec::instance().incoming.maxWireVersion) {
+                        if (session) {
+                            session->replaceTags(
+                                session->getTags() |
+                                transport::Session::kLatestVersionInternalClientKeepOpen);
+                        }
+                    } else {
+                        if (session) {
+                            session->replaceTags(
+                                session->getTags() &
+                                ~transport::Session::kLatestVersionInternalClientKeepOpen);
+                        }
+                    }
+                } else {
+                    uasserted(ErrorCodes::BadValue,
+                              str::stream() << "Unrecognized field of 'internalClient': '"
+                                            << fieldName
+                                            << "'");
+                }
+            }
+
+            uassert(ErrorCodes::BadValue,
+                    "Missing required field 'maxWireVersion' of 'internalClient'",
+                    foundMaxWireVersion);
+        } else {
+            auto session = opCtx->getClient()->session();
+            if (session && !(session->getTags() & transport::Session::kInternalClient)) {
+                session->replaceTags(session->getTags() |
+                                     transport::Session::kExternalClientKeepOpen);
+            }
+        }
+
+        appendReplicationInfo(opCtx, result, 0);
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            // If we have feature compatibility version 3.4, use a config server mode that 3.2
-            // mongos won't understand. This should prevent a 3.2 mongos from joining the cluster or
-            // making a connection to the config servers.
-            int configServerModeNumber = (serverGlobalParams.featureCompatibility.version.load() ==
-                                          ServerGlobalParams::FeatureCompatibility::Version::k34)
-                ? 2
-                : 1;
+            const int configServerModeNumber = 2;
             result.append("configsvr", configServerModeNumber);
         }
 
@@ -294,16 +356,30 @@ public:
         result.appendNumber("maxWriteBatchSize", BatchedCommandRequest::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
         result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
-        result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
+
+        // If the featureCompatibilityVersion is 3.6, respond with minWireVersion=maxWireVersion.
+        // Then if the connection is from a mongod/mongos of an earlier version, it will fail to
+        // connect.
+        if (internalClientElement &&
+            serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k36) {
+            result.append("minWireVersion", WireSpec::instance().incoming.maxWireVersion);
+        } else {
+            result.append("minWireVersion", WireSpec::instance().incoming.minWireVersion);
+        }
+
         result.append("readOnly", storageGlobalParams.readOnly);
 
         const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
                                                   "automationServiceDescriptor",
                                                   static_cast<ServerParameter*>(nullptr));
         if (parameter)
-            parameter->append(txn, result, "automationServiceDescriptor");
+            parameter->append(opCtx, result, "automationServiceDescriptor");
 
-        txn->getClient()->session()->getCompressorManager().serverNegotiate(cmdObj, &result);
+        if (opCtx->getClient()->session()) {
+            MessageCompressorManager::forSession(opCtx->getClient()->session())
+                .serverNegotiate(cmdObj, &result);
+        }
 
         return true;
     }

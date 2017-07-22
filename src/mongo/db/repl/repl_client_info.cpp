@@ -30,11 +30,9 @@
 
 #include "mongo/db/repl/repl_client_info.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
@@ -43,9 +41,14 @@ namespace repl {
 const Client::Decoration<ReplClientInfo> ReplClientInfo::forClient =
     Client::declareDecoration<ReplClientInfo>();
 
-void ReplClientInfo::setLastOpToSystemLastOpTime(OperationContext* txn) {
-    ReplicationCoordinator* replCoord = repl::ReplicationCoordinator::get(txn->getServiceContext());
-    if (replCoord->isReplEnabled() && txn->writesAreReplicated()) {
+void ReplClientInfo::setLastOp(const OpTime& ot) {
+    invariant(ot >= _lastOp);
+    _lastOp = ot;
+}
+
+void ReplClientInfo::setLastOpToSystemLastOpTime(OperationContext* opCtx) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx->getServiceContext());
+    if (replCoord->isReplEnabled() && opCtx->writesAreReplicated()) {
         setLastOp(replCoord->getMyLastAppliedOpTime());
     }
 }

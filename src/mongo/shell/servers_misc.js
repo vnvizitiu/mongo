@@ -17,7 +17,6 @@ ToolTest.prototype.startDB = function(coll) {
     var options = {
         port: this.port,
         dbpath: this.dbpath,
-        nohttpinterface: "",
         noprealloc: "",
         smallfiles: "",
         bind_ip: "127.0.0.1"
@@ -72,6 +71,7 @@ ToolTest.prototype.runTool = function() {
 ReplTest = function(name, ports) {
     this.name = name;
     this.ports = ports || allocatePorts(2);
+    this.kDefaultTimeoutMS = 10 * 60 * 1000;
 };
 
 ReplTest.prototype.getPort = function(master) {
@@ -100,7 +100,7 @@ ReplTest.prototype.getOptions = function(master, extra, putBinaryFirst, norepl) 
     var a = [];
     if (putBinaryFirst)
         a.push("mongod");
-    a.push("--nohttpinterface", "--noprealloc", "--bind_ip", "127.0.0.1", "--smallfiles");
+    a.push("--noprealloc", "--bind_ip", "127.0.0.1", "--smallfiles");
 
     a.push("--port");
     a.push(this.getPort(master));
@@ -210,7 +210,8 @@ allocatePorts = function(numPorts) {
 };
 
 function startParallelShell(jsCode, port, noConnect) {
-    var args = ["mongo"];
+    var shellPath = MongoRunner.mongoShellPath;
+    var args = [shellPath];
 
     if (typeof db == "object") {
         var hostAndPort = db.getMongo().host.split(':');

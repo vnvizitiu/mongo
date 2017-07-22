@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -29,8 +29,6 @@ __wt_win_directory_list(WT_FILE_SYSTEM *file_system,
 	size_t dirallocsz, pathlen, prefix_widelen;
 	uint32_t count;
 	char *dir_copy, **entries;
-
-	WT_UNUSED(file_system);
 
 	session = (WT_SESSION_IMPL *)wt_session;
 

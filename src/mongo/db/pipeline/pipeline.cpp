@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
@@ -62,44 +63,123 @@ namespace dps = ::mongo::dotted_path_support;
 Pipeline::Pipeline(const intrusive_ptr<ExpressionContext>& pTheCtx) : pCtx(pTheCtx) {}
 
 Pipeline::Pipeline(SourceContainer stages, const intrusive_ptr<ExpressionContext>& expCtx)
-    : _sources(stages), pCtx(expCtx) {}
+    : _sources(std::move(stages)), pCtx(expCtx) {}
 
-StatusWith<intrusive_ptr<Pipeline>> Pipeline::parse(
+Pipeline::~Pipeline() {
+    invariant(_disposed);
+}
+
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::parse(
     const std::vector<BSONObj>& rawPipeline, const intrusive_ptr<ExpressionContext>& expCtx) {
-    intrusive_ptr<Pipeline> pipeline(new Pipeline(expCtx));
+    return parseTopLevelOrFacetPipeline(rawPipeline, expCtx, false);
+}
+
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::parseFacetPipeline(
+    const std::vector<BSONObj>& rawPipeline, const intrusive_ptr<ExpressionContext>& expCtx) {
+    return parseTopLevelOrFacetPipeline(rawPipeline, expCtx, true);
+}
+
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::parseTopLevelOrFacetPipeline(
+    const std::vector<BSONObj>& rawPipeline,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const bool isFacetPipeline) {
+
+    SourceContainer stages;
 
     for (auto&& stageObj : rawPipeline) {
         auto parsedSources = DocumentSource::parse(expCtx, stageObj);
-        pipeline->_sources.insert(
-            pipeline->_sources.end(), parsedSources.begin(), parsedSources.end());
+        stages.insert(stages.end(), parsedSources.begin(), parsedSources.end());
     }
 
-    auto status = pipeline->ensureAllStagesAreInLegalPositions();
-    if (!status.isOK()) {
-        return status;
-    }
-    pipeline->stitch();
-    return pipeline;
+    return createTopLevelOrFacetPipeline(std::move(stages), expCtx, isFacetPipeline);
 }
 
-StatusWith<intrusive_ptr<Pipeline>> Pipeline::create(
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::create(
     SourceContainer stages, const intrusive_ptr<ExpressionContext>& expCtx) {
-    intrusive_ptr<Pipeline> pipeline(new Pipeline(stages, expCtx));
-    auto status = pipeline->ensureAllStagesAreInLegalPositions();
+    return createTopLevelOrFacetPipeline(std::move(stages), expCtx, false);
+}
+
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::createFacetPipeline(
+    SourceContainer stages, const intrusive_ptr<ExpressionContext>& expCtx) {
+    return createTopLevelOrFacetPipeline(std::move(stages), expCtx, true);
+}
+
+StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> Pipeline::createTopLevelOrFacetPipeline(
+    SourceContainer stages,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const bool isFacetPipeline) {
+    std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline(new Pipeline(std::move(stages), expCtx),
+                                                          Pipeline::Deleter(expCtx->opCtx));
+    auto status =
+        (isFacetPipeline ? pipeline->validateFacetPipeline() : pipeline->validatePipeline());
     if (!status.isOK()) {
         return status;
     }
+
     pipeline->stitch();
-    return pipeline;
+    return std::move(pipeline);
+}
+
+Status Pipeline::validatePipeline() const {
+    // Verify that the specified namespace is valid for the initial stage of this pipeline.
+    const NamespaceString& nss = pCtx->ns;
+
+    if (_sources.empty()) {
+        if (nss.isCollectionlessAggregateNS()) {
+            return {ErrorCodes::InvalidNamespace,
+                    "{aggregate: 1} is not valid for an empty pipeline."};
+        }
+    } else if (!dynamic_cast<DocumentSourceMergeCursors*>(_sources.front().get())) {
+        // The $mergeCursors stage can take {aggregate: 1} or a normal namespace. Aside from this,
+        // {aggregate: 1} is only valid for collectionless sources, and vice-versa.
+        const auto firstStage = _sources.front().get();
+
+        if (nss.isCollectionlessAggregateNS() && !firstStage->isCollectionlessInitialSource()) {
+            return {ErrorCodes::InvalidNamespace,
+                    str::stream() << "{aggregate: 1} is not valid for '"
+                                  << firstStage->getSourceName()
+                                  << "'; a collection is required."};
+        }
+
+        if (!nss.isCollectionlessAggregateNS() && firstStage->isCollectionlessInitialSource()) {
+            return {ErrorCodes::InvalidNamespace,
+                    str::stream() << "'" << firstStage->getSourceName()
+                                  << "' can only be run with {aggregate: 1}"};
+        }
+    }
+
+    // Verify that each stage is in a legal position within the pipeline.
+    return ensureAllStagesAreInLegalPositions();
+}
+
+Status Pipeline::validateFacetPipeline() const {
+    if (_sources.empty()) {
+        return {ErrorCodes::BadValue, "sub-pipeline in $facet stage cannot be empty."};
+    } else if (_sources.front()->isInitialSource()) {
+        return {ErrorCodes::BadValue,
+                str::stream() << _sources.front()->getSourceName()
+                              << " is not allowed to be used within a $facet stage."};
+    }
+
+    // Facet pipelines cannot have any stages which are initial sources. We've already validated the
+    // first stage, and the 'ensureAllStagesAreInLegalPositions' method checks that there are no
+    // initial sources in positions 1...N, so we can just return its result directly.
+    return ensureAllStagesAreInLegalPositions();
 }
 
 Status Pipeline::ensureAllStagesAreInLegalPositions() const {
     size_t i = 0;
     for (auto&& stage : _sources) {
-        if (stage->isValidInitialSource() && i != 0) {
+        if (stage->isInitialSource() && i != 0) {
             return {ErrorCodes::BadValue,
                     str::stream() << stage->getSourceName()
                                   << " is only valid as the first stage in a pipeline."};
+        }
+        auto matchStage = dynamic_cast<DocumentSourceMatch*>(stage.get());
+        if (i != 0 && matchStage && matchStage->isTextQuery()) {
+            return {ErrorCodes::BadValue,
+                    "$match with $text is only allowed as the first pipeline stage",
+                    17313};
         }
 
         if (dynamic_cast<DocumentSourceOut*>(stage.get()) && i != _sources.size() - 1) {
@@ -115,6 +195,9 @@ void Pipeline::optimizePipeline() {
 
     SourceContainer::iterator itr = _sources.begin();
 
+    // We could be swapping around stages during this process, so disconnect the pipeline to prevent
+    // us from entering a state with dangling pointers.
+    unstitch();
     while (itr != _sources.end() && std::next(itr) != _sources.end()) {
         invariant((*itr).get());
         itr = (*itr).get()->optimizeAt(itr, &_sources);
@@ -165,18 +248,30 @@ void Pipeline::reattachToOperationContext(OperationContext* opCtx) {
     }
 }
 
-void Pipeline::injectExpressionContext(const intrusive_ptr<ExpressionContext>& expCtx) {
-    pCtx = expCtx;
-    for (auto&& stage : _sources) {
-        stage->injectExpressionContext(pCtx);
+void Pipeline::dispose(OperationContext* opCtx) {
+    try {
+        pCtx->opCtx = opCtx;
+
+        // Make sure all stages are connected, in case we are being disposed via an error path and
+        // were
+        // not stitched at the time of the error.
+        stitch();
+
+        if (!_sources.empty()) {
+            _sources.back()->dispose();
+        }
+        _disposed = true;
+    } catch (...) {
+        std::terminate();
     }
 }
 
-intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
+std::unique_ptr<Pipeline, Pipeline::Deleter> Pipeline::splitForSharded() {
     // Create and initialize the shard spec we'll return. We start with an empty pipeline on the
     // shards and all work being done in the merger. Optimizations can move operations between
     // the pipelines to be more efficient.
-    intrusive_ptr<Pipeline> shardPipeline(new Pipeline(pCtx));
+    std::unique_ptr<Pipeline, Pipeline::Deleter> shardPipeline(new Pipeline(pCtx),
+                                                               Pipeline::Deleter(pCtx->opCtx));
 
     // The order in which optimizations are applied can have significant impact on the
     // efficiency of the final pipeline. Be Careful!
@@ -302,12 +397,19 @@ vector<Value> Pipeline::serialize() const {
     return serializedSources;
 }
 
+void Pipeline::unstitch() {
+    for (auto&& stage : _sources) {
+        stage->setSource(nullptr);
+    }
+}
+
 void Pipeline::stitch() {
     if (_sources.empty()) {
         return;
     }
     // Chain together all the stages.
     DocumentSource* prevSource = _sources.front().get();
+    prevSource->setSource(nullptr);
     for (SourceContainer::iterator iter(++_sources.begin()), listEnd(_sources.end());
          iter != listEnd;
          ++iter) {
@@ -315,30 +417,6 @@ void Pipeline::stitch() {
         pTemp->setSource(prevSource);
         prevSource = pTemp.get();
     }
-}
-
-void Pipeline::run(BSONObjBuilder& result) {
-    // We should not get here in the explain case.
-    verify(!pCtx->isExplain);
-
-    // the array in which the aggregation results reside
-    // cant use subArrayStart() due to error handling
-    BSONArrayBuilder resultArray;
-    while (auto next = getNext()) {
-        // Add the document to the result set.
-        BSONObjBuilder documentBuilder(resultArray.subobjStart());
-        next->toBson(&documentBuilder);
-        documentBuilder.doneFast();
-        // Object will be too large, assert. The extra 1KB is for headers.
-        uassert(16389,
-                str::stream() << "aggregation result exceeds maximum document size ("
-                              << BSONObjMaxUserSize / (1024 * 1024)
-                              << "MB)",
-                resultArray.len() < BSONObjMaxUserSize - 1024);
-    }
-
-    resultArray.done();
-    result.appendArray("result", resultArray.arr());
 }
 
 boost::optional<Document> Pipeline::getNext() {
@@ -351,10 +429,10 @@ boost::optional<Document> Pipeline::getNext() {
                               : boost::optional<Document>{nextResult.releaseDocument()};
 }
 
-vector<Value> Pipeline::writeExplainOps() const {
+vector<Value> Pipeline::writeExplainOps(ExplainOptions::Verbosity verbosity) const {
     vector<Value> array;
     for (SourceContainer::const_iterator it = _sources.begin(); it != _sources.end(); ++it) {
-        (*it)->serializeToArray(array, /*explain=*/true);
+        (*it)->serializeToArray(array, verbosity);
     }
     return array;
 }

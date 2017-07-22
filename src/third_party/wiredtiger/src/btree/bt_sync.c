@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -78,6 +78,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 	uint64_t internal_bytes, internal_pages, leaf_bytes, leaf_pages;
 	uint64_t oldest_id, saved_pinned_id;
 	uint32_t flags;
+	bool timer;
 
 	conn = S2C(session);
 	btree = S2BT(session);
@@ -88,7 +89,8 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 
 	internal_bytes = leaf_bytes = 0;
 	internal_pages = leaf_pages = 0;
-	if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT))
+	timer = WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT);
+	if (timer)
 		__wt_epoch(session, &start);
 
 	switch (syncop) {
@@ -133,11 +135,11 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 			if (__wt_page_is_modified(page) &&
 			    WT_TXNID_LT(page->modify->update_txn, oldest_id)) {
 				if (txn->isolation == WT_ISO_READ_COMMITTED)
-					WT_ERR(__wt_txn_get_snapshot(session));
+					__wt_txn_get_snapshot(session);
 				leaf_bytes += page->memory_footprint;
 				++leaf_pages;
-				WT_ERR(__wt_reconcile(
-				    session, walk, NULL, WT_CHECKPOINTING));
+				WT_ERR(__wt_reconcile(session,
+				    walk, NULL, WT_CHECKPOINTING, NULL));
 			}
 		}
 		break;
@@ -155,7 +157,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 		 * the checkpoint are included.
 		 */
 		if (txn->isolation == WT_ISO_READ_COMMITTED)
-			WT_ERR(__wt_txn_get_snapshot(session));
+			__wt_txn_get_snapshot(session);
 
 		/*
 		 * We cannot check the tree modified flag in the case of a
@@ -177,22 +179,9 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 		 * Set the checkpointing flag to block such actions and wait for
 		 * any problematic eviction or page splits to complete.
 		 */
-		WT_PUBLISH(btree->checkpointing, WT_CKPT_PREPARE);
-
-		/*
-		 * Sync for checkpoint allows splits to happen while the queue
-		 * is being drained, but not reconciliation. We need to do this,
-		 * since draining the queue can take long enough for hot pages
-		 * to grow significantly larger than the configured maximum
-		 * size.
-		 */
-		F_SET(btree, WT_BTREE_NO_RECONCILE);
-		ret = __wt_evict_file_exclusive_on(session);
-		F_CLR(btree, WT_BTREE_NO_RECONCILE);
-		WT_ERR(ret);
-		__wt_evict_file_exclusive_off(session);
-
-		WT_PUBLISH(btree->checkpointing, WT_CKPT_RUNNING);
+		btree->checkpointing = WT_CKPT_PREPARE;
+		(void)__wt_gen_next_drain(session, WT_GEN_EVICT);
+		btree->checkpointing = WT_CKPT_RUNNING;
 
 		/* Write all dirty in-cache pages. */
 		flags |= WT_READ_NO_EVICT;
@@ -233,7 +222,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 				++leaf_pages;
 			}
 			WT_ERR(__wt_reconcile(
-			    session, walk, NULL, WT_CHECKPOINTING));
+			    session, walk, NULL, WT_CHECKPOINTING, NULL));
 		}
 		break;
 	case WT_SYNC_CLOSE:
@@ -242,7 +231,7 @@ __sync_file(WT_SESSION_IMPL *session, WT_CACHE_OP syncop)
 		break;
 	}
 
-	if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT)) {
+	if (timer) {
 		__wt_epoch(session, &end);
 		__wt_verbose(session, WT_VERB_CHECKPOINT,
 		    "__sync_file WT_SYNC_%s wrote: %" PRIu64
@@ -266,9 +255,8 @@ err:	/* On error, clear any left-over tree walk. */
 	    saved_pinned_id == WT_TXN_NONE)
 		__wt_txn_release_snapshot(session);
 
-	/* Clear the checkpoint flag and push the change. */
-	if (btree->checkpointing != WT_CKPT_OFF)
-		WT_PUBLISH(btree->checkpointing, WT_CKPT_OFF);
+	/* Clear the checkpoint flag. */
+	btree->checkpointing = WT_CKPT_OFF;
 
 	__wt_spin_unlock(session, &btree->flush_lock);
 

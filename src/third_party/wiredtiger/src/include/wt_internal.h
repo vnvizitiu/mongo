@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -106,10 +106,12 @@ struct __wt_col;
     typedef struct __wt_col WT_COL;
 struct __wt_col_rle;
     typedef struct __wt_col_rle WT_COL_RLE;
+struct __wt_col_var_repeat;
+    typedef struct __wt_col_var_repeat WT_COL_VAR_REPEAT;
 struct __wt_colgroup;
     typedef struct __wt_colgroup WT_COLGROUP;
-struct __wt_compact;
-    typedef struct __wt_compact WT_COMPACT;
+struct __wt_compact_state;
+    typedef struct __wt_compact_state WT_COMPACT_STATE;
 struct __wt_condvar;
     typedef struct __wt_condvar WT_CONDVAR;
 struct __wt_config;
@@ -248,8 +250,6 @@ struct __wt_ovfl_reuse;
     typedef struct __wt_ovfl_reuse WT_OVFL_REUSE;
 struct __wt_ovfl_track;
     typedef struct __wt_ovfl_track WT_OVFL_TRACK;
-struct __wt_ovfl_txnc;
-    typedef struct __wt_ovfl_txnc WT_OVFL_TXNC;
 struct __wt_page;
     typedef struct __wt_page WT_PAGE;
 struct __wt_page_deleted;
@@ -276,12 +276,14 @@ struct __wt_scratch_track;
     typedef struct __wt_scratch_track WT_SCRATCH_TRACK;
 struct __wt_session_impl;
     typedef struct __wt_session_impl WT_SESSION_IMPL;
+struct __wt_session_stash;
+    typedef struct __wt_session_stash WT_SESSION_STASH;
 struct __wt_size;
     typedef struct __wt_size WT_SIZE;
 struct __wt_spinlock;
     typedef struct __wt_spinlock WT_SPINLOCK;
-struct __wt_split_stash;
-    typedef struct __wt_split_stash WT_SPLIT_STASH;
+struct __wt_stash;
+    typedef struct __wt_stash WT_STASH;
 struct __wt_table;
     typedef struct __wt_table WT_TABLE;
 struct __wt_thread;

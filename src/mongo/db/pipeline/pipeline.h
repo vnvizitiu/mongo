@@ -36,35 +36,87 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 class BSONObj;
 class BSONObjBuilder;
-class CollatorInterface;
+class ExpressionContext;
 class DocumentSource;
+class CollatorInterface;
 class OperationContext;
-struct ExpressionContext;
 
 /**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
  * pipeline.
  */
-class Pipeline : public IntrusiveCounterUnsigned {
+class Pipeline {
 public:
     typedef std::list<boost::intrusive_ptr<DocumentSource>> SourceContainer;
 
     /**
-     * Parses a Pipeline from a BSONElement representing a list of DocumentSources. Returns a non-OK
-     * status if it failed to parse. The returned pipeline is not optimized, but the caller may
-     * convert it to an optimized pipeline by calling optimizePipeline().
+     * This class will ensure a Pipeline is disposed before it is deleted.
+     */
+    class Deleter {
+    public:
+        /**
+         * Constructs an empty deleter. Useful for creating a
+         * unique_ptr<Pipeline, Pipeline::Deleter> without populating it.
+         */
+        Deleter() {}
+
+        explicit Deleter(OperationContext* opCtx) : _opCtx(opCtx) {}
+
+        /**
+         * If an owner of a std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> wants to assume
+         * responsibility for calling PlanExecutor::dispose(), they can call dismissDisposal(). If
+         * dismissed, a Deleter will not call dispose() when deleting the PlanExecutor.
+         */
+        void dismissDisposal() {
+            _dismissed = true;
+        }
+
+        /**
+         * Calls dispose() on 'pipeline', unless this Deleter has been dismissed.
+         */
+        void operator()(Pipeline* pipeline) {
+            // It is illegal to call this method on a default-constructed Deleter.
+            invariant(_opCtx);
+            if (!_dismissed) {
+                pipeline->dispose(_opCtx);
+            }
+            delete pipeline;
+        }
+
+    private:
+        OperationContext* _opCtx = nullptr;
+
+        bool _dismissed = false;
+    };
+
+    /**
+     * Parses a Pipeline from a vector of BSONObjs. Returns a non-OK status if it failed to parse.
+     * The returned pipeline is not optimized, but the caller may convert it to an optimized
+     * pipeline by calling optimizePipeline().
      *
      * It is illegal to create a pipeline using an ExpressionContext which contains a collation that
      * will not be used during execution of the pipeline. Doing so may cause comparisons made during
      * parse-time to return the wrong results.
      */
-    static StatusWith<boost::intrusive_ptr<Pipeline>> parse(
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parse(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Parses a $facet Pipeline from a vector of BSONObjs. Validation checks which are only relevant
+     * to top-level pipelines are skipped, and additional checks applicable to $facet pipelines are
+     * performed. Returns a non-OK status if it failed to parse. The returned pipeline is not
+     * optimized, but the caller may convert it to an optimized pipeline by calling
+     * optimizePipeline().
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parseFacetPipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
@@ -74,7 +126,16 @@ public:
      * Returns a non-OK status if any stage is in an invalid position. For example, if an $out stage
      * is present but is not the last stage.
      */
-    static StatusWith<boost::intrusive_ptr<Pipeline>> create(
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> create(
+        SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Creates a $facet Pipeline from an existing SourceContainer.
+     *
+     * Returns a non-OK status if any stage is invalid. For example, if the pipeline is empty or if
+     * any stage is an initial source.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> createFacetPipeline(
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
@@ -103,15 +164,25 @@ public:
     void reattachToOperationContext(OperationContext* opCtx);
 
     /**
-      Split the current Pipeline into a Pipeline for each shard, and
-      a Pipeline that combines the results within mongos.
+     * Releases any resources held by this pipeline such as PlanExecutors or in-memory structures.
+     * Must be called before deleting a Pipeline.
+     *
+     * There are multiple cleanup scenarios:
+     *  - This Pipeline will only ever use one OperationContext. In this case the Pipeline::Deleter
+     *    will automatically call dispose() before deleting the Pipeline, and the owner need not
+     *    call dispose().
+     *  - This Pipeline may use multiple OperationContexts over its lifetime. In this case it
+     *    is the owner's responsibility to call dispose() with a valid OperationContext before
+     *    deleting the Pipeline.
+     */
+    void dispose(OperationContext* opCtx);
 
-      This permanently alters this pipeline for the merging operation.
-
-      @returns the Spec for the pipeline command that should be sent
-        to the shards
+    /**
+     * Split the current Pipeline into a Pipeline for each shard, and a Pipeline that combines the
+     * results within mongos. This permanently alters this pipeline for the merging operation, and
+     * returns a Pipeline object that should be executed on each targeted shard.
     */
-    boost::intrusive_ptr<Pipeline> splitForSharded();
+    std::unique_ptr<Pipeline, Pipeline::Deleter> splitForSharded();
 
     /** If the pipeline starts with a $match, return its BSON predicate.
      *  Returns empty BSON if the first stage isn't $match.
@@ -129,12 +200,6 @@ public:
     void optimizePipeline();
 
     /**
-     * Propagates a reference to the ExpressionContext to all of the pipeline's contained stages and
-     * expressions.
-     */
-    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
      * Returns any other collections involved in the pipeline in addition to the collection the
      * aggregation is run on.
      */
@@ -145,13 +210,6 @@ public:
      */
     std::vector<Value> serialize() const;
 
-    /**
-      Run the Pipeline on the given source.
-
-      @param result builder to write the result to
-    */
-    void run(BSONObjBuilder& result);
-
     /// The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
 
@@ -161,10 +219,10 @@ public:
     boost::optional<Document> getNext();
 
     /**
-     * Write the pipeline's operators to a std::vector<Value>, with the
-     * explain flag true (for DocumentSource::serializeToArray()).
+     * Write the pipeline's operators to a std::vector<Value>, providing the level of detail
+     * specified by 'verbosity'.
      */
-    std::vector<Value> writeExplainOps() const;
+    std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const;
 
     /**
      * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
@@ -176,14 +234,12 @@ public:
         return _sources;
     }
 
-    /*
-      PipelineD is a "sister" class that has additional functionality
-      for the Pipeline.  It exists because of linkage requirements.
-      Pipeline needs to function in mongod and mongos.  PipelineD
-      contains extra functionality required in mongod, and which can't
-      appear in mongos because the required symbols are unavailable
-      for linking there.  Consider PipelineD to be an extension of this
-      class for mongod only.
+    /**
+     * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists
+     * because of linkage requirements. Pipeline needs to function in mongod and mongos. PipelineD
+     * contains extra functionality required in mongod, and which can't appear in mongos because the
+     * required symbols are unavailable for linking there. Consider PipelineD to be an extension of
+     * this class for mongod only.
      */
     friend class PipelineD;
 
@@ -198,8 +254,28 @@ private:
 
     friend class Optimizations::Sharded;
 
+    /**
+     * Used by both Pipeline::parse() and Pipeline::parseFacetPipeline() to build and validate the
+     * pipeline.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parseTopLevelOrFacetPipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const bool isFacetPipeline);
+
+    /**
+     * Used by both Pipeline::create() and Pipeline::createFacetPipeline() to build and validate the
+     * pipeline.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> createTopLevelOrFacetPipeline(
+        SourceContainer sources,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const bool isSubPipeline);
+
     Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);
     Pipeline(SourceContainer stages, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+    ~Pipeline();
 
     /**
      * Stitch together the source pointers by calling setSource() for each source in '_sources'.
@@ -209,13 +285,35 @@ private:
     void stitch();
 
     /**
-     * Returns a non-OK status if any stage is in an invalid position. For example, if an $out stage
-     * is present but is not the last stage in the pipeline.
+     * Reset all stages' child pointers to nullptr. Used to prevent dangling pointers during the
+     * optimization process, where we might swap or destroy stages.
+     */
+    void unstitch();
+
+    /**
+     * Returns a non-OK status if the pipeline fails any of a set of semantic checks. For example,
+     * if an $out stage is present then it must come last in the pipeline, while initial stages such
+     * as $indexStats must be at the start.
+     */
+    Status validatePipeline() const;
+
+    /**
+     * Returns a non-OK status if the $facet pipeline fails any of a set of semantic checks. For
+     * example, the pipeline cannot be empty and may not contain any initial stages.
+     */
+    Status validateFacetPipeline() const;
+
+    /**
+     * Helper method which validates that each stage in pipeline is in a legal position. For
+     * example, $out must be at the end, while a $match stage with a text query must be at the
+     * start. Note that this method accepts an initial source as the first stage, which is illegal
+     * for $facet pipelines.
      */
     Status ensureAllStagesAreInLegalPositions() const;
 
     SourceContainer _sources;
 
     boost::intrusive_ptr<ExpressionContext> pCtx;
+    bool _disposed = false;
 };
 }  // namespace mongo

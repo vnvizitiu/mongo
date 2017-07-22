@@ -57,7 +57,6 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/rpc/request_builder_interface.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
@@ -66,9 +65,7 @@
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/asio_message_port.h"
 #include "mongo/util/net/message_port.h"
-#include "mongo/util/net/message_port_startup_param.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
@@ -170,32 +167,24 @@ const rpc::ReplyMetadataReader& DBClientWithCommands::getReplyMetadataReader() {
     return _metadataReader;
 }
 
-rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData database,
-                                                              StringData command,
-                                                              const BSONObj& metadata,
-                                                              const BSONObj& commandArgs) {
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Database name '" << database << "' is not valid.",
-            NamespaceString::validDBName(database, NamespaceString::DollarInDbNameBehavior::Allow));
+std::pair<rpc::UniqueReply, DBClientWithCommands*> DBClientWithCommands::runCommandWithTarget(
+    OpMsgRequest request) {
+    // Make sure to reconnect if needed before building our request, since the request depends on
+    // the negotiated protocol which can change due to a reconnect.
+    checkConnection();
 
     // call() oddly takes this by pointer, so we need to put it on the stack.
     auto host = getServerAddress();
 
-    BSONObjBuilder metadataBob;
-    metadataBob.appendElements(metadata);
-
+    auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
     if (_metadataWriter) {
-        uassertStatusOK(_metadataWriter(
-            (haveClient() ? cc().getOperationContext() : nullptr), &metadataBob, host));
+        BSONObjBuilder metadataBob(std::move(request.body));
+        uassertStatusOK(_metadataWriter(opCtx, &metadataBob));
+        request.body = metadataBob.obj();
     }
 
-    auto requestBuilder = rpc::makeRequestBuilder(getClientRPCProtocols(), getServerRPCProtocols());
-
-    requestBuilder->setDatabase(database);
-    requestBuilder->setCommandName(command);
-    requestBuilder->setCommandArgs(commandArgs);
-    requestBuilder->setMetadata(metadataBob.done());
-    auto requestMsg = requestBuilder->done();
+    auto requestMsg =
+        rpc::messageFromOpMsgRequest(getClientRPCProtocols(), getServerRPCProtocols(), request);
 
     Message replyMsg;
 
@@ -205,7 +194,7 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
     uassert(ErrorCodes::HostUnreachable,
             str::stream() << "network error while attempting to run "
                           << "command '"
-                          << command
+                          << request.getCommandName()
                           << "' "
                           << "on host '"
                           << host
@@ -221,7 +210,11 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
                           << " but reply was '"
                           << networkOpToString(replyMsg.operation())
                           << "' ",
-            requestBuilder->getProtocol() == commandReply->getProtocol());
+            rpc::protocolForMessage(requestMsg) == commandReply->getProtocol());
+
+    if (_metadataReader) {
+        uassertStatusOK(_metadataReader(opCtx, commandReply->getMetadata(), host));
+    }
 
     if (ErrorCodes::SendStaleConfig ==
         getStatusFromCommandResult(commandReply->getCommandReply())) {
@@ -229,48 +222,25 @@ rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData databas
                                        commandReply->getCommandReply());
     }
 
-    if (_metadataReader) {
-        uassertStatusOK(_metadataReader(commandReply->getMetadata(), host));
-    }
-
-    return rpc::UniqueReply(std::move(replyMsg), std::move(commandReply));
-}
-
-std::tuple<rpc::UniqueReply, DBClientWithCommands*>
-DBClientWithCommands::runCommandWithMetadataAndTarget(StringData database,
-                                                      StringData command,
-                                                      const BSONObj& metadata,
-                                                      const BSONObj& commandArgs) {
-    return std::make_tuple(runCommandWithMetadata(database, command, metadata, commandArgs), this);
+    return {rpc::UniqueReply(std::move(replyMsg), std::move(commandReply)), this};
 }
 
 std::tuple<bool, DBClientWithCommands*> DBClientWithCommands::runCommandWithTarget(
-    const string& dbname, const BSONObj& cmd, BSONObj& info, int options) {
-    BSONObj upconvertedCmd;
-    BSONObj upconvertedMetadata;
-
+    const string& dbname, BSONObj cmd, BSONObj& info, int options) {
     // TODO: This will be downconverted immediately if the underlying
     // requestBuilder is a legacyRequest builder. Not sure what the best
     // way to get around that is without breaking the abstraction.
-    std::tie(upconvertedCmd, upconvertedMetadata) =
-        uassertStatusOK(rpc::upconvertRequestMetadata(cmd, options));
+    auto result = runCommandWithTarget(rpc::upconvertRequest(dbname, std::move(cmd), options));
 
-    auto commandName = upconvertedCmd.firstElementFieldName();
-
-    auto resultTuple =
-        runCommandWithMetadataAndTarget(dbname, commandName, upconvertedMetadata, upconvertedCmd);
-    auto result = std::move(std::get<0>(resultTuple));
-
-    info = result->getCommandReply().getOwned();
-
-    return std::make_tuple(isOk(info), std::get<1>(resultTuple));
+    info = result.first->getCommandReply().getOwned();
+    return std::make_tuple(isOk(info), result.second);
 }
 
 bool DBClientWithCommands::runCommand(const string& dbname,
-                                      const BSONObj& cmd,
+                                      BSONObj cmd,
                                       BSONObj& info,
                                       int options) {
-    auto res = runCommandWithTarget(dbname, cmd, info, options);
+    auto res = runCommandWithTarget(dbname, std::move(cmd), info, options);
     return std::get<0>(res);
 }
 
@@ -447,17 +417,15 @@ void DBClientWithCommands::_auth(const BSONObj& params) {
 
     auth::authenticateClient(
         params,
-        HostAndPort(getServerAddress()).host(),
+        HostAndPort(getServerAddress()),
         clientName,
         [this](RemoteCommandRequest request, auth::AuthCompletionHandler handler) {
             BSONObj info;
             auto start = Date_t::now();
 
-            auto commandName = request.cmdObj.firstElementFieldName();
-
             try {
-                auto reply = runCommandWithMetadata(
-                    request.dbname, commandName, request.metadata, request.cmdObj);
+                auto reply = runCommand(
+                    OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj, request.metadata));
 
                 BSONObj data = reply->getCommandReply().getOwned();
                 BSONObj metadata = reply->getMetadata().getOwned();
@@ -474,7 +442,7 @@ void DBClientWithCommands::_auth(const BSONObj& params) {
 
 bool DBClientWithCommands::authenticateInternalUser() {
     if (!isInternalAuthSet()) {
-        if (!serverGlobalParams.quiet) {
+        if (!serverGlobalParams.quiet.load()) {
             log() << "ERROR: No authentication parameters set for internal user";
         }
         return false;
@@ -484,7 +452,7 @@ bool DBClientWithCommands::authenticateInternalUser() {
         auth(getInternalUserAuthParams());
         return true;
     } catch (const UserException& ex) {
-        if (!serverGlobalParams.quiet) {
+        if (!serverGlobalParams.quiet.load()) {
             log() << "can't authenticate to " << toString()
                   << " as internal user, error: " << ex.what();
         }
@@ -583,23 +551,6 @@ bool DBClientWithCommands::eval(const string& dbname, const string& jscode) {
     return eval(dbname, jscode, info, retValue);
 }
 
-list<string> DBClientWithCommands::getDatabaseNames() {
-    BSONObj info;
-    uassert(10005,
-            "listdatabases failed",
-            runCommand("admin", BSON("listDatabases" << 1), info, QueryOption_SlaveOk));
-    uassert(10006, "listDatabases.databases not array", info["databases"].type() == Array);
-
-    list<string> names;
-
-    BSONObjIterator i(info["databases"].embeddedObjectUserCheck());
-    while (i.more()) {
-        names.push_back(i.next().embeddedObjectUserCheck()["name"].valuestr());
-    }
-
-    return names;
-}
-
 list<BSONObj> DBClientWithCommands::getCollectionInfos(const string& db, const BSONObj& filter) {
     list<BSONObj> infos;
 
@@ -685,7 +636,7 @@ void DBClientInterface::findN(vector<BSONObj>& out,
     for (int i = 0; i < nToReturn; i++) {
         if (!c->more())
             break;
-        out.push_back(c->nextSafeOwned());
+        out.push_back(c->nextSafe());
     }
 }
 
@@ -757,8 +708,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
         }
 
         Date_t start{Date_t::now()};
-        auto result =
-            conn->runCommandWithMetadata("admin", "isMaster", rpc::makeEmptyMetadata(), bob.done());
+        auto result = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", bob.obj()));
         Date_t finish{Date_t::now()};
 
         BSONObj isMasterObj = result->getCommandReply().getOwned();
@@ -862,7 +812,9 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     _failed = true;
 
     // We need to construct a SockAddr so we can resolve the address.
-    SockAddr osAddr{serverAddress.host().c_str(), serverAddress.port()};
+    SockAddr osAddr{serverAddress.host().c_str(),
+                    serverAddress.port(),
+                    static_cast<sa_family_t>(IPv6Enabled() ? AF_UNSPEC : AF_INET)};
 
     if (!osAddr.isValid()) {
         return Status(ErrorCodes::InvalidOptions,
@@ -871,14 +823,7 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
                                     << ", address is invalid");
     }
 
-    if (isMessagePortImplASIO()) {
-        // `_so_timeout` is in seconds.
-        auto ms = representAs<int64_t>(std::floor(_so_timeout * 1000)).value_or(kMaxMillisCount);
-        _port.reset(new ASIOMessagingPort(
-            ms > kMaxMillisCount ? Milliseconds::max() : Milliseconds(ms), _logLevel));
-    } else {
-        _port.reset(new MessagingPort(_so_timeout, _logLevel));
-    }
+    _port.reset(new MessagingPort(_so_timeout, _logLevel));
 
     if (serverAddress.host().empty()) {
         return Status(ErrorCodes::InvalidOptions,
@@ -935,18 +880,18 @@ void DBClientConnection::logout(const string& dbname, BSONObj& info) {
     runCommand(dbname, BSON("logout" << 1), info);
 }
 
-bool DBClientConnection::runCommand(const string& dbname,
-                                    const BSONObj& cmd,
-                                    BSONObj& info,
-                                    int options) {
-    if (DBClientWithCommands::runCommand(dbname, cmd, info, options))
-        return true;
+std::pair<rpc::UniqueReply, DBClientWithCommands*> DBClientConnection::runCommandWithTarget(
+    OpMsgRequest request) {
 
+    auto out = DBClientWithCommands::runCommandWithTarget(std::move(request));
     if (!_parentReplSetName.empty()) {
-        handleNotMasterResponse(info["errmsg"]);
+        const auto replyBody = out.first->getCommandReply();
+        if (!isOk(replyBody)) {
+            handleNotMasterResponse(replyBody["errmsg"]);
+        }
     }
 
-    return false;
+    return out;
 }
 
 void DBClientConnection::_checkConnection() {
@@ -1410,7 +1355,10 @@ bool hasErrField(const BSONObj& o) {
     return !getErrField(o).eoo();
 }
 
-void DBClientConnection::checkResponse(const char* data, int nReturned, bool* retry, string* host) {
+void DBClientConnection::checkResponse(const std::vector<BSONObj>& batch,
+                                       bool networkError,
+                                       bool* retry,
+                                       string* host) {
     /* check for errors.  the only one we really care about at
      * this stage is "not master"
     */
@@ -1418,10 +1366,8 @@ void DBClientConnection::checkResponse(const char* data, int nReturned, bool* re
     *retry = false;
     *host = _serverAddress.toString();
 
-    if (!_parentReplSetName.empty() && nReturned) {
-        verify(data);
-        BSONObj bsonView(data);
-        handleNotMasterResponse(getErrField(bsonView));
+    if (!_parentReplSetName.empty() && !batch.empty()) {
+        handleNotMasterResponse(getErrField(batch[0]));
     }
 }
 

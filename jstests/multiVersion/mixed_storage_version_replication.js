@@ -245,30 +245,12 @@ var RandomOps = {
         if (coll === null) {
             return null;
         }
-        var newName = coll.getDB() + "." + new ObjectId().str;
+        var newName = coll.getDB().getName() + "." + new ObjectId().str;
         if (this.verbose) {
             print("renaming collection " + coll.getFullName() + " to " + newName);
         }
         assert.commandWorked(
             conn.getDB("admin").runCommand({renameCollection: coll.getFullName(), to: newName}));
-        if (this.verbose) {
-            print("done.");
-        }
-    },
-
-    /*
-     * Randomly drop a user created database.
-     */
-    dropDatabase: function(conn) {
-        var dbs = this.getCreatedDatabases(conn);
-        if (dbs.length === 0) {
-            return null;
-        }
-        var dbName = this.randomChoice(dbs);
-        if (this.verbose) {
-            print("Dropping database " + dbName);
-        }
-        assert.commandWorked(conn.getDB(dbName).runCommand({dropDatabase: 1}));
         if (this.verbose) {
             print("done.");
         }
@@ -285,7 +267,7 @@ var RandomOps = {
         if (this.verbose) {
             print("Dropping collection " + coll.getFullName());
         }
-        assert.commandWorked(conn.getDB(coll.getDB()).runCommand({drop: coll.getName()}));
+        assert.commandWorked(coll.runCommand({drop: coll.getName()}));
         if (this.verbose) {
             print("done.");
         }
@@ -344,7 +326,7 @@ var RandomOps = {
             print("Modifying usePowerOf2Sizes to " + toggle + " on collection " +
                   coll.getFullName());
         }
-        conn.getDB(coll.getDB()).runCommand({collMod: coll.getName(), usePowerOf2Sizes: toggle});
+        coll.runCommand({collMod: coll.getName(), usePowerOf2Sizes: toggle});
         if (this.verbose) {
             print("done.");
         }
@@ -364,7 +346,7 @@ var RandomOps = {
         if (this.verbose) {
             print("Emptying capped collection: " + coll.getFullName());
         }
-        assert.commandWorked(conn.getDB(coll.getDB()).runCommand({emptycapped: coll.getName()}));
+        assert.commandWorked(coll.runCommand({emptycapped: coll.getName()}));
         if (this.verbose) {
             print("done.");
         }
@@ -431,8 +413,7 @@ var RandomOps = {
         if (this.verbose) {
             print("Converting " + coll.getFullName() + " to a capped collection.");
         }
-        assert.commandWorked(conn.getDB(coll.getDB())
-                                 .runCommand({convertToCapped: coll.getName(), size: 1024 * 1024}));
+        assert.commandWorked(coll.runCommand({convertToCapped: coll.getName(), size: 1024 * 1024}));
         if (this.verbose) {
             print("done.");
         }
@@ -457,7 +438,12 @@ var RandomOps = {
     doRandomWork: function(conn, numOps, possibleOps) {
         for (var i = 0; i < numOps; i++) {
             op = this.randomChoice(possibleOps);
-            this[op](conn);
+            try {
+                this[op](conn);
+            } catch (ex) {
+                print('doRandomWork - ' + op + ': failed: ' + ex);
+                throw ex;
+            }
         }
     }
 
@@ -594,7 +580,6 @@ function startCmds(randomOps, host) {
         "remove",
         "update",
         "renameCollection",
-        "dropDatabase",
         "dropCollection",
         "createIndex",
         "dropIndex",
@@ -659,6 +644,7 @@ function doMultiThreadedWork(primary, numThreads) {
     // Create a replica set with 2 nodes of each of the types below, plus one arbiter.
     var oldVersion = "last-stable";
     var newVersion = "latest";
+
     var setups = [
         {binVersion: newVersion, storageEngine: 'mmapv1'},
         {binVersion: newVersion, storageEngine: 'mmapv1'},
@@ -670,25 +656,30 @@ function doMultiThreadedWork(primary, numThreads) {
     ];
     var replTest = new ReplSetTest({nodes: {n0: setups[0]}, name: name});
     replTest.startSet();
-    replTest.initiate();
+    var config = replTest.getReplSetConfig();
+    // Override the default value -1 in 3.5.
+    config.settings = {catchUpTimeoutMillis: 2000};
+    replTest.initiate(config);
 
-    // We set the featureCompatibilityVersion to 3.2 so that 3.2 secondaries can successfully
-    // initial sync from a 3.4 primary. We do this prior to adding any other members to the replica
+    // We set the featureCompatibilityVersion to 3.4 so that 3.4 secondaries can successfully
+    // initial sync from a 3.6 primary. We do this prior to adding any other members to the replica
     // set. This effectively allows us to emulate upgrading some of our nodes to the latest version
-    // while different 3.4 and 3.2 mongod processes are being elected primary.
+    // while different 3.6 and 3.4 mongod processes are being elected primary.
     assert.commandWorked(
-        replTest.getPrimary().adminCommand({setFeatureCompatibilityVersion: "3.2"}));
+        replTest.getPrimary().adminCommand({setFeatureCompatibilityVersion: "3.4"}));
 
     for (let i = 1; i < setups.length; ++i) {
         replTest.add(setups[i]);
     }
 
-    var config = replTest.getReplSetConfig();
+    var newConfig = replTest.getReplSetConfig();
+    config = replTest.getReplSetConfigFromNode();
     // Make sure everyone is syncing from the primary, to ensure we have all combinations of
     // primary/secondary syncing.
-    config.settings = {chainingAllowed: false};
+    config.members = newConfig.members;
+    config.settings.chainingAllowed = false;
     config.protocolVersion = 0;
-    config.version = 2;
+    config.version += 1;
     reconfig(replTest, config);
 
     // Ensure all are synced.

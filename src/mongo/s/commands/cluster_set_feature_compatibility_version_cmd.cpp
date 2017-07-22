@@ -40,7 +40,7 @@ namespace mongo {
 namespace {
 
 /**
- * Sets the minimum allowed version for the cluster. If it is 3.2, then shards should not use 3.4
+ * Sets the minimum allowed version for the cluster. If it is 3.4, then shards should not use 3.6
  * features.
  *
  * Format:
@@ -48,9 +48,9 @@ namespace {
  *   setFeatureCompatibilityVersion: <string version>
  * }
  */
-class SetFeatureCompatibilityVersionCmd : public Command {
+class SetFeatureCompatibilityVersionCmd : public BasicCommand {
 public:
-    SetFeatureCompatibilityVersionCmd() : Command("setFeatureCompatibilityVersion") {}
+    SetFeatureCompatibilityVersionCmd() : BasicCommand("setFeatureCompatibilityVersion") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -65,10 +65,10 @@ public:
     }
 
     virtual void help(std::stringstream& help) const {
-        help << "Set the API version for the cluster. If set to \"3.2\", then 3.4 features are "
-                "disabled. If \"3.4\", then 3.4 features are enabled, and all nodes in the cluster "
-                "must be version 3.4. See "
-                "http://dochub.mongodb.org/core/3.4-feature-compatibility.";
+        help << "Set the API version for the cluster. If set to \"3.4\", then 3.6 features are "
+                "disabled. If \"3.6\", then 3.6 features are enabled, and all nodes in the cluster "
+                "must be version 3.6. See "
+                "http://dochub.mongodb.org/core/3.6-feature-compatibility.";
     }
 
     Status checkAuthForCommand(Client* client,
@@ -83,19 +83,17 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         const auto version = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
 
         // Forward to config shard, which will forward to all shards.
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto response = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            txn,
+            opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             dbname,
             BSON("_configsvrSetFeatureCompatibilityVersion" << version),

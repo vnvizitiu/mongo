@@ -1,7 +1,7 @@
 var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
 
 (function() {
-    "use_strict";
+    "use strict";
 
     function makeDirectoryReadOnly(dir) {
         if (_isWindows()) {
@@ -58,7 +58,7 @@ var StandaloneFixture, ShardedFixture, runReadOnlyTest, zip2, cycleN;
         jsTest.log("sharding test collection...");
 
         // Use a hashed shard key so we actually hit multiple shards.
-        this.shardingTest.shardColl(test.name, {_id: "hashed"});
+        this.shardingTest.shardColl(test.name, {_id: "hashed"}, false);
 
         test.load(this.shardingTest.getDB("test")[test.name]);
     };

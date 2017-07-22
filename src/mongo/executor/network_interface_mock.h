@@ -121,10 +121,11 @@ public:
     /**
      * Not implemented.
      */
-    void cancelAllCommands() override {}
     virtual Status setAlarm(Date_t when, const stdx::function<void()>& action);
 
     virtual bool onNetworkThread();
+
+    void dropConnections(const HostAndPort&) override {}
 
 
     ////////////////////////////////////////////////////////////////////////////////
@@ -285,6 +286,11 @@ private:
      * Values are used in a bitmask, as well.
      */
     enum ThreadType { kNoThread = 0, kExecutorThread = 1, kNetworkThread = 2 };
+
+    /**
+     * Implementation of startup behavior.
+     */
+    void _startup_inlock();
 
     /**
      * Returns information about the state of this mock for diagnostic purposes.

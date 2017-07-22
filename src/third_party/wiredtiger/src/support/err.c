@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -102,9 +102,10 @@ __handler_failure(WT_SESSION_IMPL *session,
 	 */
 	char s[256];
 
-	(void)snprintf(s, sizeof(s),
+	if (__wt_snprintf(s, sizeof(s),
 	    "application %s event handler failed: %s",
-	    which, __wt_strerror(session, error, NULL, 0));
+	    which, __wt_strerror(session, error, NULL, 0)) != 0)
+		return;
 
 	/*
 	 * Use the error handler to report the failure, unless it was the error
@@ -143,10 +144,29 @@ __wt_event_handler_set(WT_SESSION_IMPL *session, WT_EVENT_HANDLER *handler)
 			handler->handle_message = __handle_message_default;
 		if (handler->handle_progress == NULL)
 			handler->handle_progress = __handle_progress_default;
+		if (handler->handle_close == NULL)
+			handler->handle_close = __handle_close_default;
 	}
 
 	session->event_handler = handler;
 }
+
+#define	WT_ERROR_APPEND(p, remain, ...) do {				\
+	size_t __len;							\
+	WT_ERR(__wt_snprintf_len_set(p, remain, &__len, __VA_ARGS__));	\
+	if (__len > remain)						\
+		__len = remain;						\
+	p += __len;							\
+	remain -= __len;						\
+} while (0)
+#define	WT_ERROR_APPEND_AP(p, remain, ...) do {				\
+	size_t __len;							\
+	WT_ERR(__wt_vsnprintf_len_set(p, remain, &__len, __VA_ARGS__));	\
+	if (__len > remain)						\
+		__len = remain;						\
+	p += __len;							\
+	remain -= __len;						\
+} while (0)
 
 /*
  * __wt_eventv --
@@ -161,9 +181,9 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	WT_DECL_RET;
 	WT_SESSION *wt_session;
 	struct timespec ts;
-	size_t len, remain, wlen;
+	size_t len, remain;
 	const char *err, *prefix;
-	char *end, *p, tid[128];
+	char *p, tid[128];
 
 	/*
 	 * We're using a stack buffer because we want error messages no matter
@@ -174,6 +194,8 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 * Buffer placed at the end of the stack in case snprintf overflows.
 	 */
 	char s[2048];
+	p = s;
+	remain = sizeof(s);
 
 	/*
 	 * !!!
@@ -185,24 +207,8 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 * first session, but if the allocation of the first session fails, for
 	 * example, we can end up here without a session.)
 	 */
-	if (session == NULL) {
-		if (fprintf(stderr,
-		    "WiredTiger Error%s%s: ",
-		    error == 0 ? "" : ": ",
-		    error == 0 ? "" :
-		    __wt_strerror(session, error, NULL, 0)) < 0)
-			ret = EIO;
-		if (vfprintf(stderr, fmt, ap) < 0)
-			ret = EIO;
-		if (fprintf(stderr, "\n") < 0)
-			ret = EIO;
-		if (fflush(stderr) != 0)
-			ret = EIO;
-		return (ret);
-	}
-
-	p = s;
-	end = s + sizeof(s);
+	if (session == NULL)
+		goto err;
 
 	/*
 	 * We have several prefixes for the error message: a timestamp and the
@@ -211,42 +217,24 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 * followed by a colon.
 	 */
 	__wt_epoch(session, &ts);
-	__wt_thread_id(tid, sizeof(tid));
-	remain = WT_PTRDIFF(end, p);
-	wlen = (size_t)snprintf(p, remain, "[%" PRIuMAX ":%" PRIuMAX "][%s]",
+	WT_ERR(__wt_thread_id(tid, sizeof(tid)));
+	WT_ERROR_APPEND(p, remain,
+	    "[%" PRIuMAX ":%" PRIuMAX "][%s]",
 	    (uintmax_t)ts.tv_sec, (uintmax_t)ts.tv_nsec / WT_THOUSAND, tid);
-	p = wlen >= remain ? end : p + wlen;
 
-	if ((prefix = S2C(session)->error_prefix) != NULL) {
-		remain = WT_PTRDIFF(end, p);
-		wlen = (size_t)snprintf(p, remain, ", %s", prefix);
-		p = wlen >= remain ? end : p + wlen;
-	}
+	if ((prefix = S2C(session)->error_prefix) != NULL)
+		WT_ERROR_APPEND(p, remain, ", %s", prefix);
 	prefix = session->dhandle == NULL ? NULL : session->dhandle->name;
-	if (prefix != NULL) {
-		remain = WT_PTRDIFF(end, p);
-		wlen = (size_t)snprintf(p, remain, ", %s", prefix);
-		p = wlen >= remain ? end : p + wlen;
-	}
-	if ((prefix = session->name) != NULL) {
-		remain = WT_PTRDIFF(end, p);
-		wlen = (size_t)snprintf(p, remain, ", %s", prefix);
-		p = wlen >= remain ? end : p + wlen;
-	}
-	remain = WT_PTRDIFF(end, p);
-	wlen = (size_t)snprintf(p, remain, ": ");
-	p = wlen >= remain ? end : p + wlen;
+	if (prefix != NULL)
+		WT_ERROR_APPEND(p, remain, ", %s", prefix);
+	if ((prefix = session->name) != NULL)
+		WT_ERROR_APPEND(p, remain, ", %s", prefix);
+	WT_ERROR_APPEND(p, remain, ": ");
 
-	if (file_name != NULL) {
-		remain = WT_PTRDIFF(end, p);
-		wlen = (size_t)
-		    snprintf(p, remain, "%s, %d: ", file_name, line_number);
-		p = wlen >= remain ? end : p + wlen;
-	}
+	if (file_name != NULL)
+		WT_ERROR_APPEND(p, remain, "%s, %d: ", file_name, line_number);
 
-	remain = WT_PTRDIFF(end, p);
-	wlen = (size_t)vsnprintf(p, remain, fmt, ap);
-	p = wlen >= remain ? end : p + wlen;
+	WT_ERROR_APPEND_AP(p, remain, fmt, ap);
 
 	if (error != 0) {
 		/*
@@ -261,10 +249,8 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 		 */
 		err = __wt_strerror(session, error, NULL, 0);
 		len = strlen(err);
-		if (WT_PTRDIFF(p, s) < len || strcmp(p - len, err) != 0) {
-			remain = WT_PTRDIFF(end, p);
-			(void)snprintf(p, remain, ": %s", err);
-		}
+		if (WT_PTRDIFF(p, s) < len || strcmp(p - len, err) != 0)
+			WT_ERROR_APPEND(p, remain, ": %s", err);
 	}
 
 	/*
@@ -279,7 +265,7 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 	 *
 	 * If an application-specified error message handler fails, complain
 	 * using the default error handler.  If the default error handler fails,
-	 * there's nothing to do.
+	 * fallback to stderr.
 	 */
 	wt_session = (WT_SESSION *)session;
 	handler = session->event_handler;
@@ -293,6 +279,21 @@ __wt_eventv(WT_SESSION_IMPL *session, bool msg_event, int error,
 			__handler_failure(session, ret, "error", true);
 	}
 
+	if (ret != 0) {
+err:		if (fprintf(stderr,
+		    "WiredTiger Error%s%s: ",
+		    error == 0 ? "" : ": ",
+		    error == 0 ? "" :
+		    __wt_strerror(session, error, NULL, 0)) < 0)
+			WT_TRET(EIO);
+		if (vfprintf(stderr, fmt, ap) < 0)
+			WT_TRET(EIO);
+		if (fprintf(stderr, "\n") < 0)
+			WT_TRET(EIO);
+		if (fflush(stderr) != 0)
+			WT_TRET(EIO);
+	}
+
 	return (ret);
 }
 
@@ -304,6 +305,7 @@ void
 __wt_err(WT_SESSION_IMPL *session, int error, const char *fmt, ...)
     WT_GCC_FUNC_ATTRIBUTE((cold))
     WT_GCC_FUNC_ATTRIBUTE((format (printf, 3, 4)))
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	va_list ap;
 
@@ -359,6 +361,22 @@ __wt_ext_err_printf(
 }
 
 /*
+ * __wt_verbose_worker --
+ * 	Verbose message.
+ */
+void
+__wt_verbose_worker(WT_SESSION_IMPL *session, const char *fmt, ...)
+    WT_GCC_FUNC_ATTRIBUTE((format (printf, 2, 3)))
+    WT_GCC_FUNC_ATTRIBUTE((cold))
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	WT_IGNORE_RET(__wt_eventv(session, true, 0, NULL, 0, fmt, ap));
+	va_end(ap);
+}
+
+/*
  * info_msg --
  * 	Informational message.
  */
@@ -375,7 +393,7 @@ info_msg(WT_SESSION_IMPL *session, const char *fmt, va_list ap)
 	 */
 	char s[2048];
 
-	(void)vsnprintf(s, sizeof(s), fmt, ap);
+	WT_RET(__wt_vsnprintf(s, sizeof(s), fmt, ap));
 
 	wt_session = (WT_SESSION *)session;
 	handler = session->event_handler;
@@ -470,6 +488,7 @@ __wt_assert(WT_SESSION_IMPL *session,
 #ifdef HAVE_DIAGNOSTIC
     WT_GCC_FUNC_ATTRIBUTE((noreturn))
 #endif
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	va_list ap;
 
@@ -491,6 +510,7 @@ __wt_assert(WT_SESSION_IMPL *session,
 int
 __wt_panic(WT_SESSION_IMPL *session)
     WT_GCC_FUNC_ATTRIBUTE((cold))
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	F_SET(S2C(session), WT_CONN_PANIC);
 	__wt_err(session, WT_PANIC, "the process must exit and restart");
@@ -498,8 +518,12 @@ __wt_panic(WT_SESSION_IMPL *session)
 #if defined(HAVE_DIAGNOSTIC)
 	__wt_abort(session);			/* Drop core if testing. */
 	/* NOTREACHED */
-#else
+#endif
+#if !defined(HAVE_DIAGNOSTIC) || defined(_WIN32)
 	/*
+	 * Confusing #ifdef structure because gcc knows we can't get here and
+	 * Visual Studio doesn't.
+	 *
 	 * Chaos reigns within.
 	 * Reflect, repent, and reboot.
 	 * Order shall return.
@@ -515,17 +539,29 @@ __wt_panic(WT_SESSION_IMPL *session)
 int
 __wt_illegal_value(WT_SESSION_IMPL *session, const char *name)
     WT_GCC_FUNC_ATTRIBUTE((cold))
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	__wt_errx(session, "%s%s%s",
 	    name == NULL ? "" : name, name == NULL ? "" : ": ",
 	    "encountered an illegal file format or internal value");
 
-#if defined(HAVE_DIAGNOSTIC)
-	__wt_abort(session);			/* Drop core if testing. */
-	/* NOTREACHED */
-#else
 	return (__wt_panic(session));
-#endif
+}
+
+/*
+ * __wt_inmem_unsupported_op --
+ *	Print a standard error message for an operation that's not supported
+ * for in-memory configurations.
+ */
+int
+__wt_inmem_unsupported_op(WT_SESSION_IMPL *session, const char *tag)
+    WT_GCC_FUNC_ATTRIBUTE((cold))
+{
+	if (F_ISSET(S2C(session), WT_CONN_IN_MEMORY))
+		WT_RET_MSG(session, ENOTSUP,
+		    "%s%snot supported for in-memory configurations",
+		    tag == NULL ? "" : tag, tag == NULL ? "" : ": ");
+	return (0);
 }
 
 /*

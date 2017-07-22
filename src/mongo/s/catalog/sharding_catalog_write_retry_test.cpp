@@ -37,11 +37,11 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/sharding_catalog_test_fixture.h"
@@ -52,7 +52,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
@@ -275,10 +274,9 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        BatchedInsertRequest actualBatchedInsert;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedInsert.parseBSON(request.dbname, request.cmdObj, &errmsg));
-        ASSERT_EQUALS(kTestNamespace.ns(), actualBatchedInsert.getNS().ns());
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto insertOp = InsertOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), insertOp.getNamespace().ns());
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -317,6 +315,151 @@ TEST_F(InsertRetryTest, DuplicateKeyErrorAfterWriteConcernFailureMatch) {
     future.timed_get(kFutureTimeout);
 }
 
+TEST_F(UpdateRetryTest, Success) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    BSONObj objToUpdate = BSON("_id" << 1 << "Value"
+                                     << "TestValue");
+    BSONObj updateExpr = BSON("$set" << BSON("Value"
+                                             << "NewTestValue"));
+
+    auto future = launchAsync([&] {
+        auto status =
+            catalogClient()->updateConfigDocument(operationContext(),
+                                                  kTestNamespace.ns(),
+                                                  objToUpdate,
+                                                  updateExpr,
+                                                  false,
+                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        ASSERT_OK(status);
+    });
+
+    onCommand([&](const RemoteCommandRequest& request) {
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+
+        BatchedCommandResponse response;
+        response.setOk(true);
+        response.setNModified(1);
+
+        return response.toBSON();
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(UpdateRetryTest, NotMasterErrorReturnedPersistently) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    BSONObj objToUpdate = BSON("_id" << 1 << "Value"
+                                     << "TestValue");
+    BSONObj updateExpr = BSON("$set" << BSON("Value"
+                                             << "NewTestValue"));
+
+    auto future = launchAsync([&] {
+        auto status =
+            catalogClient()->updateConfigDocument(operationContext(),
+                                                  kTestNamespace.ns(),
+                                                  objToUpdate,
+                                                  updateExpr,
+                                                  false,
+                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+    });
+
+    for (int i = 0; i < 3; ++i) {
+        onCommand([](const RemoteCommandRequest& request) {
+            BatchedCommandResponse response;
+            response.setOk(false);
+            response.setErrCode(ErrorCodes::NotMaster);
+            response.setErrMessage("not master");
+
+            return response.toBSON();
+        });
+    }
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(UpdateRetryTest, NotMasterReturnedFromTargeter) {
+    configTargeter()->setFindHostReturnValue(Status(ErrorCodes::NotMaster, "not master"));
+
+    BSONObj objToUpdate = BSON("_id" << 1 << "Value"
+                                     << "TestValue");
+    BSONObj updateExpr = BSON("$set" << BSON("Value"
+                                             << "NewTestValue"));
+
+    auto future = launchAsync([&] {
+        auto status =
+            catalogClient()->updateConfigDocument(operationContext(),
+                                                  kTestNamespace.ns(),
+                                                  objToUpdate,
+                                                  updateExpr,
+                                                  false,
+                                                  ShardingCatalogClient::kMajorityWriteConcern);
+        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
+TEST_F(UpdateRetryTest, NotMasterOnceSuccessAfterRetry) {
+    HostAndPort host1("TestHost1");
+    HostAndPort host2("TestHost2");
+    configTargeter()->setFindHostReturnValue(host1);
+
+    CollectionType collection;
+    collection.setNs(NamespaceString("db.coll"));
+    collection.setUpdatedAt(network()->now());
+    collection.setUnique(true);
+    collection.setEpoch(OID::gen());
+    collection.setKeyPattern(KeyPattern(BSON("_id" << 1)));
+
+    BSONObj objToUpdate = BSON("_id" << 1 << "Value"
+                                     << "TestValue");
+    BSONObj updateExpr = BSON("$set" << BSON("Value"
+                                             << "NewTestValue"));
+
+    auto future = launchAsync([&] {
+        ASSERT_OK(
+            catalogClient()->updateConfigDocument(operationContext(),
+                                                  kTestNamespace.ns(),
+                                                  objToUpdate,
+                                                  updateExpr,
+                                                  false,
+                                                  ShardingCatalogClient::kMajorityWriteConcern));
+    });
+
+    onCommand([&](const RemoteCommandRequest& request) {
+        ASSERT_EQUALS(host1, request.target);
+
+        BatchedCommandResponse response;
+        response.setOk(false);
+        response.setErrCode(ErrorCodes::NotMaster);
+        response.setErrMessage("not master");
+
+        // Ensure that when the catalog manager tries to retarget after getting the
+        // NotMaster response, it will get back a new target.
+        configTargeter()->setFindHostReturnValue(host2);
+        return response.toBSON();
+    });
+
+    onCommand([&](const RemoteCommandRequest& request) {
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
+
+        BatchedCommandResponse response;
+        response.setOk(true);
+        response.setNModified(1);
+
+        return response.toBSON();
+    });
+
+    future.timed_get(kFutureTimeout);
+}
+
 TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     configTargeter()->setFindHostReturnValue({kTestHosts[0]});
 
@@ -337,10 +480,9 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
-        ASSERT_EQUALS(kTestNamespace.ns(), actualBatchedUpdate.getNS().ns());
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
 
         BatchedCommandResponse response;
 
@@ -354,10 +496,9 @@ TEST_F(UpdateRetryTest, OperationInterruptedDueToPrimaryStepDown) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
-        ASSERT_EQUALS(kTestNamespace.ns(), actualBatchedUpdate.getNS().ns());
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -389,10 +530,9 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
-        ASSERT_EQUALS(kTestNamespace.ns(), actualBatchedUpdate.getNS().ns());
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
 
         BatchedCommandResponse response;
         response.setOk(true);
@@ -415,10 +555,9 @@ TEST_F(UpdateRetryTest, WriteConcernFailure) {
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
-        BatchedUpdateRequest actualBatchedUpdate;
-        std::string errmsg;
-        ASSERT_TRUE(actualBatchedUpdate.parseBSON(request.dbname, request.cmdObj, &errmsg));
-        ASSERT_EQUALS(kTestNamespace.ns(), actualBatchedUpdate.getNS().ns());
+        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto updateOp = UpdateOp::parse(opMsgRequest);
+        ASSERT_EQUALS(kTestNamespace.ns(), updateOp.getNamespace().ns());
 
         BatchedCommandResponse response;
         response.setOk(true);

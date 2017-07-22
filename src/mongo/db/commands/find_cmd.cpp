@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -49,10 +50,10 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -66,11 +67,11 @@ const char kTermField[] = "term";
 /**
  * A command for running .find() queries.
  */
-class FindCmd : public Command {
+class FindCmd : public BasicCommand {
     MONGO_DISALLOW_COPYING(FindCmd);
 
 public:
-    FindCmd() : Command("find") {}
+    FindCmd() : BasicCommand("find") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -93,7 +94,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -124,16 +125,15 @@ public:
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
                                const BSONObj& cmdObj) override {
-        NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbname, cmdObj));
         auto hasTerm = cmdObj.hasField(kTermField);
         return AuthorizationSession::get(client)->checkAuthForFind(nss, hasTerm);
     }
 
-    Status explain(OperationContext* txn,
+    Status explain(OperationContext* opCtx,
                    const std::string& dbname,
                    const BSONObj& cmdObj,
-                   ExplainCommon::Verbosity verbosity,
-                   const rpc::ServerSelectionMetadata&,
+                   ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         if (!nss.isValid()) {
@@ -148,19 +148,11 @@ public:
             return qrStatus.getStatus();
         }
 
-        if (!qrStatus.getValue()->getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
-        }
-
         // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
 
-        ExtensionsCallbackReal extensionsCallback(txn, &nss);
+        ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
         auto statusWithCQ =
-            CanonicalQuery::canonicalize(txn, std::move(qrStatus.getValue()), extensionsCallback);
+            CanonicalQuery::canonicalize(opCtx, std::move(qrStatus.getValue()), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -168,7 +160,7 @@ public:
 
         // Acquire locks. If the namespace is a view, we release our locks and convert the query
         // request into an aggregation command.
-        AutoGetCollectionOrViewForRead ctx(txn, nss);
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
         if (ctx.getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
             ctx.releaseLocksForView();
@@ -180,11 +172,17 @@ public:
             if (!viewAggregationCommand.isOK())
                 return viewAggregationCommand.getStatus();
 
-            Command* agg = Command::findCommand("aggregate");
-            std::string errmsg;
+            // Create the agg request equivalent of the find operation, with the explain verbosity
+            // included.
+            auto aggRequest = AggregationRequest::parseFromBSON(
+                nss, viewAggregationCommand.getValue(), verbosity);
+            if (!aggRequest.isOK()) {
+                return aggRequest.getStatus();
+            }
 
             try {
-                agg->run(txn, dbname, viewAggregationCommand.getValue(), 0, errmsg, *out);
+                return runAggregate(
+                    opCtx, nss, aggRequest.getValue(), viewAggregationCommand.getValue(), *out);
             } catch (DBException& error) {
                 if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
                     return {ErrorCodes::InvalidPipelineOperator,
@@ -192,7 +190,6 @@ public:
                 }
                 return error.toStatus();
             }
-            return Status::OK();
         }
 
         // The collection may be NULL. If so, getExecutor() should handle it by returning an
@@ -201,11 +198,11 @@ public:
 
         // We have a parsed query. Time to get the execution plan for it.
         auto statusWithPlanExecutor =
-            getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
+            getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         // Got the execution tree. Explain it.
         Explain::explainStages(exec.get(), collection, verbosity, out);
@@ -221,23 +218,16 @@ public:
      *   --Save state for getMore, transferring ownership of the executor to a ClientCursor.
      *   --Generate response to send to the client.
      */
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (!nss.isValid() || nss.isCommand() || nss.isSpecialCommand()) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::InvalidNamespace,
-                                        str::stream() << "Invalid collection name: " << nss.ns()});
-        }
+        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
 
         // Although it is a command, a find command gets counted as a query.
         globalOpCounters.gotQuery();
 
-        if (txn->getClient()->isInDirectClient()) {
+        if (opCtx->getClient()->isInDirectClient()) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation, "Cannot run find command from eval()"));
@@ -252,20 +242,10 @@ public:
 
         auto& qr = qrStatus.getValue();
 
-        if (!qr->getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::InvalidOptions,
-                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
-        }
-
         // Validate term before acquiring locks, if provided.
         if (auto term = qr->getReplicationTerm()) {
-            auto replCoord = repl::ReplicationCoordinator::get(txn);
-            Status status = replCoord->updateTerm(txn, *term);
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            Status status = replCoord->updateTerm(opCtx, *term);
             // Note: updateTerm returns ok if term stayed the same.
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
@@ -279,11 +259,11 @@ public:
         // find command parameters, so these fields are redundant.
         const int ntoreturn = -1;
         const int ntoskip = -1;
-        beginQueryOp(txn, nss, cmdObj, ntoreturn, ntoskip);
+        beginQueryOp(opCtx, nss, cmdObj, ntoreturn, ntoskip);
 
         // Finish the parsing step by using the QueryRequest to create a CanonicalQuery.
-        ExtensionsCallbackReal extensionsCallback(txn, &nss);
-        auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
+        ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+        auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
         if (!statusWithCQ.isOK()) {
             return appendCommandStatus(result, statusWithCQ.getStatus());
         }
@@ -291,7 +271,7 @@ public:
 
         // Acquire locks. If the query is on a view, we release our locks and convert the query
         // request into an aggregation command.
-        AutoGetCollectionOrViewForRead ctx(txn, nss);
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
         Collection* collection = ctx.getCollection();
         if (ctx.getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
@@ -304,33 +284,33 @@ public:
             if (!viewAggregationCommand.isOK())
                 return appendCommandStatus(result, viewAggregationCommand.getStatus());
 
-            Command* agg = Command::findCommand("aggregate");
-            try {
-                agg->run(txn, dbname, viewAggregationCommand.getValue(), options, errmsg, result);
-            } catch (DBException& error) {
-                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
-                    return appendCommandStatus(
-                        result,
-                        {ErrorCodes::InvalidPipelineOperator,
-                         str::stream() << "Unsupported in view pipeline: " << error.what()});
-                }
-                return appendCommandStatus(result, error.toStatus());
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx,
+                OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregationCommand.getValue())));
+            auto status = getStatusFromCommandResult(aggResult);
+            if (status.code() == ErrorCodes::InvalidPipelineOperator) {
+                return appendCommandStatus(
+                    result,
+                    {ErrorCodes::InvalidPipelineOperator,
+                     str::stream() << "Unsupported in view pipeline: " << status.reason()});
             }
-            return true;
+            result.resetToEmpty();
+            result.appendElements(aggResult);
+            return status.isOK();
         }
 
         // Get the execution plan for the query.
         auto statusWithPlanExecutor =
-            getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
+            getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
 
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         {
-            stdx::lock_guard<Client>(*txn->getClient());
-            CurOp::get(txn)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
         }
 
         if (!collection) {
@@ -338,7 +318,7 @@ public:
             // there is no ClientCursor id, and then return.
             const long long numResults = 0;
             const CursorId cursorId = 0;
-            endQueryOp(txn, collection, *exec, numResults, cursorId);
+            endQueryOp(opCtx, collection, *exec, numResults, cursorId);
             appendCursorResponseObject(cursorId, nss.ns(), BSONArray(), &result);
             return true;
         }
@@ -378,43 +358,42 @@ public:
 
         // Before saving the cursor, ensure that whatever plan we established happened with the
         // expected collection version
-        auto css = CollectionShardingState::get(txn, nss);
-        css->checkShardVersionOrThrow(txn);
+        auto css = CollectionShardingState::get(opCtx, nss);
+        css->checkShardVersionOrThrow(opCtx);
 
         // Set up the cursor for getMore.
         CursorId cursorId = 0;
-        if (shouldSaveCursor(txn, collection, state, exec.get())) {
-            // Register the execution plan inside a ClientCursor. Ownership of the PlanExecutor is
-            // transferred to the ClientCursor.
-            //
-            // First unregister the PlanExecutor so it can be re-registered with ClientCursor.
-            exec->deregisterExec();
-
-            // Create a ClientCursor containing this plan executor. We don't have to worry about
-            // leaking it as it's inserted into a global map by its ctor.
-            ClientCursor* cursor =
-                new ClientCursor(collection->getCursorManager(),
-                                 exec.release(),
-                                 nss.ns(),
-                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                                 originalQR.getOptions(),
-                                 cmdObj.getOwned());
-            cursorId = cursor->cursorid();
+        if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
+            // Create a ClientCursor containing this plan executor and register it with the cursor
+            // manager.
+            ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 nss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 cmdObj});
+            cursorId = pinnedCursor.getCursor()->cursorid();
 
             invariant(!exec);
-            PlanExecutor* cursorExec = cursor->getExecutor();
+            PlanExecutor* cursorExec = pinnedCursor.getCursor()->getExecutor();
 
             // State will be restored on getMore.
             cursorExec->saveState();
             cursorExec->detachFromOperationContext();
 
-            cursor->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
-            cursor->setPos(numResults);
+            // We assume that cursors created through a DBDirectClient are always used from their
+            // original OperationContext, so we do not need to move time to and from the cursor.
+            if (!opCtx->getClient()->isInDirectClient()) {
+                pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
+                    opCtx->getRemainingMaxTimeMicros());
+            }
+            pinnedCursor.getCursor()->setPos(numResults);
 
             // Fill out curop based on the results.
-            endQueryOp(txn, collection, *cursorExec, numResults, cursorId);
+            endQueryOp(opCtx, collection, *cursorExec, numResults, cursorId);
         } else {
-            endQueryOp(txn, collection, *exec, numResults, cursorId);
+            endQueryOp(opCtx, collection, *exec, numResults, cursorId);
         }
 
         // Generate the response object to send to the client.

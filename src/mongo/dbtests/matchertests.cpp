@@ -39,7 +39,6 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/matcher/matcher.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/timer.h"
@@ -231,15 +230,15 @@ template <typename M>
 class WhereSimple1 {
 public:
     void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
         const NamespaceString nss("unittests.matchertests");
-        AutoGetCollectionForRead ctx(&txn, nss);
+        AutoGetCollectionForReadCommand ctx(&opCtx, nss);
 
         const CollatorInterface* collator = nullptr;
         M m(BSON("$where"
                  << "function(){ return this.a == 1; }"),
-            ExtensionsCallbackReal(&txn, &nss),
+            ExtensionsCallbackReal(&opCtx, &nss),
             collator);
         ASSERT(m.matches(BSON("a" << 1)));
         ASSERT(!m.matches(BSON("a" << 2)));

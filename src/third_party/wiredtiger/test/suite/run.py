@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2016 MongoDB, Inc.
+# Public Domain 2014-2017 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -324,7 +324,8 @@ if __name__ == '__main__':
     # All global variables should be set before any test classes are loaded.
     # That way, verbose printing can be done at the class definition level.
     wttest.WiredTigerTestCase.globalSetup(preserve, timestamp, gdbSub,
-                                          verbose, dirarg, longtest)
+                                          verbose, wt_builddir, dirarg,
+                                          longtest)
 
     # Without any tests listed as arguments, do discovery
     if len(testargs) == 0:

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -40,6 +40,8 @@ __wt_btree_stat_init(WT_SESSION_IMPL *session, WT_CURSOR_STAT *cst)
 	WT_STAT_SET(session, stats, btree_maxleafpage, btree->maxleafpage);
 	WT_STAT_SET(session, stats, btree_maxleafvalue, btree->maxleafvalue);
 
+	WT_STAT_SET(session, stats, cache_bytes_dirty,
+	    __wt_btree_dirty_inuse(session));
 	WT_STAT_SET(session, stats, cache_bytes_inuse,
 	    __wt_btree_bytes_inuse(session));
 
@@ -104,8 +106,7 @@ __stat_page(WT_SESSION_IMPL *session, WT_PAGE *page, WT_DSRC_STATS **stats)
 	switch (page->type) {
 	case WT_PAGE_COL_FIX:
 		WT_STAT_INCR(session, stats, btree_column_fix);
-		WT_STAT_INCRV(
-		    session, stats, btree_entries, page->pg_fix_entries);
+		WT_STAT_INCRV(session, stats, btree_entries, page->entries);
 		break;
 	case WT_PAGE_COL_INT:
 		WT_STAT_INCR(session, stats, btree_column_internal);
@@ -177,7 +178,9 @@ __stat_page_col_var(
 		 */
 		WT_SKIP_FOREACH(ins, WT_COL_UPDATE(page, cip)) {
 			upd = ins->upd;
-			if (WT_UPDATE_DELETED_ISSET(upd)) {
+			if (upd->type == WT_UPDATE_RESERVED)
+				continue;
+			if (upd->type == WT_UPDATE_DELETED) {
 				if (!orig_deleted) {
 					++deleted_cnt;
 					--entry_cnt;
@@ -191,11 +194,14 @@ __stat_page_col_var(
 	}
 
 	/* Walk any append list. */
-	WT_SKIP_FOREACH(ins, WT_COL_APPEND(page))
-		if (WT_UPDATE_DELETED_ISSET(ins->upd))
+	WT_SKIP_FOREACH(ins, WT_COL_APPEND(page)) {
+		if (ins->upd->type == WT_UPDATE_RESERVED)
+			continue;
+		if (ins->upd->type == WT_UPDATE_DELETED)
 			++deleted_cnt;
 		else
 			++entry_cnt;
+	}
 
 	WT_STAT_INCRV(session, stats, btree_column_deleted, deleted_cnt);
 	WT_STAT_INCRV(session, stats, btree_column_rle, rle_cnt);
@@ -262,7 +268,8 @@ __stat_page_row_leaf(
 	 * key on the page.
 	 */
 	WT_SKIP_FOREACH(ins, WT_ROW_INSERT_SMALLEST(page))
-		if (!WT_UPDATE_DELETED_ISSET(ins->upd))
+		if (ins->upd->type != WT_UPDATE_DELETED &&
+		    ins->upd->type != WT_UPDATE_RESERVED)
 			++entry_cnt;
 
 	/*
@@ -271,16 +278,19 @@ __stat_page_row_leaf(
 	 */
 	WT_ROW_FOREACH(page, rip, i) {
 		upd = WT_ROW_UPDATE(page, rip);
-		if (upd == NULL || !WT_UPDATE_DELETED_ISSET(upd))
+		if (upd == NULL ||
+		    (upd->type != WT_UPDATE_DELETED &&
+		    upd->type != WT_UPDATE_RESERVED))
 			++entry_cnt;
 		if (upd == NULL && (cell =
 		    __wt_row_leaf_value_cell(page, rip, NULL)) != NULL &&
 		    __wt_cell_type(cell) == WT_CELL_VALUE_OVFL)
-				++ovfl_cnt;
+			++ovfl_cnt;
 
 		/* Walk K/V pairs inserted after the on-page K/V pair. */
 		WT_SKIP_FOREACH(ins, WT_ROW_INSERT(page, rip))
-			if (!WT_UPDATE_DELETED_ISSET(ins->upd))
+			if (ins->upd->type != WT_UPDATE_DELETED &&
+			    ins->upd->type != WT_UPDATE_RESERVED)
 				++entry_cnt;
 	}
 

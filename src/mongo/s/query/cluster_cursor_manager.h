@@ -154,13 +154,19 @@ public:
          *
          * Can block.
          */
-        StatusWith<ClusterQueryResult> next();
+        StatusWith<ClusterQueryResult> next(OperationContext* opCtx);
 
         /**
          * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
          * called after returnCursor() is called.  A cursor must be owned.
          */
         bool isTailable() const;
+
+        /**
+         * Returns the set of authenticated users when this cursor was created. Cannot be called
+         * after returnCursor() is called.  A cursor must be owned.
+         */
+        UserNameIterator getAuthenticatedUsers() const;
 
         /**
          * Transfers ownership of the underlying cursor back to the manager.  A cursor must be
@@ -201,14 +207,6 @@ public:
          * if the cursor is not tailable + awaitData).
          */
         Status setAwaitDataTimeout(Milliseconds awaitDataTimeout);
-
-
-        /**
-         * Update the operation context for remote requests.
-         *
-         * Network requests depend on having a valid operation context for user initiated actions.
-         */
-        void setOperationContext(OperationContext* txn);
 
     private:
         // ClusterCursorManager is a friend so that its methods can call the PinnedCursor
@@ -269,7 +267,8 @@ public:
      *
      * Does not block.
      */
-    StatusWith<CursorId> registerCursor(std::unique_ptr<ClusterClientCursor> cursor,
+    StatusWith<CursorId> registerCursor(OperationContext* opCtx,
+                                        std::unique_ptr<ClusterClientCursor> cursor,
                                         const NamespaceString& nss,
                                         CursorType cursorType,
                                         CursorLifetime cursorLifetime);
@@ -289,7 +288,7 @@ public:
      */
     StatusWith<PinnedCursor> checkOutCursor(const NamespaceString& nss,
                                             CursorId cursorId,
-                                            OperationContext* txn);
+                                            OperationContext* opCtx);
 
     /**
      * Informs the manager that the given cursor should be killed.  The cursor need not necessarily
@@ -337,6 +336,16 @@ public:
      * Does not block.
      */
     Stats stats() const;
+
+    /**
+     * Appends sessions that have open cursors in this cursor manager to the given set of lsids.
+     */
+    void appendActiveSessions(LogicalSessionIdSet* lsids) const;
+
+    /**
+     * Returns a list of all open cursors for the given session.
+     */
+    stdx::unordered_set<CursorId> getCursorsForSession(LogicalSessionId lsid) const;
 
     /**
      * Returns the namespace associated with the given cursor id, by examining the 'namespace
@@ -418,7 +427,8 @@ private:
             : _cursor(std::move(cursor)),
               _cursorType(cursorType),
               _cursorLifetime(cursorLifetime),
-              _lastActive(lastActive) {
+              _lastActive(lastActive),
+              _lsid(_cursor->getLsid()) {
             invariant(_cursor);
         }
 
@@ -447,6 +457,10 @@ private:
 
         bool isCursorOwned() const {
             return static_cast<bool>(_cursor);
+        }
+
+        boost::optional<LogicalSessionId> getLsid() const {
+            return _lsid;
         }
 
         /**
@@ -485,6 +499,7 @@ private:
         CursorType _cursorType = CursorType::NamespaceNotSharded;
         CursorLifetime _cursorLifetime = CursorLifetime::Mortal;
         Date_t _lastActive;
+        boost::optional<LogicalSessionId> _lsid;
     };
 
     /**

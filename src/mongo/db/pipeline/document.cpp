@@ -32,6 +32,7 @@
 
 #include <boost/functional/hash.hpp>
 
+#include "mongo/bson/bson_depth.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/util/mongoutils/str.h"
@@ -246,9 +247,15 @@ BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Document& d
     return builder.builder();
 }
 
-void Document::toBson(BSONObjBuilder* pBuilder) const {
+void Document::toBson(BSONObjBuilder* builder, size_t recursionLevel) const {
+    uassert(ErrorCodes::Overflow,
+            str::stream() << "cannot convert document to BSON because it exceeds the limit of "
+                          << BSONDepth::getMaxAllowableDepth()
+                          << " levels of nesting",
+            recursionLevel <= BSONDepth::getMaxAllowableDepth());
+
     for (DocumentStorageIterator it = storage().iterator(); !it.atEnd(); it.advance()) {
-        *pBuilder << it->nameSD() << it->val;
+        it->val.addToBsonObj(builder, it->nameSD(), recursionLevel);
     }
 }
 
@@ -335,7 +342,7 @@ static Value getNestedFieldHelper(const Document& doc,
                                   const FieldPath& fieldNames,
                                   vector<Position>* positions,
                                   size_t level) {
-    const string& fieldName = fieldNames.getFieldName(level);
+    const auto fieldName = fieldNames.getFieldName(level);
     const Position pos = doc.positionOf(fieldName);
 
     if (!pos.found())
@@ -354,10 +361,9 @@ static Value getNestedFieldHelper(const Document& doc,
     return getNestedFieldHelper(val.getDocument(), fieldNames, positions, level + 1);
 }
 
-const Value Document::getNestedField(const FieldPath& fieldNames,
-                                     vector<Position>* positions) const {
-    fassert(16489, fieldNames.getPathLength());
-    return getNestedFieldHelper(*this, fieldNames, positions, 0);
+const Value Document::getNestedField(const FieldPath& path, vector<Position>* positions) const {
+    fassert(16489, path.getPathLength());
+    return getNestedFieldHelper(*this, path, positions, 0);
 }
 
 size_t Document::getApproximateSize() const {
@@ -406,10 +412,12 @@ int Document::compare(const Document& rL,
 
         // For compatibility with BSONObj::woCompare() consider the canonical type of values
         // before considerting their names.
-        const int rCType = canonicalizeBSONType(rField.val.getType());
-        const int lCType = canonicalizeBSONType(lField.val.getType());
-        if (lCType != rCType)
-            return lCType < rCType ? -1 : 1;
+        if (lField.val.getType() != rField.val.getType()) {
+            const int rCType = canonicalizeBSONType(rField.val.getType());
+            const int lCType = canonicalizeBSONType(lField.val.getType());
+            if (lCType != rCType)
+                return lCType < rCType ? -1 : 1;
+        }
 
         const int nameCmp = lField.nameSD().compare(rField.nameSD());
         if (nameCmp)

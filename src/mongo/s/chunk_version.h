@@ -99,6 +99,15 @@ public:
     static StatusWith<ChunkVersion> parseFromBSONForChunk(const BSONObj& obj);
 
     /**
+     * Interprets the lastmod (combined major/minor) from a BSONObj without an epoch
+     *  { ..., <field>: [ <combined major/minor> ], ... }
+     * and then sets the returned ChunkVersion's epoch field to 'epoch'.
+     */
+    static StatusWith<ChunkVersion> parseFromBSONWithFieldAndSetEpoch(const BSONObj& obj,
+                                                                      StringData field,
+                                                                      const OID& epoch);
+
+    /**
      * Indicates a dropped collection. All components are zeroes (OID is zero time, zero
      * machineId/inc).
      */
@@ -291,7 +300,7 @@ public:
         if (prefixIn == "" && !obj["version"].eoo()) {
             prefix = (std::string) "version";
         }
-        // TODO: use ChunkType::DEPRECATED_lastmod()
+        // TODO: use ChunkType::lastmod()
         // NOTE: type_chunk.h includes this file
         else if (prefixIn == "" && !obj["lastmod"].eoo()) {
             prefix = (std::string) "lastmod";

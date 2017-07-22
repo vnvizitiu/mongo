@@ -32,7 +32,9 @@
 
 #include "mongo/db/query/find.h"
 
+#include "mongo/base/error_codes.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
@@ -55,6 +57,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
@@ -62,10 +65,10 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-using std::endl;
 using std::unique_ptr;
 using stdx::make_unique;
 
@@ -80,7 +83,7 @@ bool isCursorAwaitData(const ClientCursor* cursor) {
     return cursor->queryOptions() & QueryOption_AwaitData;
 }
 
-bool shouldSaveCursor(OperationContext* txn,
+bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec) {
@@ -100,7 +103,7 @@ bool shouldSaveCursor(OperationContext* txn,
     // an empty collection. Right now we do not keep a cursor if the collection
     // has zero records.
     if (qr.isTailable()) {
-        return collection && collection->numRecords(txn) != 0U;
+        return collection && collection->numRecords(opCtx) != 0U;
     }
 
     return !exec->isEOF();
@@ -120,25 +123,25 @@ bool shouldSaveCursorGetMore(PlanExecutor::ExecState finalState,
     return !exec->isEOF();
 }
 
-void beginQueryOp(OperationContext* txn,
+void beginQueryOp(OperationContext* opCtx,
                   const NamespaceString& nss,
                   const BSONObj& queryObj,
                   long long ntoreturn,
                   long long ntoskip) {
-    auto curOp = CurOp::get(txn);
+    auto curOp = CurOp::get(opCtx);
     curOp->debug().ntoreturn = ntoreturn;
     curOp->debug().ntoskip = ntoskip;
-    stdx::lock_guard<Client> lk(*txn->getClient());
-    curOp->setQuery_inlock(queryObj);
+    stdx::lock_guard<Client> lk(*opCtx->getClient());
+    curOp->setOpDescription_inlock(queryObj);
     curOp->setNS_inlock(nss.ns());
 }
 
-void endQueryOp(OperationContext* txn,
+void endQueryOp(OperationContext* opCtx,
                 Collection* collection,
                 const PlanExecutor& exec,
                 long long numResults,
                 CursorId cursorId) {
-    auto curOp = CurOp::get(txn);
+    auto curOp = CurOp::get(opCtx);
 
     // Fill out basic CurOp query exec properties.
     curOp->debug().nreturned = numResults;
@@ -151,7 +154,7 @@ void endQueryOp(OperationContext* txn,
     curOp->debug().setPlanSummaryMetrics(summaryStats);
 
     if (collection) {
-        collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+        collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
     }
 
     if (curOp->shouldDBProfile()) {
@@ -207,10 +210,14 @@ void generateBatch(int ntoreturn,
         }
     }
 
-    if (PlanExecutor::DEAD == *state || PlanExecutor::FAILURE == *state) {
-        // Propagate this error to caller.
+    // Propagate any errors to the caller.
+    if (PlanExecutor::FAILURE == *state) {
         error() << "getMore executor error, stats: " << redact(Explain::getWinningPlanStats(exec));
         uasserted(17406, "getMore executor error: " + WorkingSetCommon::toStatusString(obj));
+    } else if (PlanExecutor::DEAD == *state) {
+        uasserted(ErrorCodes::QueryPlanKilled,
+                  str::stream() << "PlanExecutor killed: "
+                                << WorkingSetCommon::toStatusString(obj));
     }
 }
 
@@ -219,7 +226,7 @@ void generateBatch(int ntoreturn,
 /**
  * Called by db/instance.cpp.  This is the getMore entry point.
  */
-Message getMore(OperationContext* txn,
+Message getMore(OperationContext* opCtx,
                 const char* ns,
                 int ntoreturn,
                 long long cursorid,
@@ -227,7 +234,8 @@ Message getMore(OperationContext* txn,
                 bool* isCursorAuthorized) {
     invariant(ntoreturn >= 0);
 
-    CurOp& curOp = *CurOp::get(txn);
+    CurOp& curOp = *CurOp::get(opCtx);
+    curOp.ensureStarted();
 
     // For testing, we may want to fail if we receive a getmore.
     if (MONGO_FAIL_POINT(failReceivedGetmore)) {
@@ -238,38 +246,60 @@ Message getMore(OperationContext* txn,
 
     const NamespaceString nss(ns);
 
-    // Depending on the type of cursor being operated on, we hold locks for the whole getMore,
-    // or none of the getMore, or part of the getMore.  The three cases in detail:
+    // Cursors come in one of two flavors:
+    // - Cursors owned by the collection cursor manager, such as those generated via the find
+    //   command. For these cursors, we hold the appropriate collection lock for the duration of the
+    //   getMore using AutoGetCollectionForRead.
+    // - Cursors owned by the global cursor manager, such as those generated via the aggregate
+    //   command. These cursors either hold no collection state or manage their collection state
+    //   internally, so we acquire no locks.
     //
-    // 1) Normal cursor: we lock with "ctx" and hold it for the whole getMore.
-    // 2) Cursor owned by global cursor manager: we don't lock anything.  These cursors don't own
-    //    any collection state. These cursors are generated either by the listCollections or
-    //    listIndexes commands, as these special cursor-generating commands operate over catalog
-    //    data rather than targeting the data within a collection.
-    // 3) Agg cursor: we lock with "ctx", then release, then relock with "unpinDBLock" and
-    //    "unpinCollLock".  This is because agg cursors handle locking internally (hence the
-    //    release), but the pin and unpin of the cursor must occur under the collection lock.
-    //    We don't use our AutoGetCollectionForRead "ctx" to relock, because
-    //    AutoGetCollectionForRead checks the sharding version (and we want the relock for the
-    //    unpin to succeed even if the sharding version has changed).
+    // While we only need to acquire locks in the case of a cursor which is *not* globally owned, we
+    // need to create an AutoStatsTracker in either case. This is responsible for updating
+    // statistics in CurOp and Top. We avoid using AutoGetCollectionForReadCommand because we may
+    // need to drop and reacquire locks when the cursor is awaitData, but we don't want to update
+    // the stats twice.
     //
-    // Note that we declare our locks before our ClientCursorPin, in order to ensure that the
-    // pin's destructor is called before the lock destructors (so that the unpin occurs under
-    // the lock).
-    unique_ptr<AutoGetCollectionForRead> ctx;
-    unique_ptr<Lock::DBLock> unpinDBLock;
-    unique_ptr<Lock::CollectionLock> unpinCollLock;
-
+    // Note that we acquire our locks before our ClientCursorPin, in order to ensure that the pin's
+    // destructor is called before the lock's destructor (if there is one) so that the cursor
+    // cleanup can occur under the lock.
+    boost::optional<AutoGetCollectionForRead> readLock;
+    boost::optional<AutoStatsTracker> statsTracker;
     CursorManager* cursorManager;
-    if (nss.isListIndexesCursorNS() || nss.isListCollectionsCursorNS()) {
-        // List collections and list indexes are special cursor-generating commands whose
-        // cursors are managed globally, as they operate over catalog data rather than targeting
-        // the data within a collection.
+
+    if (CursorManager::isGloballyManagedCursor(cursorid)) {
         cursorManager = CursorManager::getGlobalCursorManager();
+
+        if (boost::optional<NamespaceString> nssForCurOp = nss.isGloballyManagedNamespace()
+                ? nss.getTargetNSForGloballyManagedNamespace()
+                : nss) {
+            AutoGetDb autoDb(opCtx, nssForCurOp->db(), MODE_IS);
+            const auto profilingLevel = autoDb.getDb()
+                ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
+                : boost::none;
+            statsTracker.emplace(opCtx, *nssForCurOp, Top::LockType::NotLocked, profilingLevel);
+            auto view = autoDb.getDb()
+                ? autoDb.getDb()->getViewCatalog()->lookup(opCtx, nssForCurOp->ns())
+                : nullptr;
+            uassert(
+                ErrorCodes::CommandNotSupportedOnView,
+                str::stream() << "Namespace " << nssForCurOp->ns()
+                              << " is a view. OP_GET_MORE operations are not supported on views. "
+                              << "Only clients which support the getMore command can be used to "
+                                 "query views.",
+                !view);
+        }
     } else {
-        ctx = stdx::make_unique<AutoGetCollectionForRead>(txn, nss);
-        Collection* collection = ctx->getCollection();
-        uassert(17356, "collection dropped between getMore calls", collection);
+        readLock.emplace(opCtx, nss);
+        const int doNotChangeProfilingLevel = 0;
+        statsTracker.emplace(opCtx,
+                             nss,
+                             Top::LockType::ReadLocked,
+                             readLock->getDb() ? readLock->getDb()->getProfilingLevel()
+                                               : doNotChangeProfilingLevel);
+        Collection* collection = readLock->getCollection();
+        uassert(
+            ErrorCodes::OperationFailed, "collection dropped between getMore calls", collection);
         cursorManager = collection->getCursorManager();
     }
 
@@ -279,14 +309,15 @@ Message getMore(OperationContext* txn,
     // passing in a query object (necessary to check SlaveOK query option), the only state where
     // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
     // reads are not okay.
-    Status status = repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(txn, nss, true);
+    Status status =
+        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, true);
     uassertStatusOK(status);
 
     // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
     // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
     // CC, so don't delete it.
-    ClientCursorPin ccPin(cursorManager, cursorid);
-    ClientCursor* cc = ccPin.c();
+    auto ccPin = cursorManager->pinCursor(opCtx, cursorid);
+
     // These are set in the QueryResult msg we return.
     int resultFlags = ResultFlag_AwaitCapable;
 
@@ -299,42 +330,56 @@ Message getMore(OperationContext* txn,
     BufBuilder bb(InitialBufSize);
     bb.skip(sizeof(QueryResult::Value));
 
-    if (NULL == cc) {
-        cursorid = 0;
-        resultFlags = ResultFlag_CursorNotFound;
+    if (!ccPin.isOK()) {
+        if (ccPin == ErrorCodes::CursorNotFound) {
+            cursorid = 0;
+            resultFlags = ResultFlag_CursorNotFound;
+        } else {
+            invariant(ccPin == ErrorCodes::QueryPlanKilled);
+            uassertStatusOK(ccPin.getStatus());
+        }
     } else {
+        ClientCursor* cc = ccPin.getValue().getCursor();
+
         // Check for spoofing of the ns such that it does not match the one originally
         // there for the cursor.
         uassert(ErrorCodes::Unauthorized,
                 str::stream() << "Requested getMore on namespace " << ns << ", but cursor "
                               << cursorid
                               << " belongs to namespace "
-                              << cc->ns(),
-                ns == cc->ns());
+                              << cc->nss().ns(),
+                nss == cc->nss());
+
+        // A user can only call getMore on their own cursor. If there were multiple users
+        // authenticated when the cursor was created, then at least one of them must be
+        // authenticated in order to run getMore on the cursor.
+        uassert(ErrorCodes::Unauthorized,
+                str::stream() << "cursor id " << cursorid
+                              << " was not created by the authenticated user",
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isCoauthorizedWith(cc->getAuthenticatedUsers()));
+
         *isCursorAuthorized = true;
 
         if (cc->isReadCommitted())
-            uassertStatusOK(txn->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+            uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
 
-        // Reset timeout timer on the cursor since the cursor is still in use.
-        cc->setIdleTime(0);
+        uassert(40548,
+                "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
+                "which support the getMore command can be used on tailable aggregations.",
+                readLock || !isCursorAwaitData(cc));
 
         // If the operation that spawned this cursor had a time limit set, apply leftover
         // time to this getmore.
         if (cc->getLeftoverMaxTimeMicros() < Microseconds::max()) {
             uassert(40136,
                     "Illegal attempt to set operation deadline within DBDirectClient",
-                    !txn->getClient()->isInDirectClient());
-            txn->setDeadlineAfterNowBy(cc->getLeftoverMaxTimeMicros());
+                    !opCtx->getClient()->isInDirectClient());
+            opCtx->setDeadlineAfterNowBy(cc->getLeftoverMaxTimeMicros());
         }
-        txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+        opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
-        cc->updateSlaveLocation(txn);
-
-        if (cc->isAggCursor()) {
-            // Agg cursors handle their own locking internally.
-            ctx.reset();  // unlocks
-        }
+        cc->updateSlaveLocation(opCtx);
 
         // If we're replaying the oplog, we save the last time that we read.
         Timestamp slaveReadTill;
@@ -345,12 +390,12 @@ Message getMore(OperationContext* txn,
         uint64_t notifierVersion = 0;
         std::shared_ptr<CappedInsertNotifier> notifier;
         if (isCursorAwaitData(cc)) {
-            invariant(ctx->getCollection()->isCapped());
+            invariant(readLock->getCollection()->isCapped());
             // Retrieve the notifier which we will wait on until new data arrives. We make sure
             // to do this in the lock because once we drop the lock it is possible for the
             // collection to become invalid. The notifier itself will outlive the collection if
             // the collection is dropped, as we keep a shared_ptr to it.
-            notifier = ctx->getCollection()->getCappedInsertNotifier();
+            notifier = readLock->getCollection()->getCappedInsertNotifier();
 
             // Must get the version before we call generateBatch in case a write comes in after
             // that call and before we call wait on the notifier.
@@ -358,17 +403,19 @@ Message getMore(OperationContext* txn,
         }
 
         PlanExecutor* exec = cc->getExecutor();
-        exec->reattachToOperationContext(txn);
+        exec->reattachToOperationContext(opCtx);
         exec->restoreState();
 
         auto planSummary = Explain::getPlanSummary(exec);
         {
-            stdx::lock_guard<Client>(*txn->getClient());
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp.setPlanSummary_inlock(planSummary);
 
-            // Ensure that the original query or command object is available in the slow query log,
-            // profiler and currentOp.
-            curOp.setQuery_inlock(cc->getQuery());
+            // Ensure that the original query object is available in the slow query log, profiler
+            // and currentOp. Upconvert _query to resemble a getMore command, and set the original
+            // command or upconverted legacy query in the originatingCommand field.
+            curOp.setOpDescription_inlock(upconvertGetMoreEntry(nss, cursorid, ntoreturn));
+            curOp.setOriginatingCommand_inlock(cc->getOriginatingCommandObj());
         }
 
         PlanExecutor::ExecState state;
@@ -386,19 +433,18 @@ Message getMore(OperationContext* txn,
         if (isCursorAwaitData(cc) && state == PlanExecutor::IS_EOF && numResults == 0) {
             // Save the PlanExecutor and drop our locks.
             exec->saveState();
-            ctx.reset();
+            readLock.reset();
 
-            // Block waiting for data for up to 1 second.
+            // Block waiting for data for up to 1 second. Time spent blocking is not counted towards
+            // the total operation latency.
+            curOp.pauseTimer();
             Seconds timeout(1);
             notifier->wait(notifierVersion, timeout);
             notifier.reset();
-
-            // Set expected latency to match wait time. This makes sure the logs aren't spammed
-            // by awaitData queries that exceed slowms due to blocking on the CappedInsertNotifier.
-            curOp.setExpectedLatencyMs(durationCount<Milliseconds>(timeout));
+            curOp.resumeTimer();
 
             // Reacquiring locks.
-            ctx = make_unique<AutoGetCollectionForRead>(txn, nss);
+            readLock.emplace(opCtx, nss);
             exec->restoreState();
 
             // We woke up because either the timed_wait expired, or there was more data. Either
@@ -412,43 +458,28 @@ Message getMore(OperationContext* txn,
         postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
         curOp.debug().setPlanSummaryMetrics(postExecutionStats);
 
-        // We do not report 'execStats' for aggregation, both in the original request and
-        // subsequent getMore. The reason for this is that aggregation's source PlanExecutor
-        // could be destroyed before we know whether we need execStats and we do not want to
-        // generate for all operations due to cost.
-        if (!cc->isAggCursor() && curOp.shouldDBProfile()) {
+        // We do not report 'execStats' for aggregation or other globally managed cursors, both in
+        // the original request and subsequent getMore. It would be useful to have this information
+        // for an aggregation, but the source PlanExecutor could be destroyed before we know whether
+        // we need execStats and we do not want to generate for all operations due to cost.
+        if (!CursorManager::isGloballyManagedCursor(cursorid) && curOp.shouldDBProfile()) {
             BSONObjBuilder execStatsBob;
             Explain::getWinningPlanStats(exec, &execStatsBob);
             curOp.debug().execStats = execStatsBob.obj();
         }
 
-        // We have to do this before re-acquiring locks in the agg case because
-        // shouldSaveCursorGetMore() can make a network call for agg cursors.
-        //
-        // TODO: Getting rid of PlanExecutor::isEOF() in favor of PlanExecutor::IS_EOF would mean
-        // that this network operation is no longer necessary.
-        const bool shouldSaveCursor = shouldSaveCursorGetMore(state, exec, isCursorTailable(cc));
-
-        // In order to deregister a cursor, we need to be holding the DB + collection lock and
-        // if the cursor is aggregation, we release these locks.
-        if (cc->isAggCursor()) {
-            invariant(NULL == ctx.get());
-            unpinDBLock = make_unique<Lock::DBLock>(txn->lockState(), nss.db(), MODE_IS);
-            unpinCollLock = make_unique<Lock::CollectionLock>(txn->lockState(), nss.ns(), MODE_IS);
-        }
-
         // Our two possible ClientCursorPin cleanup paths are:
         // 1) If the cursor is not going to be saved, we call deleteUnderlying() on the pin.
-        // 2) If the cursor is going to be saved, we simply let the pin go out of scope.  In
-        //    this case, the pin's destructor will be invoked, which will call release() on the
-        //    pin.  Because our ClientCursorPin is declared after our lock is declared, this
-        //    will happen under the lock.
-        if (!shouldSaveCursor) {
-            ccPin.deleteUnderlying();
+        // 2) If the cursor is going to be saved, we simply let the pin go out of scope. In this
+        //    case, the pin's destructor will be invoked, which will call release() on the pin.
+        //    Because our ClientCursorPin is declared after our lock is declared, this will happen
+        //    under the lock if any locking was necessary.
+        if (!shouldSaveCursorGetMore(state, exec, isCursorTailable(cc))) {
+            ccPin.getValue().deleteUnderlying();
 
             // cc is now invalid, as is the executor
             cursorid = 0;
-            cc = NULL;
+            cc = nullptr;
             curOp.debug().cursorExhausted = true;
 
             LOG(5) << "getMore NOT saving client cursor, ended with state "
@@ -468,9 +499,13 @@ Message getMore(OperationContext* txn,
 
             *exhaust = cc->queryOptions() & QueryOption_Exhaust;
 
-            // If the getmore had a time limit, remaining time is "rolled over" back to the
-            // cursor (for use by future getmore ops).
-            cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
+            // We assume that cursors created through a DBDirectClient are always used from their
+            // original OperationContext, so we do not need to move time to and from the cursor.
+            if (!opCtx->getClient()->isInDirectClient()) {
+                // If the getmore had a time limit, remaining time is "rolled over" back to the
+                // cursor (for use by future getmore ops).
+                cc->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+            }
         }
     }
 
@@ -485,11 +520,12 @@ Message getMore(OperationContext* txn,
     return Message(bb.release());
 }
 
-std::string runQuery(OperationContext* txn,
+std::string runQuery(OperationContext* opCtx,
                      QueryMessage& q,
                      const NamespaceString& nss,
                      Message& result) {
-    CurOp& curOp = *CurOp::get(txn);
+    CurOp& curOp = *CurOp::get(opCtx);
+    curOp.ensureStarted();
 
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid ns [" << nss.ns() << "]",
@@ -497,11 +533,11 @@ std::string runQuery(OperationContext* txn,
     invariant(!nss.isCommand());
 
     // Set CurOp information.
-    beginQueryOp(txn, nss, q.query, q.ntoreturn, q.ntoskip);
+    beginQueryOp(opCtx, nss, q.query, q.ntoreturn, q.ntoskip);
 
     // Parse the qm into a CanonicalQuery.
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, q, ExtensionsCallbackReal(txn, &nss));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, q, ExtensionsCallbackReal(opCtx, &nss));
     if (!statusWithCQ.isOK()) {
         uasserted(17287,
                   str::stream() << "Can't canonicalize query: "
@@ -514,12 +550,21 @@ std::string runQuery(OperationContext* txn,
     LOG(2) << "Running query: " << redact(cq->toStringShort());
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
-    AutoGetCollectionForRead ctx(txn, nss);
+    AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
     Collection* collection = ctx.getCollection();
 
+    if (ctx.getView()) {
+        uasserted(ErrorCodes::CommandNotSupportedOnView,
+                  str::stream()
+                      << "Namespace "
+                      << nss.ns()
+                      << " is a view. Legacy find operations are not supported on views. "
+                      << "Only clients which support the find command can be used to query views.");
+    }
+
     // We have a parsed query. Time to get the execution plan for it.
-    std::unique_ptr<PlanExecutor> exec = uassertStatusOK(
-        getExecutorFind(txn, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO));
+    auto exec = uassertStatusOK(
+        getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO));
 
     const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
 
@@ -530,7 +575,8 @@ std::string runQuery(OperationContext* txn,
         bb.skip(sizeof(QueryResult::Value));
 
         BSONObjBuilder explainBob;
-        Explain::explainStages(exec.get(), collection, ExplainCommon::EXEC_ALL_PLANS, &explainBob);
+        Explain::explainStages(
+            exec.get(), collection, ExplainOptions::Verbosity::kExecAllPlans, &explainBob);
 
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
@@ -553,15 +599,15 @@ std::string runQuery(OperationContext* txn,
     if (qr.getMaxTimeMS() > 0) {
         uassert(40116,
                 "Illegal attempt to set operation deadline within DBDirectClient",
-                !txn->getClient()->isInDirectClient());
-        txn->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
+                !opCtx->getClient()->isInDirectClient());
+        opCtx->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
     }
-    txn->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+    opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
     // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
     bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
     Status serveReadsStatus =
-        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(txn, nss, slaveOK);
+        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, slaveOK);
     uassertStatusOK(serveReadsStatus);
 
     // Run the query.
@@ -582,7 +628,7 @@ std::string runQuery(OperationContext* txn,
 
     // Get summary info about which plan the executor is using.
     {
-        stdx::lock_guard<Client> lk(*txn->getClient());
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
         curOp.setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
     }
 
@@ -615,14 +661,6 @@ std::string runQuery(OperationContext* txn,
         }
     }
 
-    // If we cache the executor later, we want to deregister it as it receives notifications
-    // anyway by virtue of being cached.
-    //
-    // If we don't cache the executor later, we are deleting it, so it must be deregistered.
-    //
-    // So, no matter what, deregister the executor.
-    exec->deregisterExec();
-
     // Caller expects exceptions thrown in certain cases.
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
@@ -632,35 +670,34 @@ std::string runQuery(OperationContext* txn,
 
     // Before saving the cursor, ensure that whatever plan we established happened with the expected
     // collection version
-    auto css = CollectionShardingState::get(txn, nss);
-    css->checkShardVersionOrThrow(txn);
+    auto css = CollectionShardingState::get(opCtx, nss);
+    css->checkShardVersionOrThrow(opCtx);
 
     // Fill out CurOp based on query results. If we have a cursorid, we will fill out CurOp with
     // this cursorid later.
     long long ccId = 0;
 
-    if (shouldSaveCursor(txn, collection, state, exec.get())) {
+    if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
         // We won't use the executor until it's getMore'd.
         exec->saveState();
         exec->detachFromOperationContext();
 
-        // Allocate a new ClientCursor.  We don't have to worry about leaking it as it's
-        // inserted into a global map by its ctor.
-        ClientCursor* cc =
-            new ClientCursor(collection->getCursorManager(),
-                             exec.release(),
-                             nss.ns(),
-                             txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
-                             qr.getOptions(),
-                             qr.getFilter());
-        ccId = cc->cursorid();
+        // Allocate a new ClientCursor and register it with the cursor manager.
+        ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
+            opCtx,
+            {std::move(exec),
+             nss,
+             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+             upconvertQueryEntry(q.query, qr.nss(), q.ntoreturn, q.ntoskip)});
+        ccId = pinnedCursor.getCursor()->cursorid();
 
         LOG(5) << "caching executor with cursorid " << ccId << " after returning " << numResults
                << " results";
 
         // TODO document
         if (qr.isOplogReplay() && !slaveReadTill.isNull()) {
-            cc->slaveReadTill(slaveReadTill);
+            pinnedCursor.getCursor()->slaveReadTill(slaveReadTill);
         }
 
         // TODO document
@@ -668,16 +705,20 @@ std::string runQuery(OperationContext* txn,
             curOp.debug().exhaust = true;
         }
 
-        cc->setPos(numResults);
+        pinnedCursor.getCursor()->setPos(numResults);
 
-        // If the query had a time limit, remaining time is "rolled over" to the cursor (for
-        // use by future getmore ops).
-        cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
+        // We assume that cursors created through a DBDirectClient are always used from their
+        // original OperationContext, so we do not need to move time to and from the cursor.
+        if (!opCtx->getClient()->isInDirectClient()) {
+            // If the query had a time limit, remaining time is "rolled over" to the cursor (for
+            // use by future getmore ops).
+            pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+        }
 
-        endQueryOp(txn, collection, *cc->getExecutor(), numResults, ccId);
+        endQueryOp(opCtx, collection, *pinnedCursor.getCursor()->getExecutor(), numResults, ccId);
     } else {
         LOG(5) << "Not caching executor but returning " << numResults << " results.";
-        endQueryOp(txn, collection, *exec, numResults, ccId);
+        endQueryOp(opCtx, collection, *exec, numResults, ccId);
     }
 
     // Fill out the output buffer's header.

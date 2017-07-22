@@ -68,9 +68,9 @@ std::unique_ptr<DBClientBase>& CopyDbAuthConnection::forClient(Client* client) {
  * nonce from the source of a "copydb" operation for authentication purposes.  See the
  * description of the "copydb" command below.
  */
-class CmdCopyDbGetNonce : public Command {
+class CmdCopyDbGetNonce : public ErrmsgCommandDeprecated {
 public:
-    CmdCopyDbGetNonce() : Command("copydbgetnonce") {}
+    CmdCopyDbGetNonce() : ErrmsgCommandDeprecated("copydbgetnonce") {}
 
     virtual bool adminOnly() const {
         return true;
@@ -96,12 +96,11 @@ public:
         help << "usage: {copydbgetnonce: 1, fromhost: <hostname>}";
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string&,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string&,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         string fromhost = cmdObj.getStringField("fromhost");
         if (fromhost.empty()) {
             /* copy from self */
@@ -112,7 +111,7 @@ public:
 
         const ConnectionString cs(uassertStatusOK(ConnectionString::parse(fromhost)));
 
-        auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
+        auto& authConn = CopyDbAuthConnection::forClient(opCtx->getClient());
         authConn.reset(cs.connect(StringData(), errmsg));
         if (!authConn) {
             return false;
@@ -126,7 +125,7 @@ public:
             return false;
         }
 
-        result.appendElements(ret);
+        filterCommandReplyForPassthrough(ret, &result);
         return true;
     }
 
@@ -141,9 +140,9 @@ public:
  * Run against the mongod that is the intended target for the "copydb" command.  Used to
  * initialize a SASL auth session for a "copydb" operation for authentication purposes.
  */
-class CmdCopyDbSaslStart : public Command {
+class CmdCopyDbSaslStart : public ErrmsgCommandDeprecated {
 public:
-    CmdCopyDbSaslStart() : Command("copydbsaslstart") {}
+    CmdCopyDbSaslStart() : ErrmsgCommandDeprecated("copydbsaslstart") {}
 
     virtual bool adminOnly() const {
         return true;
@@ -170,13 +169,20 @@ public:
                 "from secure server\n";
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string&,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
-        const string fromDb = cmdObj.getStringField("fromdb");
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string&,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
+        const auto fromdbElt = cmdObj["fromdb"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'renameCollection' must be of type String",
+                fromdbElt.type() == BSONType::String);
+        const string fromDb = fromdbElt.str();
+        uassert(
+            ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid 'fromdb' name: " << fromDb,
+            NamespaceString::validDBName(fromDb, NamespaceString::DollarInDbNameBehavior::Allow));
 
         string fromHost = cmdObj.getStringField("fromhost");
         if (fromHost.empty()) {
@@ -201,7 +207,7 @@ public:
             return false;
         }
 
-        auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
+        auto& authConn = CopyDbAuthConnection::forClient(opCtx->getClient());
         authConn.reset(cs.connect(StringData(), errmsg));
         if (!authConn.get()) {
             return false;
@@ -214,7 +220,7 @@ public:
             return appendCommandStatus(result, getStatusFromCommandResult(ret));
         }
 
-        result.appendElements(ret);
+        filterCommandReplyForPassthrough(ret, &result);
         return true;
     }
 

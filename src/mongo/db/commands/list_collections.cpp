@@ -34,15 +34,16 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
@@ -111,7 +112,7 @@ boost::optional<vector<StringData>> _getExactNameMatches(const MatchExpression* 
  *
  * Does not add any information about the system.namespaces collection, or non-existent collections.
  */
-void _addWorkingSetMember(OperationContext* txn,
+void _addWorkingSetMember(OperationContext* opCtx,
                           const BSONObj& maybe,
                           const MatchExpression* matcher,
                           WorkingSet* ws,
@@ -147,14 +148,24 @@ BSONObj buildViewBson(const ViewDefinition& view) {
     return b.obj();
 }
 
-BSONObj buildCollectionBson(OperationContext* txn, const Collection* collection) {
+BSONObj buildCollectionBson(OperationContext* opCtx,
+                            const Collection* collection,
+                            bool includePendingDrops) {
 
     if (!collection) {
         return {};
     }
 
-    StringData collectionName = collection->ns().coll();
+    auto nss = collection->ns();
+    auto collectionName = nss.coll();
     if (collectionName == "system.namespaces") {
+        return {};
+    }
+
+    // Drop-pending collections are replicated collections that have been marked for deletion.
+    // These collections are considered dropped and should not be returned in the results for this
+    // command, unless specified explicitly by the 'includePendingDrops' command argument.
+    if (nss.isDropPendingNamespace() && !includePendingDrops) {
         return {};
     }
 
@@ -162,13 +173,21 @@ BSONObj buildCollectionBson(OperationContext* txn, const Collection* collection)
     b.append("name", collectionName);
     b.append("type", "collection");
 
-    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(txn);
+    CollectionOptions options = collection->getCatalogEntry()->getCollectionOptions(opCtx);
+
+    // While the UUID is stored as a collection option, from the user's perspective it is an
+    // unsettable read-only property, so put it in the 'info' section.
+    auto uuid = options.uuid;
+    options.uuid.reset();
     b.append("options", options.toBSON());
 
-    BSONObj info = BSON("readOnly" << storageGlobalParams.readOnly);
-    b.append("info", info);
+    BSONObjBuilder infoBuilder;
+    infoBuilder.append("readOnly", storageGlobalParams.readOnly);
+    if (uuid)
+        infoBuilder.appendElements(uuid->toBSON());
+    b.append("info", infoBuilder.obj());
 
-    auto idIndex = collection->getIndexCatalog()->findIdIndex(txn);
+    auto idIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
     if (idIndex) {
         b.append("idIndex", idIndex->infoObj());
     }
@@ -176,7 +195,7 @@ BSONObj buildCollectionBson(OperationContext* txn, const Collection* collection)
     return b.obj();
 }
 
-class CmdListCollections : public Command {
+class CmdListCollections : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -200,13 +219,7 @@ public:
                                        const BSONObj& cmdObj) {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
-        // Check for the listCollections ActionType on the database
-        // or find on system.namespaces for pre 3.0 systems.
-        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(dbname),
-                                                           ActionType::listCollections) ||
-            authzSession->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(dbname, "system.namespaces")),
-                ActionType::find)) {
+        if (authzSession->isAuthorizedToListCollections(dbname)) {
             return Status::OK();
         }
 
@@ -214,15 +227,15 @@ public:
                       str::stream() << "Not authorized to list collections on db: " << dbname);
     }
 
-    CmdListCollections() : Command("listCollections") {}
+    CmdListCollections() : BasicCommand("listCollections") {}
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& jsobj,
-             int,
-             string& errmsg,
+             const BSONObj& jsobj,
              BSONObjBuilder& result) {
         unique_ptr<MatchExpression> matcher;
+
+        // Check for 'filter' argument.
         BSONElement filterElt = jsobj["filter"];
         if (!filterElt.eoo()) {
             if (filterElt.type() != mongo::Object) {
@@ -247,29 +260,38 @@ public:
             return appendCommandStatus(result, parseCursorStatus);
         }
 
-        ScopedTransaction scopedXact(txn, MODE_IS);
-        AutoGetDb autoDb(txn, dbname, MODE_S);
+        // Check for 'includePendingDrops' flag. The default is to not include drop-pending
+        // collections.
+        bool includePendingDrops;
+        Status status = bsonExtractBooleanFieldWithDefault(
+            jsobj, "includePendingDrops", false, &includePendingDrops);
+
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
+        }
+
+        AutoGetDb autoDb(opCtx, dbname, MODE_S);
 
         Database* db = autoDb.getDb();
 
         auto ws = make_unique<WorkingSet>();
-        auto root = make_unique<QueuedDataStage>(txn, ws.get());
+        auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
 
         if (db) {
             if (auto collNames = _getExactNameMatches(matcher.get())) {
                 for (auto&& collName : *collNames) {
                     auto nss = NamespaceString(db->name(), collName);
-                    Collection* collection = db->getCollection(nss);
-                    BSONObj collBson = buildCollectionBson(txn, collection);
+                    Collection* collection = db->getCollection(opCtx, nss);
+                    BSONObj collBson = buildCollectionBson(opCtx, collection, includePendingDrops);
                     if (!collBson.isEmpty()) {
-                        _addWorkingSetMember(txn, collBson, matcher.get(), ws.get(), root.get());
+                        _addWorkingSetMember(opCtx, collBson, matcher.get(), ws.get(), root.get());
                     }
                 }
             } else {
                 for (auto&& collection : *db) {
-                    BSONObj collBson = buildCollectionBson(txn, collection);
+                    BSONObj collBson = buildCollectionBson(opCtx, collection, includePendingDrops);
                     if (!collBson.isEmpty()) {
-                        _addWorkingSetMember(txn, collBson, matcher.get(), ws.get(), root.get());
+                        _addWorkingSetMember(opCtx, collBson, matcher.get(), ws.get(), root.get());
                     }
                 }
             }
@@ -279,10 +301,10 @@ public:
                 SimpleBSONObjComparator::kInstance.evaluate(
                     filterElt.Obj() == ListCollectionsFilter::makeTypeCollectionFilter());
             if (!skipViews) {
-                db->getViewCatalog()->iterate(txn, [&](const ViewDefinition& view) {
+                db->getViewCatalog()->iterate(opCtx, [&](const ViewDefinition& view) {
                     BSONObj viewBson = buildViewBson(view);
                     if (!viewBson.isEmpty()) {
-                        _addWorkingSetMember(txn, viewBson, matcher.get(), ws.get(), root.get());
+                        _addWorkingSetMember(opCtx, viewBson, matcher.get(), ws.get(), root.get());
                     }
                 });
             }
@@ -291,11 +313,11 @@ public:
         const NamespaceString cursorNss = NamespaceString::makeListCollectionsNSS(dbname);
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            txn, std::move(ws), std::move(root), cursorNss.ns(), PlanExecutor::YIELD_MANUAL);
+            opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
-        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
@@ -320,12 +342,14 @@ public:
         if (!exec->isEOF()) {
             exec->saveState();
             exec->detachFromOperationContext();
-            ClientCursor* cursor =
-                new ClientCursor(CursorManager::getGlobalCursorManager(),
-                                 exec.release(),
-                                 cursorNss.ns(),
-                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
-            cursorId = cursor->cursorid();
+            auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 cursorNss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 jsobj});
+            cursorId = pinnedCursor.getCursor()->cursorid();
         }
 
         appendCursorResponseObject(cursorId, cursorNss.ns(), firstBatch.arr(), &result);

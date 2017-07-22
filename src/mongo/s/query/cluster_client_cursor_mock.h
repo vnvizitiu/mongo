@@ -30,6 +30,9 @@
 
 #include <queue>
 
+#include <boost/optional.hpp>
+
+#include "mongo/db/logical_session_id.h"
 #include "mongo/s/query/cluster_client_cursor.h"
 #include "mongo/stdx/functional.h"
 
@@ -39,15 +42,18 @@ class ClusterClientCursorMock final : public ClusterClientCursor {
     MONGO_DISALLOW_COPYING(ClusterClientCursorMock);
 
 public:
-    ClusterClientCursorMock(stdx::function<void(void)> killCallback = stdx::function<void(void)>());
+    ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
+                            stdx::function<void(void)> killCallback = stdx::function<void(void)>());
 
     ~ClusterClientCursorMock();
 
-    StatusWith<ClusterQueryResult> next() final;
+    StatusWith<ClusterQueryResult> next(OperationContext* opCtx) final;
 
-    void kill() final;
+    void kill(OperationContext* opCtx) final;
 
     bool isTailable() const final;
+
+    UserNameIterator getAuthenticatedUsers() const final;
 
     long long getNumReturnedSoFar() const final;
 
@@ -55,7 +61,7 @@ public:
 
     Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) final;
 
-    void setOperationContext(OperationContext* txn) final;
+    boost::optional<LogicalSessionId> getLsid() const final;
 
     /**
      * Returns true unless marked as having non-exhausted remote cursors via
@@ -80,6 +86,8 @@ private:
     long long _numReturnedSoFar = 0;
 
     bool _remotesExhausted = true;
+
+    boost::optional<LogicalSessionId> _lsid;
 };
 
 }  // namespace mongo

@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/db/client.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/service_context_noop.h"
 
 namespace mongo {
@@ -43,6 +44,14 @@ public:
     QueryTestServiceContext();
 
     ServiceContext::UniqueOperationContext makeOperationContext();
+
+    ServiceContext::UniqueOperationContext makeOperationContext(LogicalSessionId lsid);
+
+    Client* getClient() const;
+
+    ServiceContext* getServiceContext() {
+        return &_serviceContext;
+    }
 
 private:
     ServiceContextNoop _serviceContext;

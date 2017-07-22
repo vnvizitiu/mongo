@@ -30,19 +30,16 @@
 
 #include <deque>
 
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 
 namespace mongo {
 
-class PlanExecutor;
-
 /**
- * Constructs and returns Documents from the BSONObj objects produced by a supplied
- * PlanExecutor.
- *
- * An object of this type may only be used by one thread, see SERVER-6123.
+ * Constructs and returns Documents from the BSONObj objects produced by a supplied PlanExecutor.
  */
 class DocumentSourceCursor final : public DocumentSource {
 public:
@@ -52,30 +49,22 @@ public:
     BSONObjSet getOutputSorts() final {
         return _outputSorts;
     }
-    /**
-     * Attempts to combine with any subsequent $limit stages by setting the internal '_limit' field.
-     */
-    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
-    Value serialize(bool explain = false) const final;
-    bool isValidInitialSource() const final {
-        return true;
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    InitialSourceType getInitialSourceType() const final {
+        return InitialSourceType::kInitialSource;
     }
-    void dispose() final;
 
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
 
     /**
-     * Create a document source based on a passed-in PlanExecutor.
-     *
-     * This is usually put at the beginning of a chain of document sources
-     * in order to fetch data from the database.
+     * Create a document source based on a passed-in PlanExecutor. 'exec' must be a yielding
+     * PlanExecutor, and must be registered with the associated collection's CursorManager.
      */
     static boost::intrusive_ptr<DocumentSourceCursor> create(
-        const std::string& ns,
-        std::unique_ptr<PlanExecutor> exec,
+        Collection* collection,
+        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
     /*
@@ -114,10 +103,17 @@ public:
      * @param projection The projection that has been passed down to the query system.
      * @param deps The output of DepsTracker::toParsedDeps.
      */
-    void setProjection(const BSONObj& projection, const boost::optional<ParsedDeps>& deps);
+    void setProjection(const BSONObj& projection, const boost::optional<ParsedDeps>& deps) {
+        _projection = projection;
+        _dependencies = deps;
+    }
 
-    /// returns -1 for no limit
-    long long getLimit() const;
+    /**
+     * Returns the limit associated with this cursor, or -1 if there is no limit.
+     */
+    long long getLimit() const {
+        return _limit ? _limit->getLimit() : -1;
+    }
 
     /**
      * If subsequent sources need no information from the cursor, the cursor can simply output empty
@@ -127,21 +123,42 @@ public:
         _shouldProduceEmptyDocs = true;
     }
 
-    const std::string& getPlanSummaryStr() const;
+    const std::string& getPlanSummaryStr() const {
+        return _planSummary;
+    }
 
-    const PlanSummaryStats& getPlanSummaryStats() const;
+    const PlanSummaryStats& getPlanSummaryStats() const {
+        return _planSummaryStats;
+    }
 
 protected:
-    void doInjectExpressionContext() final;
+    /**
+     * Disposes of '_exec' and '_rangePreserver' if they haven't been disposed already. This
+     * involves taking a collection lock.
+     */
+    void doDispose() final;
+
+    /**
+     * Attempts to combine with any subsequent $limit stages by setting the internal '_limit' field.
+     */
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
 
 private:
-    DocumentSourceCursor(const std::string& ns,
-                         std::unique_ptr<PlanExecutor> exec,
+    DocumentSourceCursor(Collection* collection,
+                         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
                          const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+    ~DocumentSourceCursor();
 
+    /**
+     * Acquires locks to properly destroy and de-register '_exec'. '_exec' must be non-null.
+     */
+    void cleanupExecutor();
+
+    /**
+     * Reads a batch of data from '_exec'.
+     */
     void loadBatch();
-
-    void recordPlanSummaryStr();
 
     void recordPlanSummaryStats();
 
@@ -156,8 +173,10 @@ private:
     boost::intrusive_ptr<DocumentSourceLimit> _limit;
     long long _docsAddedToBatches;  // for _limit enforcement
 
-    const std::string _ns;
-    std::unique_ptr<PlanExecutor> _exec;
+    // The underlying query plan which feeds this pipeline. Must be destroyed while holding the
+    // collection lock.
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> _exec;
+
     BSONObjSet _outputSorts;
     std::string _planSummary;
     PlanSummaryStats _planSummaryStats;

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -297,7 +297,7 @@ __wt_meta_ckptlist_get(
 	*ckptbasep = ckptbase;
 
 	if (0) {
-err:		__wt_meta_ckptlist_free(session, ckptbase);
+err:		__wt_meta_ckptlist_free(session, &ckptbase);
 	}
 	__wt_free(session, config);
 	__wt_scr_free(session, &buf);
@@ -429,7 +429,7 @@ __wt_meta_ckptlist_set(WT_SESSION_IMPL *session,
 		}
 		if (strcmp(ckpt->name, WT_CHECKPOINT) == 0)
 			WT_ERR(__wt_buf_catfmt(session, buf,
-			    "%s%s.%" PRId64 "=(addr=\"%.*s\",order=%" PRIu64
+			    "%s%s.%" PRId64 "=(addr=\"%.*s\",order=%" PRId64
 			    ",time=%" PRIuMAX ",size=%" PRIu64
 			    ",write_gen=%" PRIu64 ")",
 			    sep, ckpt->name, ckpt->order,
@@ -438,7 +438,7 @@ __wt_meta_ckptlist_set(WT_SESSION_IMPL *session,
 			    ckpt->write_gen));
 		else
 			WT_ERR(__wt_buf_catfmt(session, buf,
-			    "%s%s=(addr=\"%.*s\",order=%" PRIu64
+			    "%s%s=(addr=\"%.*s\",order=%" PRId64
 			    ",time=%" PRIuMAX ",size=%" PRIu64
 			    ",write_gen=%" PRIu64 ")",
 			    sep, ckpt->name,
@@ -463,16 +463,16 @@ err:	__wt_scr_free(session, &buf);
  *	Discard the checkpoint array.
  */
 void
-__wt_meta_ckptlist_free(WT_SESSION_IMPL *session, WT_CKPT *ckptbase)
+__wt_meta_ckptlist_free(WT_SESSION_IMPL *session, WT_CKPT **ckptbasep)
 {
-	WT_CKPT *ckpt;
+	WT_CKPT *ckpt, *ckptbase;
 
-	if (ckptbase == NULL)
+	if ((ckptbase = *ckptbasep) == NULL)
 		return;
 
 	WT_CKPT_FOREACH(ckptbase, ckpt)
 		__wt_meta_checkpoint_free(session, ckpt);
-	__wt_free(session, ckptbase);
+	__wt_free(session, *ckptbasep);
 }
 
 /*

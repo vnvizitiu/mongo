@@ -79,8 +79,6 @@ else:
 # We pre-generate configs for platforms and just check them in.  Running
 # mozilla's config requires a relatively huge portion of their tree.
 env.Prepend(CPPPATH=[
-    '#src',
-    '$BUILD_DIR',
     'extract/js/src',
     'extract/mfbt',
     'extract/intl/icu/source/common',
@@ -93,6 +91,7 @@ env.Prepend(CPPPATH=[
 sources = [
     "extract/js/src/builtin/RegExp.cpp",
     "extract/js/src/frontend/Parser.cpp",
+    "extract/js/src/jit/ProcessExecutableMemory.cpp",
     "extract/js/src/jsarray.cpp",
     "extract/js/src/jsatom.cpp",
     "extract/js/src/jsmath.cpp",
@@ -114,13 +113,6 @@ if env.TargetOSIs('windows'):
     env.Prepend(CPPDEFINES=[
         ("_CRT_RAND_S", "1")
     ])
-    sources.extend([
-        "extract/js/src/jit/ExecutableAllocatorWin.cpp",
-    ])
-else:
-    sources.extend([
-        "extract/js/src/jit/ExecutableAllocatorPosix.cpp",
-    ])
 
 sources.extend(Glob('platform/' + env["TARGET_ARCH"] + "/" + env["TARGET_OS"] + "/build/*.cpp")),
 
@@ -131,6 +123,6 @@ env.Library(
     source=sources,
     LIBDEPS_TAGS=[
         # Depends on allocation symbols defined elsewhere
-        'incomplete'
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )

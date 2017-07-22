@@ -63,9 +63,9 @@ using std::string;
  *   writeConcern: <BSONObj>
  * }
  */
-class ConfigSvrMergeChunkCommand : public Command {
+class ConfigSvrMergeChunkCommand : public BasicCommand {
 public:
-    ConfigSvrMergeChunkCommand() : Command("_configsvrCommitChunkMerge") {}
+    ConfigSvrMergeChunkCommand() : BasicCommand("_configsvrCommitChunkMerge") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is sent by a shard to the sharding config server. Do "
@@ -98,11 +98,9 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             uasserted(ErrorCodes::IllegalOperation,
@@ -112,11 +110,11 @@ public:
         auto parsedRequest = uassertStatusOK(MergeChunkRequest::parseFromConfigCommand(cmdObj));
 
         Status mergeChunkResult =
-            Grid::get(txn)->catalogManager()->commitChunkMerge(txn,
-                                                               parsedRequest.getNamespace(),
-                                                               parsedRequest.getEpoch(),
-                                                               parsedRequest.getChunkBoundaries(),
-                                                               parsedRequest.getShardName());
+            ShardingCatalogManager::get(opCtx)->commitChunkMerge(opCtx,
+                                                                 parsedRequest.getNamespace(),
+                                                                 parsedRequest.getEpoch(),
+                                                                 parsedRequest.getChunkBoundaries(),
+                                                                 parsedRequest.getShardName());
 
         if (!mergeChunkResult.isOK()) {
             return appendCommandStatus(result, mergeChunkResult);

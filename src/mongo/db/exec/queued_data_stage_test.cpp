@@ -32,6 +32,8 @@
 
 #include "mongo/db/exec/queued_data_stage.h"
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context.h"
@@ -51,9 +53,9 @@ class QueuedDataStageTest : public unittest::Test {
 public:
     QueuedDataStageTest() {
         _service = stdx::make_unique<ServiceContextNoop>();
-        _service.get()->setFastClockSource(stdx::make_unique<ClockSourceMock>());
-        _client = _service.get()->makeClient("test");
-        _opCtxNoop.reset(new OperationContextNoop(_client.get(), 0));
+        _service->setFastClockSource(stdx::make_unique<ClockSourceMock>());
+        _client = _service->makeClient("test");
+        _opCtxNoop = _client->makeOperationContext();
         _opCtx = _opCtxNoop.get();
     }
 
@@ -70,7 +72,7 @@ private:
     // The OperationContextNoop must be destroyed before the UniqueClient is destroyed.
     std::unique_ptr<ServiceContextNoop> _service;
     ServiceContext::UniqueClient _client;
-    std::unique_ptr<OperationContextNoop> _opCtxNoop;
+    ServiceContext::UniqueOperationContext _opCtxNoop;
 };
 
 //

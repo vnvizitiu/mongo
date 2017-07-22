@@ -7,21 +7,21 @@ var newVersion = "latest";
 
 var name = "multiversioninitsync";
 
-var multitest = function(replSetVersion, newNodeVersion) {
+var multitest = function(replSetVersion, newNodeVersion, configSettings) {
     var nodes = {n1: {binVersion: replSetVersion}, n2: {binVersion: replSetVersion}};
 
     print("Start up a two-node " + replSetVersion + " replica set.");
     var rst = new ReplSetTest({name: name, nodes: nodes});
     rst.startSet();
-    var config = rst.getReplSetConfig();
-    // Set protocol version to 0 for 3.2 replset.
-    if (replSetVersion == newVersion) {
-        config.protocolVersion = 0;
-    }
-    rst.initiate(config);
+    var conf = rst.getReplSetConfig();
+    conf.settings = configSettings;
+    rst.initiate(conf);
 
     // Wait for a primary node.
     var primary = rst.getPrimary();
+
+    // The featureCompatibilityVersion must be 3.4 to have a mixed-version replica set.
+    assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: "3.4"}));
 
     // Insert some data and wait for replication.
     for (var i = 0; i < 25; i++) {
@@ -55,4 +55,5 @@ multitest(oldVersion, newVersion);
 // Old Secondary is synced from a "latest"
 // version ReplSet.
 // *****************************************
-multitest(newVersion, oldVersion);
+// Hard-code catchup timeout. The default timeout on 3.5 is -1, which is invalid on 3.4.
+multitest(newVersion, oldVersion, {catchUpTimeoutMillis: 2000});

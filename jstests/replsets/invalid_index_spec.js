@@ -14,6 +14,8 @@
     replTest.initiate();
 
     let primaryDB = replTest.getPrimary().getDB(testName);
+    let secondary = replTest.getSecondary();
+    let secondaryAdminDB = secondary.getDB("admin");
 
     // Set a fail point that allows for index creation with invalid spec fields.
     primaryDB.adminCommand(
@@ -38,8 +40,15 @@
     };
     assert.soon(assertFn, "Replication should have aborted on invalid index specification", 60000);
 
-    replTest.stopSet(undefined,
-                     undefined,
-                     {allowedExitCodes: [MongoRunner.EXIT_ABRUPT, MongoRunner.EXIT_ABORT]});
+    assert.soon(function() {
+        try {
+            secondaryAdminDB.runCommand({ping: 1});
+        } catch (e) {
+            return true;
+        }
+        return false;
+    }, "Node did not terminate due to invalid index spec", 60 * 1000);
 
+    replTest.stop(secondary, undefined, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
+    replTest.stopSet();
 })();

@@ -1,6 +1,5 @@
-// message.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2017 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,13 +17,13 @@
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -33,15 +32,9 @@
 
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/encoded_value_storage.h"
 #include "mongo/base/static_assert.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/util/allocator.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/hostandport.h"
-#include "mongo/util/net/sockaddr.h"
-#include "mongo/util/print.h"
 
 namespace mongo {
 
@@ -50,12 +43,9 @@ namespace mongo {
  */
 const size_t MaxMessageSizeBytes = 48 * 1000 * 1000;
 
-class Message;
-
 enum NetworkOp : int32_t {
     opInvalid = 0,
     opReply = 1,     /* reply. responseTo is set. */
-    dbMsg = 1000,    /* generic msg command followed by a std::string */
     dbUpdate = 2001, /* update object */
     dbInsert = 2002,
     // dbGetByOID = 2003,
@@ -68,11 +58,30 @@ enum NetworkOp : int32_t {
     dbCommand = 2010,
     dbCommandReply = 2011,
     dbCompressed = 2012,
+    dbMsg = 2013,
 };
+
+inline bool isSupportedNetworkOp(NetworkOp op) {
+    switch (op) {
+        case opReply:
+        case dbUpdate:
+        case dbInsert:
+        case dbQuery:
+        case dbGetMore:
+        case dbDelete:
+        case dbKillCursors:
+        case dbCommand:
+        case dbCommandReply:
+        case dbCompressed:
+        case dbMsg:
+            return true;
+        default:
+            return false;
+    }
+}
 
 enum class LogicalOp {
     opInvalid,
-    opMsg,
     opUpdate,
     opInsert,
     opQuery,
@@ -83,10 +92,8 @@ enum class LogicalOp {
     opCompressed,
 };
 
-static inline LogicalOp networkOpToLogicalOp(NetworkOp networkOp) {
+inline LogicalOp networkOpToLogicalOp(NetworkOp networkOp) {
     switch (networkOp) {
-        case dbMsg:
-            return LogicalOp::opMsg;
         case dbUpdate:
             return LogicalOp::opUpdate;
         case dbInsert:
@@ -99,6 +106,7 @@ static inline LogicalOp networkOpToLogicalOp(NetworkOp networkOp) {
             return LogicalOp::opDelete;
         case dbKillCursors:
             return LogicalOp::opKillCursors;
+        case dbMsg:
         case dbCommand:
             return LogicalOp::opCommand;
         case dbCompressed:
@@ -110,16 +118,12 @@ static inline LogicalOp networkOpToLogicalOp(NetworkOp networkOp) {
     }
 }
 
-bool doesOpGetAResponse(int op);
-
 inline const char* networkOpToString(NetworkOp networkOp) {
     switch (networkOp) {
         case opInvalid:
             return "none";
         case opReply:
             return "reply";
-        case dbMsg:
-            return "msg";
         case dbUpdate:
             return "update";
         case dbInsert:
@@ -138,6 +142,8 @@ inline const char* networkOpToString(NetworkOp networkOp) {
             return "commandReply";
         case dbCompressed:
             return "compressed";
+        case dbMsg:
+            return "msg";
         default:
             int op = static_cast<int>(networkOp);
             massert(16141, str::stream() << "cannot translate opcode " << op, !op);
@@ -149,8 +155,6 @@ inline const char* logicalOpToString(LogicalOp logicalOp) {
     switch (logicalOp) {
         case LogicalOp::opInvalid:
             return "none";
-        case LogicalOp::opMsg:
-            return "msg";
         case LogicalOp::opUpdate:
             return "update";
         case LogicalOp::opInsert:
@@ -172,33 +176,12 @@ inline const char* logicalOpToString(LogicalOp logicalOp) {
     }
 }
 
-inline bool opIsWrite(int op) {
-    switch (op) {
-        case 0:
-        case opReply:
-        case dbMsg:
-        case dbQuery:
-        case dbGetMore:
-        case dbKillCursors:
-        case dbCompressed:
-            return false;
-
-        case dbUpdate:
-        case dbInsert:
-        case dbDelete:
-            return true;
-
-        default:
-            PRINT(op);
-            verify(0);
-            return "";
-    }
-}
-
 namespace MSGHEADER {
+
 #pragma pack(1)
-/* see http://dochub.mongodb.org/core/mongowireprotocol
-*/
+/**
+ * See http://dochub.mongodb.org/core/mongowireprotocol
+ */
 struct Layout {
     int32_t messageLength;  // total message size, including this
     int32_t requestID;      // identifier for this message
@@ -288,6 +271,7 @@ public:
 }  // namespace MSGHEADER
 
 namespace MsgData {
+
 #pragma pack(1)
 struct Layout {
     MSGHEADER::Layout header;
@@ -402,9 +386,11 @@ public:
 };
 
 const int MsgDataHeaderSize = sizeof(Value) - 4;
+
 inline int ConstView::dataLen() const {
     return getLen() - MsgDataHeaderSize;
 }
+
 }  // namespace MsgData
 
 class Message {
@@ -472,8 +458,6 @@ public:
         return _buf.get();
     }
 
-    std::string toString() const;
-
     SharedBuffer sharedBuffer() {
         return _buf;
     }
@@ -486,8 +470,9 @@ private:
     SharedBuffer _buf;
 };
 
-
+/**
+ * Returns an always incrementing value to be used to assign to the next received network message.
+ */
 int32_t nextMessageId();
-
 
 }  // namespace mongo

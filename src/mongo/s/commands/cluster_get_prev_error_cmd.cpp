@@ -38,9 +38,9 @@
 namespace mongo {
 namespace {
 
-class GetPrevErrorCmd : public Command {
+class GetPrevErrorCmd : public ErrmsgCommandDeprecated {
 public:
-    GetPrevErrorCmd() : Command("getPrevError", false, "getpreverror") {}
+    GetPrevErrorCmd() : ErrmsgCommandDeprecated("getPrevError", "getpreverror") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -61,12 +61,11 @@ public:
         // No auth required
     }
 
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
         errmsg += "getpreverror not supported for sharded environments";
         return false;
     }

@@ -53,7 +53,7 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class CompactCmd : public Command {
+class CompactCmd : public ErrmsgCommandDeprecated {
 public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -84,14 +84,13 @@ public:
                 "  validate - check records are noncorrupt before adding to newly compacting "
                 "extents. slower but safer (defaults to true in this version)\n";
     }
-    CompactCmd() : Command("compact") {}
+    CompactCmd() : ErrmsgCommandDeprecated("compact") {}
 
-    virtual bool run(OperationContext* txn,
-                     const string& db,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& db,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         NamespaceString nss = parseNsCollectionRequired(db, cmdObj);
 
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
@@ -144,13 +143,12 @@ public:
         if (cmdObj.hasElement("validate"))
             compactOptions.validateDocuments = cmdObj["validate"].trueValue();
 
-        ScopedTransaction transaction(txn, MODE_IX);
-        AutoGetDb autoDb(txn, db, MODE_X);
+        AutoGetDb autoDb(opCtx, db, MODE_X);
         Database* const collDB = autoDb.getDb();
 
-        Collection* collection = collDB ? collDB->getCollection(nss) : nullptr;
+        Collection* collection = collDB ? collDB->getCollection(opCtx, nss) : nullptr;
         auto view =
-            collDB && !collection ? collDB->getViewCatalog()->lookup(txn, nss.ns()) : nullptr;
+            collDB && !collection ? collDB->getViewCatalog()->lookup(opCtx, nss.ns()) : nullptr;
 
         // If db/collection does not exist, short circuit and return.
         if (!collDB || !collection) {
@@ -162,12 +160,12 @@ public:
                     result, {ErrorCodes::NamespaceNotFound, "collection does not exist"});
         }
 
-        OldClientContext ctx(txn, nss.ns());
+        OldClientContext ctx(opCtx, nss.ns());
         BackgroundOperation::assertNoBgOpInProgForNs(nss.ns());
 
         log() << "compact " << nss.ns() << " begin, options: " << compactOptions;
 
-        StatusWith<CompactStats> status = collection->compact(txn, &compactOptions);
+        StatusWith<CompactStats> status = collection->compact(opCtx, &compactOptions);
         if (!status.isOK())
             return appendCommandStatus(result, status.getStatus());
 

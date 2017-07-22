@@ -26,14 +26,18 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/ops/modifier_current_date.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/db/global_timestamp.h"
-#include "mongo/db/ops/field_checker.h"
-#include "mongo/db/ops/log_builder.h"
-#include "mongo/db/ops/path_support.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/update/field_checker.h"
+#include "mongo/db/update/log_builder.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -210,7 +214,8 @@ Status ModifierCurrentDate::apply() const {
 
         // createPathAt() will complete the path and attach 'elemToSet' at the end of it.
         Status s = pathsupport::createPathAt(
-            _updatePath, _preparedState->idxFound, _preparedState->elemFound, elemToSet);
+                       _updatePath, _preparedState->idxFound, _preparedState->elemFound, elemToSet)
+                       .getStatus();
         if (!s.isOK())
             return s;
     }
@@ -224,7 +229,9 @@ Status ModifierCurrentDate::apply() const {
         if (!s.isOK())
             return s;
     } else {
-        Status s = elemToSet.setValueTimestamp(getNextGlobalTimestamp());
+        ServiceContext* service = getGlobalServiceContext();
+        auto ts = LogicalClock::get(service)->reserveTicks(1).asTimestamp();
+        Status s = elemToSet.setValueTimestamp(ts);
         if (!s.isOK())
             return s;
     }

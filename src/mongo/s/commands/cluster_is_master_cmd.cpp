@@ -44,9 +44,9 @@
 namespace mongo {
 namespace {
 
-class CmdIsMaster : public Command {
+class CmdIsMaster : public BasicCommand {
 public:
-    CmdIsMaster() : Command("isMaster", false, "ismaster") {}
+    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -67,14 +67,12 @@ public:
         // No auth required
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
 
-        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(txn->getClient());
+        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
         if (!seenIsMaster) {
             clientMetadataIsMasterState.setSeenIsMaster();
@@ -97,10 +95,10 @@ public:
 
             invariant(swParseClientMetadata.getValue());
 
-            swParseClientMetadata.getValue().get().logClientMetadata(txn->getClient());
+            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
 
             clientMetadataIsMasterState.setClientMetadata(
-                txn->getClient(), std::move(swParseClientMetadata.getValue()));
+                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
         }
 
         result.appendBool("ismaster", true);
@@ -119,9 +117,10 @@ public:
                                                   "automationServiceDescriptor",
                                                   static_cast<ServerParameter*>(nullptr));
         if (parameter)
-            parameter->append(txn, result, "automationServiceDescriptor");
+            parameter->append(opCtx, result, "automationServiceDescriptor");
 
-        txn->getClient()->session()->getCompressorManager().serverNegotiate(cmdObj, &result);
+        MessageCompressorManager::forSession(opCtx->getClient()->session())
+            .serverNegotiate(cmdObj, &result);
 
         return true;
     }

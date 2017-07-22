@@ -47,6 +47,7 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -369,8 +370,8 @@ public:
     }
 
     // In general, for lazy queries, we'll need to say, recv, then checkResponse
-    virtual void checkResponse(const char* data,
-                               int nReturned,
+    virtual void checkResponse(const std::vector<BSONObj>& batch,
+                               bool networkError,
                                bool* retry = nullptr,
                                std::string* targetHost = nullptr) {
         if (retry)
@@ -410,28 +411,18 @@ public:
     const rpc::ReplyMetadataReader& getReplyMetadataReader();
 
     /**
-     * Runs a database command. This variant allows the caller to manually specify the metadata
-     * for the request, and receive it for the reply.
-     *
-     * TODO: rename this to runCommand, and change the old one to runCommandLegacy.
+     * Runs the specified command request.
      */
-    virtual rpc::UniqueReply runCommandWithMetadata(StringData database,
-                                                    StringData command,
-                                                    const BSONObj& metadata,
-                                                    const BSONObj& commandArgs);
+    virtual std::pair<rpc::UniqueReply, DBClientWithCommands*> runCommandWithTarget(
+        OpMsgRequest request);
 
-    /*
-     * This wraps up the runCommandWithMetadata function above, but returns the DBClient that
-     * actually ran the command. When called against a replica set, this will return the specific
-     * replica set member the command ran against.
-     *
-     * This is used in the shell so that cursors can send getMore through the correct connection.
+    /**
+     * Runs the specified command request. This thin wrapper just unwraps the reply and ignores the
+     * target connection from the above runCommandWithTarget().
      */
-    virtual std::tuple<rpc::UniqueReply, DBClientWithCommands*> runCommandWithMetadataAndTarget(
-        StringData database,
-        StringData command,
-        const BSONObj& metadata,
-        const BSONObj& commandArgs);
+    rpc::UniqueReply runCommand(OpMsgRequest request) {
+        return runCommandWithTarget(std::move(request)).first;
+    }
 
     /** Run a database command.  Database commands are represented as BSON objects.  Common database
         commands have prebuilt helper functions -- see below.  If a helper is not available you can
@@ -446,10 +437,7 @@ public:
 
         @return true if the command returned "ok".
     */
-    virtual bool runCommand(const std::string& dbname,
-                            const BSONObj& cmd,
-                            BSONObj& info,
-                            int options = 0);
+    bool runCommand(const std::string& dbname, BSONObj cmd, BSONObj& info, int options = 0);
 
     /*
      * This wraps up the runCommand function avove, but returns the DBClient that actually ran
@@ -458,10 +446,10 @@ public:
      *
      * This is used in the shell so that cursors can send getMore through the correct connection.
      */
-    virtual std::tuple<bool, DBClientWithCommands*> runCommandWithTarget(const std::string& dbname,
-                                                                         const BSONObj& cmd,
-                                                                         BSONObj& info,
-                                                                         int options = 0);
+    std::tuple<bool, DBClientWithCommands*> runCommandWithTarget(const std::string& dbname,
+                                                                 BSONObj cmd,
+                                                                 BSONObj& info,
+                                                                 int options = 0);
 
     /**
     * Authenticates to another cluster member using appropriate authentication data.
@@ -711,13 +699,6 @@ public:
     }
 
     /**
-       get a list of all the current databases
-       uses the { listDatabases : 1 } command.
-       throws on error
-     */
-    std::list<std::string> getDatabaseNames();
-
-    /**
      * { name : "<short collection name>",
      *   options : { }
      * }
@@ -794,6 +775,11 @@ public:
                                   const BSONObj& cmdArgs,
                                   BSONObj& info,
                                   int options = 0);
+
+    /**
+     * Reconnect if needed and allowed.
+     */
+    virtual void checkConnection() {}
 
 protected:
     /** if the result of a command is ok*/
@@ -1058,10 +1044,9 @@ public:
                                      const BSONObj* fieldsToReturn,
                                      int queryOptions);
 
-    virtual bool runCommand(const std::string& dbname,
-                            const BSONObj& cmd,
-                            BSONObj& info,
-                            int options = 0);
+    using DBClientWithCommands::runCommandWithTarget;
+    std::pair<rpc::UniqueReply, DBClientWithCommands*> runCommandWithTarget(
+        OpMsgRequest request) override;
 
     /**
        @return true if this connection is currently in a failed state.  When autoreconnect is on,
@@ -1112,8 +1097,8 @@ public:
 
     virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
     virtual bool recv(Message& m);
-    virtual void checkResponse(const char* data,
-                               int nReturned,
+    virtual void checkResponse(const std::vector<BSONObj>& batch,
+                               bool networkError,
                                bool* retry = NULL,
                                std::string* host = NULL);
     virtual bool call(Message& toSend, Message& response, bool assertOk, std::string* actualServer);
@@ -1145,6 +1130,12 @@ public:
         return _compressorManager;
     }
 
+    // throws SocketException if in failed state and not reconnecting or if waiting to reconnect
+    void checkConnection() override {
+        if (_failed)
+            _checkConnection();
+    }
+
 protected:
     int _minWireVersion{0};
     int _maxWireVersion{0};
@@ -1162,12 +1153,6 @@ protected:
     std::string _applicationName;
 
     void _checkConnection();
-
-    // throws SocketException if in failed state and not reconnecting or if waiting to reconnect
-    void checkConnection() {
-        if (_failed)
-            _checkConnection();
-    }
 
     std::map<std::string, BSONObj> authCache;
     double _so_timeout;

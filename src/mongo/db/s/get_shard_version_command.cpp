@@ -47,9 +47,9 @@
 namespace mongo {
 namespace {
 
-class GetShardVersion : public Command {
+class GetShardVersion : public BasicCommand {
 public:
-    GetShardVersion() : Command("getShardVersion") {}
+    GetShardVersion() : BasicCommand("getShardVersion") {}
 
     void help(std::stringstream& help) const override {
         help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
@@ -82,25 +82,23 @@ public:
         return parseNsFullyQualified(dbname, cmdObj);
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << nss.ns() << " is not a valid namespace",
                 nss.isValid());
 
-        ShardingState* const gss = ShardingState::get(txn);
+        ShardingState* const gss = ShardingState::get(opCtx);
         if (gss->enabled()) {
-            result.append("configServer", gss->getConfigServer(txn).toString());
+            result.append("configServer", gss->getConfigServer(opCtx).toString());
         } else {
             result.append("configServer", "");
         }
 
-        ShardedConnectionInfo* const sci = ShardedConnectionInfo::get(txn->getClient(), false);
+        ShardedConnectionInfo* const sci = ShardedConnectionInfo::get(opCtx->getClient(), false);
         result.appendBool("inShardedMode", sci != nullptr);
         if (sci) {
             result.appendTimestamp("mine", sci->getVersion(nss.ns()).toLong());
@@ -108,8 +106,8 @@ public:
             result.appendTimestamp("mine", 0);
         }
 
-        AutoGetCollection autoColl(txn, nss, MODE_IS);
-        CollectionShardingState* const css = CollectionShardingState::get(txn, nss);
+        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        CollectionShardingState* const css = CollectionShardingState::get(opCtx, nss);
 
         ScopedCollectionMetadata metadata;
         if (css) {
@@ -132,7 +130,7 @@ public:
                 chunksArr.doneFast();
 
                 BSONArrayBuilder pendingArr(metadataBuilder.subarrayStart("pending"));
-                metadata->toBSONPending(pendingArr);
+                css->toBSONPending(pendingArr);
                 pendingArr.doneFast();
             }
             metadataBuilder.doneFast();

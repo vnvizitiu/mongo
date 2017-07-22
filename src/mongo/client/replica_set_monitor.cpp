@@ -47,12 +47,10 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/background.h"
-#include "mongo/util/concurrency/mutex.h"  // for StaticObserver
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/static_observer.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 
@@ -94,8 +92,6 @@ const Milliseconds kFindHostMaxBackOffTime(500);
 // TODO: Move to ReplicaSetMonitorManager
 ReplicaSetMonitor::ConfigChangeHook asyncConfigChangeHook;
 ReplicaSetMonitor::ConfigChangeHook syncConfigChangeHook;
-
-StaticObserver staticObserver;
 
 //
 // Helpers for stl algorithms
@@ -165,7 +161,6 @@ struct HostNotIn {
 
 /**
  * Replica set refresh period on the task executor.
- * This value must be equal to ReadPreferenceSettings::kMinimalMaxStalenessValue / 2
  */
 const Seconds kRefreshPeriod(30);
 }  // namespace
@@ -180,10 +175,12 @@ ReplicaSetMonitor::ReplicaSetMonitor(StringData name, const std::set<HostAndPort
     : _state(std::make_shared<SetState>(name, seeds)),
       _executor(globalRSMonitorManager.getExecutor()) {}
 
+ReplicaSetMonitor::ReplicaSetMonitor(const MongoURI& uri)
+    : _state(std::make_shared<SetState>(uri)), _executor(globalRSMonitorManager.getExecutor()) {}
+
 void ReplicaSetMonitor::init() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(_executor);
-    invariant(kRefreshPeriod * 2 == ReadPreferenceSetting::kMinimalMaxStalenessValue);
     std::weak_ptr<ReplicaSetMonitor> that(shared_from_this());
     auto status = _executor->scheduleWork([=](const CallbackArgs& cbArgs) {
         if (auto ptr = that.lock()) {
@@ -385,6 +382,10 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::createIfNeeded(const string& na
         ConnectionString::forReplicaSet(name, vector<HostAndPort>(servers.begin(), servers.end())));
 }
 
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::createIfNeeded(const MongoURI& uri) {
+    return globalRSMonitorManager.getOrCreateMonitor(uri);
+}
+
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitor::get(const std::string& name) {
     return globalRSMonitorManager.getMonitor(name);
 }
@@ -498,7 +499,7 @@ Refresher::NextStep Refresher::getNextStep() {
     if (_scan->hostsToScan.empty()) {
         // We've tried all hosts we can, so nothing more to do in this round.
         if (!_scan->foundUpMaster) {
-            warning() << "No primary detected for set " << _set->name;
+            warning() << "Unable to reach primary for set " << _set->name;
 
             // Since we've talked to everyone we could but still didn't find a primary, we
             // do the best we can, and assume all unconfirmedReplies are actually from nodes
@@ -531,7 +532,8 @@ Refresher::NextStep Refresher::getNextStep() {
         } else {
             auto nScans = _set->consecutiveFailedScans++;
             if (nScans <= 10 || nScans % 10 == 0) {
-                log() << "All nodes for set " << _set->name << " are down. "
+                log() << "Cannot reach any nodes for set " << _set->name
+                      << ". Please check network connectivity and the status of the set. "
                       << "This has happened for " << _set->consecutiveFailedScans
                       << " checks in a row.";
             }
@@ -819,11 +821,18 @@ HostAndPort Refresher::_refreshUntilMatches(const ReadPreferenceSetting* criteri
                 StatusWith<BSONObj> isMasterReplyStatus{ErrorCodes::InternalError,
                                                         "Uninitialized variable"};
                 int64_t pingMicros = 0;
+                MongoURI targetURI;
+
+                if (_set->setUri.isValid()) {
+                    targetURI = _set->setUri.cloneURIForServer(ns.host);
+                } else {
+                    targetURI = MongoURI(ConnectionString(ns.host));
+                }
 
                 // Do not do network calls while holding a mutex
                 lk.unlock();
                 try {
-                    ScopedDbConnection conn(ConnectionString(ns.host), socketTimeoutSecs);
+                    ScopedDbConnection conn(targetURI, socketTimeoutSecs);
                     bool ignoredOutParam = false;
                     Timer timer;
                     BSONObj reply;
@@ -1000,6 +1009,12 @@ SetState::SetState(StringData name, const std::set<HostAndPort>& seedNodes)
     DEV checkInvariants();
 }
 
+SetState::SetState(const MongoURI& uri)
+    : SetState(uri.getSetName(),
+               std::set<HostAndPort>(uri.getServers().begin(), uri.getServers().end())) {
+    setUri = uri;
+}
+
 HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) const {
     switch (criteria.pref) {
         // "Prefered" read preferences are defined in terms of other preferences
@@ -1010,12 +1025,12 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
             if (!out.empty())
                 return out;
             return getMatchingHost(ReadPreferenceSetting(
-                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessMS));
+                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
         }
 
         case ReadPreference::SecondaryPreferred: {
             HostAndPort out = getMatchingHost(ReadPreferenceSetting(
-                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessMS));
+                ReadPreference::SecondaryOnly, criteria.tags, criteria.maxStalenessSeconds));
             if (!out.empty())
                 return out;
             // NOTE: the spec says we should use the primary even if tags don't match
@@ -1038,7 +1053,7 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                 return true;
             };
             // build comparator
-            if (criteria.maxStalenessMS.count()) {
+            if (criteria.maxStalenessSeconds.count()) {
                 auto masterIt = std::find_if(nodes.begin(), nodes.end(), isMaster);
                 if (masterIt == nodes.end() || !masterIt->lastWriteDate.toMillisSinceEpoch()) {
                     auto writeDateCmp = [](const Node* a, const Node* b) -> bool {
@@ -1058,18 +1073,19 @@ HostAndPort SetState::getMatchingHost(const ReadPreferenceSetting& criteria) con
                     } else {
                         Date_t maxWriteTime = (*latestSecNode)->lastWriteDate;
                         matchNode = [=](const Node& node) -> bool {
-                            return Milliseconds(maxWriteTime - node.lastWriteDate) +
+                            return duration_cast<Seconds>(maxWriteTime - node.lastWriteDate) +
                                 kRefreshPeriod <=
-                                criteria.maxStalenessMS;
+                                criteria.maxStalenessSeconds;
                         };
                     }
                 } else {
-                    Milliseconds primaryStaleness =
-                        masterIt->lastWriteDateUpdateTime - masterIt->lastWriteDate;
+                    Seconds primaryStaleness = duration_cast<Seconds>(
+                        masterIt->lastWriteDateUpdateTime - masterIt->lastWriteDate);
                     matchNode = [=](const Node& node) -> bool {
-                        return Milliseconds(node.lastWriteDateUpdateTime - node.lastWriteDate) -
+                        return duration_cast<Seconds>(node.lastWriteDateUpdateTime -
+                                                      node.lastWriteDate) -
                             primaryStaleness + kRefreshPeriod <=
-                            criteria.maxStalenessMS;
+                            criteria.maxStalenessSeconds;
                     };
                 }
             }

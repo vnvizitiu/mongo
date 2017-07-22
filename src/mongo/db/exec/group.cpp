@@ -76,11 +76,11 @@ Status getKey(
 // static
 const char* GroupStage::kStageType = "GROUP";
 
-GroupStage::GroupStage(OperationContext* txn,
+GroupStage::GroupStage(OperationContext* opCtx,
                        const GroupRequest& request,
                        WorkingSet* workingSet,
                        PlanStage* child)
-    : PlanStage(kStageType, txn),
+    : PlanStage(kStageType, opCtx),
       _request(request),
       _ws(workingSet),
       _specificStats(),
@@ -96,9 +96,8 @@ Status GroupStage::initGroupScripting() {
     const std::string userToken =
         AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
 
-    const NamespaceString nss(_request.ns);
     _scope = getGlobalScriptEngine()->getPooledScope(
-        getOpCtx(), nss.db().toString(), "group" + userToken);
+        getOpCtx(), _request.ns.db().toString(), "group" + userToken);
     if (!_request.reduceScope.isEmpty()) {
         _scope->init(&_request.reduceScope);
     }

@@ -31,6 +31,8 @@
  * the DBClientReplicaSet talks to, so the tests only covers the client side logic.
  */
 
+#include "mongo/platform/basic.h"
+
 #include <map>
 #include <memory>
 #include <string>
@@ -44,7 +46,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_replica_set.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -62,11 +63,8 @@ using std::vector;
 /**
  * Constructs a metadata object containing the passed server selection metadata.
  */
-BSONObj makeMetadata(ReadPreference rp, TagSet tagSet, bool secondaryOk) {
-    BSONObjBuilder metadataBob;
-    rpc::ServerSelectionMetadata ssm(secondaryOk, ReadPreferenceSetting(rp, tagSet));
-    uassertStatusOK(ssm.writeToMetadata(&metadataBob));
-    return metadataBob.obj();
+BSONObj makeMetadata(ReadPreference rp, TagSet tagSet) {
+    return ReadPreferenceSetting(rp, std::move(tagSet)).toContainingBSON();
 }
 
 /**
@@ -104,8 +102,8 @@ void assertOneOfNodesSelected(MockReplicaSet* replSet,
     bool secondaryOk = (rp != ReadPreference::PrimaryOnly);
     auto tagSet = secondaryOk ? TagSet() : TagSet::primaryOnly();
     // We need the command to be a "SecOk command"
-    auto res = replConn.runCommandWithMetadata(
-        "foo", "dbStats", makeMetadata(rp, tagSet, secondaryOk), BSON("dbStats" << 1));
+    auto res = replConn.runCommand(
+        OpMsgRequest::fromDBAndBody("foo", BSON("dbStats" << 1), makeMetadata(rp, tagSet)));
     stdx::unordered_set<HostAndPort> hostSet;
     for (const auto& hostName : hostNames) {
         hostSet.emplace(hostName);
@@ -228,13 +226,11 @@ private:
 
 void assertRunCommandWithReadPrefThrows(MockReplicaSet* replSet, ReadPreference rp) {
     bool isPrimaryOnly = (rp == ReadPreference::PrimaryOnly);
-
-    bool secondaryOk = !isPrimaryOnly;
     TagSet ts = isPrimaryOnly ? TagSet::primaryOnly() : TagSet();
 
     DBClientReplicaSet replConn(replSet->getSetName(), replSet->getHosts(), StringData());
-    ASSERT_THROWS(replConn.runCommandWithMetadata(
-                      "foo", "whoami", makeMetadata(rp, ts, secondaryOk), BSON("dbStats" << 1)),
+    ASSERT_THROWS(replConn.runCommand(OpMsgRequest::fromDBAndBody(
+                      "foo", BSON("dbStats" << 1), makeMetadata(rp, ts))),
                   AssertionException);
 }
 
@@ -538,7 +534,7 @@ protected:
         ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
 
         {
-            mongo::repl::ReplicaSetConfig oldConfig = _replSet->getReplConfig();
+            mongo::repl::ReplSetConfig oldConfig = _replSet->getReplConfig();
 
             mongo::BSONObjBuilder newConfigBuilder;
             newConfigBuilder.append("_id", oldConfig.getReplSetName());
@@ -616,7 +612,7 @@ protected:
             }
 
             membersBuilder.done();
-            mongo::repl::ReplicaSetConfig newConfig;
+            mongo::repl::ReplSetConfig newConfig;
             fassert(28569, newConfig.initialize(newConfigBuilder.done()));
             fassert(28568, newConfig.validate());
             _replSet->setConfig(newConfig);

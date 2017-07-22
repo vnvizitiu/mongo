@@ -44,12 +44,14 @@ namespace mongo {
 class DocumentSourceLookUp final : public DocumentSourceNeedsMongod,
                                    public SplittableDocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> liteParse(
+    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
         const AggregationRequest& request, const BSONElement& spec);
 
     GetNextResult getNext() final;
     const char* getSourceName() const final;
-    void serializeToArray(std::vector<Value>& array, bool explain = false) const final;
+    void serializeToArray(
+        std::vector<Value>& array,
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
     /**
      * Returns the 'as' path, and possibly fields modified by an absorbed $unwind.
@@ -60,14 +62,7 @@ public:
         return true;
     }
 
-    /**
-     * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwindSrc'
-     * field.
-     */
-    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
-                                                     Pipeline::SourceContainer* container) final;
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
-    void dispose() final;
 
     BSONObjSet getOutputSorts() final {
         return DocumentSource::truncateSortSet(pSource->getOutputSorts(), {_as.fullPath()});
@@ -108,52 +103,129 @@ public:
      * Helper to absorb an $unwind stage. Only used for testing this special behavior.
      */
     void setUnwindStage(const boost::intrusive_ptr<DocumentSourceUnwind>& unwind) {
-        invariant(!_handlingUnwind);
+        invariant(!_unwindSrc);
         _unwindSrc = unwind;
-        _handlingUnwind = true;
+    }
+
+    /**
+     * Returns true if DocumentSourceLookup was constructed with pipeline syntax (as opposed to
+     * localField/foreignField syntax).
+     */
+    bool wasConstructedWithPipelineSyntax() const {
+        return !static_cast<bool>(_localField);
     }
 
 protected:
-    void doInjectExpressionContext() final;
+    void doDispose() final;
+
+    /**
+     * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwindSrc'
+     * field.
+     */
+    Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
+                                                     Pipeline::SourceContainer* container) final;
 
 private:
+    struct LetVariable {
+        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
+            : name(std::move(name)), expression(std::move(expression)), id(id) {}
+
+        std::string name;
+        boost::intrusive_ptr<Expression> expression;
+        Variables::Id id;
+    };
+
+    /**
+     * Target constructor. Handles common-field initialization for the syntax-specific delegating
+     * constructors.
+     */
+    DocumentSourceLookUp(NamespaceString fromNs,
+                         std::string as,
+                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * Constructor used for a $lookup stage specified using the {from: ..., localField: ...,
+     * foreignField: ..., as: ...} syntax.
+     */
     DocumentSourceLookUp(NamespaceString fromNs,
                          std::string as,
                          std::string localField,
                          std::string foreignField,
                          const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
-    Value serialize(bool explain = false) const final {
-        // Should not be called; use serializeToArray instead.
+    /**
+     * Constructor used for a $lookup stage specified using the {from: ..., pipeline: [...], as:
+     * ...} syntax.
+     */
+    DocumentSourceLookUp(NamespaceString fromNs,
+                         std::string as,
+                         std::vector<BSONObj> pipeline,
+                         BSONObj letVariables,
+                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * Should not be called; use serializeToArray instead.
+     */
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
         MONGO_UNREACHABLE;
     }
 
     GetNextResult unwindResult();
 
+    /**
+     * Copies 'vars' and 'vps' to the Variables and VariablesParseState objects in 'expCtx'. These
+     * copies provide access to 'let' defined variables in sub-pipeline execution.
+     */
+    static void copyVariablesToExpCtx(const Variables& vars,
+                                      const VariablesParseState& vps,
+                                      ExpressionContext* expCtx);
+
+    /**
+     * Resolves let defined variables against 'localDoc' and stores the results in 'variables'.
+     */
+    void resolveLetVariables(const Document& localDoc, Variables* variables);
+
+    /**
+     * The pipeline supplied via the $lookup 'pipeline' argument. This may differ from pipeline that
+     * is executed in that it will not include optimizations or resolved views.
+     */
+    std::string getUserPipelineDefinition();
+
     NamespaceString _fromNs;
+    NamespaceString _resolvedNs;
     FieldPath _as;
-    FieldPath _localField;
-    FieldPath _foreignField;
-    std::string _foreignFieldFieldName;
     boost::optional<BSONObj> _additionalFilter;
 
-    // The ExpressionContext used when performing aggregation pipelines against the '_fromNs'
+    // For use when $lookup is specified with localField/foreignField syntax.
+    boost::optional<FieldPath> _localField;
+    boost::optional<FieldPath> _foreignField;
+
+    // Holds 'let' defined variables defined both in this stage and in parent pipelines. These are
+    // copied to the '_fromExpCtx' ExpressionContext's 'variables' and 'variablesParseState' for use
+    // in foreign pipeline execution.
+    Variables _variables;
+    VariablesParseState _variablesParseState;
+
+    // The ExpressionContext used when performing aggregation pipelines against the '_resolvedNs'
     // namespace.
     boost::intrusive_ptr<ExpressionContext> _fromExpCtx;
 
-    // The aggregation pipeline to perform against the '_fromNs' namespace.
-    std::vector<BSONObj> _fromPipeline;
+    // The aggregation pipeline to perform against the '_resolvedNs' namespace. Referenced view
+    // namespaces have been resolved.
+    std::vector<BSONObj> _resolvedPipeline;
+    // The aggregation pipeline defined with the user request, prior to optimization and view
+    // resolution.
+    std::vector<BSONObj> _userPipeline;
+
+    std::vector<LetVariable> _letVariables;
 
     boost::intrusive_ptr<DocumentSourceMatch> _matchSrc;
     boost::intrusive_ptr<DocumentSourceUnwind> _unwindSrc;
 
-    bool _handlingUnwind = false;
-    bool _handlingMatch = false;
-
-    // The following members are used to hold onto state across getNext() calls when
-    // '_handlingUnwind' is true.
+    // The following members are used to hold onto state across getNext() calls when '_unwindSrc' is
+    // not null.
     long long _cursorIndex = 0;
-    boost::intrusive_ptr<Pipeline> _pipeline;
+    std::unique_ptr<Pipeline, Pipeline::Deleter> _pipeline;
     boost::optional<Document> _input;
     boost::optional<Document> _nextValue;
 };

@@ -35,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -46,18 +47,8 @@ class BatchedDeleteRequest {
     MONGO_DISALLOW_COPYING(BatchedDeleteRequest);
 
 public:
-    //
-    // schema declarations
-    //
-
-    // Name used for the batched delete invocation.
-    static const std::string BATCHED_DELETE_REQUEST;
-
-    // Field names and types in the batched delete command type.
     static const BSONField<std::string> collName;
     static const BSONField<std::vector<BatchedDeleteDocument*>> deletes;
-    static const BSONField<BSONObj> writeConcern;
-    static const BSONField<bool> ordered;
 
     //
     // construction / destruction
@@ -66,12 +57,9 @@ public:
     BatchedDeleteRequest();
     ~BatchedDeleteRequest();
 
-    /** Copies all the fields present in 'this' to 'other'. */
-    void cloneTo(BatchedDeleteRequest* other) const;
-
     bool isValid(std::string* errMsg) const;
     BSONObj toBSON() const;
-    bool parseBSON(StringData dbName, const BSONObj& source, std::string* errMsg);
+    void parseRequest(const OpMsgRequest& request);
     void clear();
     std::string toString() const;
 
@@ -82,36 +70,14 @@ public:
     void setNS(NamespaceString ns);
     const NamespaceString& getNS() const;
 
-    void setDeletes(const std::vector<BatchedDeleteDocument*>& deletes);
-
     /**
      * deletes ownership is transferred to here.
      */
     void addToDeletes(BatchedDeleteDocument* deletes);
     void unsetDeletes();
-    bool isDeletesSet() const;
     std::size_t sizeDeletes() const;
     const std::vector<BatchedDeleteDocument*>& getDeletes() const;
     const BatchedDeleteDocument* getDeletesAt(std::size_t pos) const;
-
-    void setWriteConcern(const BSONObj& writeConcern);
-    void unsetWriteConcern();
-    bool isWriteConcernSet() const;
-    const BSONObj& getWriteConcern() const;
-
-    void setOrdered(bool ordered);
-    void unsetOrdered();
-    bool isOrderedSet() const;
-    bool getOrdered() const;
-
-    /**
-     * These are no-ops since delete never validates documents. They only exist to fulfill the
-     * unified API.
-     */
-    void setShouldBypassValidation(bool newVal) {}
-    bool shouldBypassValidation() const {
-        return false;
-    }
 
 private:
     // Convention: (M)andatory, (O)ptional
@@ -123,14 +89,6 @@ private:
     // (M)  array of individual deletes
     std::vector<BatchedDeleteDocument*> _deletes;
     bool _isDeletesSet;
-
-    // (O)  to be issued after the batch applied
-    BSONObj _writeConcern;
-    bool _isWriteConcernSet;
-
-    // (O)  whether batch is issued in parallel or not
-    bool _ordered;
-    bool _isOrderedSet;
 };
 
 }  // namespace mongo

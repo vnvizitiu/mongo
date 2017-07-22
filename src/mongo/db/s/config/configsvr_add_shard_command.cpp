@@ -36,7 +36,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -55,9 +55,9 @@ const long long kMaxSizeMBDefault = 0;
 /**
  * Internal sharding command run on config servers to add a shard to the cluster.
  */
-class ConfigSvrAddShardCommand : public Command {
+class ConfigSvrAddShardCommand : public BasicCommand {
 public:
-    ConfigSvrAddShardCommand() : Command("_configsvrAddShard") {}
+    ConfigSvrAddShardCommand() : BasicCommand("_configsvrAddShard") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
@@ -86,11 +86,9 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             return appendCommandStatus(
@@ -105,7 +103,7 @@ public:
         }
         auto parsedRequest = std::move(swParsedRequest.getValue());
 
-        auto replCoord = repl::ReplicationCoordinator::get(txn);
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto rsConfig = replCoord->getConfig();
 
         auto validationStatus = parsedRequest.validate(rsConfig.isLocalHostAllowed());
@@ -119,8 +117,8 @@ public:
                            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
                                                       : kMaxSizeMBDefault);
 
-        StatusWith<string> addShardResult = Grid::get(txn)->catalogManager()->addShard(
-            txn,
+        StatusWith<string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
+            opCtx,
             parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
             parsedRequest.getConnString(),
             parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);

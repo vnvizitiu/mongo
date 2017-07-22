@@ -30,10 +30,10 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/algorithm.h"
-#include "mongo/db/ops/field_checker.h"
-#include "mongo/db/ops/log_builder.h"
-#include "mongo/db/ops/path_support.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/field_checker.h"
+#include "mongo/db/update/log_builder.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -64,7 +64,7 @@ void deduplicate(mb::Element parent, Ordering comp, Equality equal) {
         std::vector<mb::Element>::iterator next = where;
         ++next;
         while (next != end && equal(*where, *next)) {
-            next->remove();
+            next->remove().transitional_ignore();
             ++next;
         }
         where = next;
@@ -167,34 +167,6 @@ Status ModifierAddToSet::init(const BSONElement& modExpr, const Options& opts, b
             return status;
 
         _val = each;
-    }
-
-    // Check if no invalid data (such as fields with '$'s) are being used in the $each
-    // clause.
-    mb::ConstElement valCursor = _val.leftChild();
-    while (valCursor.ok()) {
-        const BSONType type = valCursor.getType();
-        dassert(valCursor.hasValue());
-        switch (type) {
-            case mongo::Object: {
-                Status s = valCursor.getValueObject().storageValidEmbedded();
-                if (!s.isOK())
-                    return s;
-
-                break;
-            }
-            case mongo::Array: {
-                Status s = valCursor.getValueArray().storageValidEmbedded();
-                if (!s.isOK())
-                    return s;
-
-                break;
-            }
-            default:
-                break;
-        }
-
-        valCursor = valCursor.rightSibling();
     }
 
     setCollator(opts.collator);
@@ -318,8 +290,10 @@ Status ModifierAddToSet::apply() const {
         }
 
         // createPathAt() will complete the path and attach 'elemToSet' at the end of it.
-        Status status = pathsupport::createPathAt(
-            _fieldRef, _preparedState->idxFound, _preparedState->elemFound, baseArray);
+        Status status =
+            pathsupport::createPathAt(
+                _fieldRef, _preparedState->idxFound, _preparedState->elemFound, baseArray)
+                .getStatus();
         if (!status.isOK()) {
             return status;
         }

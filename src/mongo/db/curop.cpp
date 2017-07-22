@@ -39,7 +39,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/cursor_id.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -69,10 +68,8 @@ const std::vector<const char*> kDollarQueryModifiers = {
     "$maxTimeMS",
 };
 
-/**
- * For a find using the OP_QUERY protocol (as opposed to the commands protocol), upconverts the
- * "query" field so that the profiling entry matches that of the find command.
- */
+}  // namespace
+
 BSONObj upconvertQueryEntry(const BSONObj& query,
                             const NamespaceString& nss,
                             int ntoreturn,
@@ -128,10 +125,6 @@ BSONObj upconvertQueryEntry(const BSONObj& query,
     return bob.obj();
 }
 
-/**
- * For a getMore using OP_GET_MORE, as opposed to getMore command, upconverts the "query" field so
- * that the profiling entry matches that of the getMore command.
- */
 BSONObj upconvertGetMoreEntry(const NamespaceString& nss, CursorId cursorId, int ntoreturn) {
     return GetMoreRequest(nss,
                           cursorId,
@@ -142,8 +135,6 @@ BSONObj upconvertGetMoreEntry(const NamespaceString& nss, CursorId cursorId, int
                           )
         .toBSON();
 }
-
-}  // namespace
 
 /**
  * This type decorates a Client object with a stack of active CurOp objects.
@@ -275,10 +266,12 @@ void CurOp::ensureStarted() {
     }
 }
 
-void CurOp::enter_inlock(const char* ns, int dbProfileLevel) {
+void CurOp::enter_inlock(const char* ns, boost::optional<int> dbProfileLevel) {
     ensureStarted();
     _ns = ns;
-    raiseDbProfileLevel(dbProfileLevel);
+    if (dbProfileLevel) {
+        raiseDbProfileLevel(*dbProfileLevel);
+    }
 }
 
 void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
@@ -303,53 +296,65 @@ Command::ReadWriteType CurOp::getReadWriteType() const {
 }
 
 namespace {
+
 /**
- * Appends {name: obj} to the provided builder.  If obj is greater than maxSize, appends a
- * string summary of obj instead of the object itself.
+ * Appends {<name>: obj} to the provided builder.  If obj is greater than maxSize, appends a string
+ * summary of obj as { <name>: { $truncated: "obj" } }. If a comment parameter is present, add it to
+ * the truncation object.
  */
 void appendAsObjOrString(StringData name,
                          const BSONObj& obj,
-                         size_t maxSize,
+                         const boost::optional<size_t> maxSize,
                          BSONObjBuilder* builder) {
-    if (static_cast<size_t>(obj.objsize()) <= maxSize) {
+    if (!maxSize || static_cast<size_t>(obj.objsize()) <= *maxSize) {
         builder->append(name, obj);
     } else {
         // Generate an abbreviated serialization for the object, by passing false as the
         // "full" argument to obj.toString().
         std::string objToString = obj.toString();
-        if (objToString.size() <= maxSize) {
-            builder->append(name, objToString);
-        } else {
+        if (objToString.size() > *maxSize) {
             // objToString is still too long, so we append to the builder a truncated form
             // of objToString concatenated with "...".  Instead of creating a new string
             // temporary, mutate objToString to do this (we know that we can mutate
             // characters in objToString up to and including objToString[maxSize]).
-            objToString[maxSize - 3] = '.';
-            objToString[maxSize - 2] = '.';
-            objToString[maxSize - 1] = '.';
-            builder->append(name, StringData(objToString).substr(0, maxSize));
+            objToString[*maxSize - 3] = '.';
+            objToString[*maxSize - 2] = '.';
+            objToString[*maxSize - 1] = '.';
         }
+
+        StringData truncation = StringData(objToString).substr(0, *maxSize);
+
+        // Append the truncated representation of the object to the builder. If a comment parameter
+        // is present, write it to the object alongside the truncated op. This object will appear as
+        // {$truncated: "{find: \"collection\", filter: {x: 1, ...", comment: "comment text" }
+        BSONObjBuilder truncatedBuilder(builder->subobjStart(name));
+        truncatedBuilder.append("$truncated", truncation);
+
+        if (auto comment = obj["comment"]) {
+            truncatedBuilder.append(comment);
+        }
+
+        truncatedBuilder.doneFast();
     }
 }
 }  // namespace
 
-void CurOp::reportState(BSONObjBuilder* builder) {
+void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     if (_start) {
-        builder->append("secs_running", elapsedSeconds());
-        builder->append("microsecs_running", static_cast<long long int>(elapsedMicros()));
+        builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
+        builder->append("microsecs_running", durationCount<Microseconds>(elapsedTimeTotal()));
     }
 
     builder->append("op", logicalOpToString(_logicalOp));
     builder->append("ns", _ns);
 
-    // When currentOp is run, it returns a single response object containing all current
-    // operations. This request will fail if the response exceeds the 16MB document limit. We limit
-    // query object size here to reduce the risk of exceeding.
-    const size_t maxQuerySize = 512;
+    // When the currentOp command is run, it returns a single response object containing all current
+    // operations; this request will fail if the response exceeds the 16MB document limit. By
+    // contrast, the $currentOp aggregation stage does not have this restriction. If 'truncateOps'
+    // is true, limit the size of each op to 1000 bytes. Otherwise, do not truncate.
+    const boost::optional<size_t> maxQuerySize{truncateOps, 1000};
 
-    if (_networkOp == dbInsert) {
-        appendAsObjOrString("insert", _query, maxQuerySize, builder);
-    } else if (!_command && _networkOp == dbQuery) {
+    if (!_command && _networkOp == dbQuery) {
         // This is a legacy OP_QUERY. We upconvert the "query" field of the currentOp output to look
         // similar to a find command.
         //
@@ -358,16 +363,13 @@ void CurOp::reportState(BSONObjBuilder* builder) {
         const int ntoreturn = 0;
         const int ntoskip = 0;
 
-        appendAsObjOrString("query",
-                            upconvertQueryEntry(_query, NamespaceString(_ns), ntoreturn, ntoskip),
-                            maxQuerySize,
-                            builder);
+        appendAsObjOrString(
+            "command",
+            upconvertQueryEntry(_opDescription, NamespaceString(_ns), ntoreturn, ntoskip),
+            maxQuerySize,
+            builder);
     } else {
-        appendAsObjOrString("query", _query, maxQuerySize, builder);
-    }
-
-    if (!_collation.isEmpty()) {
-        appendAsObjOrString("collation", _collation, maxQuerySize, builder);
+        appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
     }
 
     if (!_originatingCommand.isEmpty()) {
@@ -397,7 +399,9 @@ void CurOp::reportState(BSONObjBuilder* builder) {
 
 namespace {
 StringData getProtoString(int op) {
-    if (op == dbQuery) {
+    if (op == dbMsg) {
+        return "op_msg";
+    } else if (op == dbQuery) {
         return "op_query";
     } else if (op == dbCommand) {
         return "op_command";
@@ -432,12 +436,20 @@ string OpDebug::report(Client* client,
         }
     }
 
-    auto query = curop.query();
+    BSONObj query;
+
+    // If necessary, upconvert legacy find operations so that their log lines resemble their find
+    // command counterpart.
+    if (!iscommand && networkOp == dbQuery) {
+        query = upconvertQueryEntry(
+            curop.opDescription(), NamespaceString(curop.getNS()), ntoreturn, ntoskip);
+    } else {
+        query = curop.opDescription();
+    }
 
     if (!query.isEmpty()) {
+        s << " command: ";
         if (iscommand) {
-            s << " command: ";
-
             Command* curCommand = curop.getCommand();
             if (curCommand) {
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
@@ -448,7 +460,6 @@ string OpDebug::report(Client* client,
                 s << redact(query);
             }
         } else {
-            s << " query: ";
             s << redact(query);
         }
     }
@@ -460,16 +471,6 @@ string OpDebug::report(Client* client,
 
     if (!curop.getPlanSummary().empty()) {
         s << " planSummary: " << redact(curop.getPlanSummary().toString());
-    }
-
-    if (!updateobj.isEmpty()) {
-        s << " update: " << redact(updateobj);
-    }
-
-    auto collation = curop.collation();
-    if (!collation.isEmpty()) {
-        s << " collation: ";
-        collation.toString(s);
     }
 
     OPDEBUG_TOSTRING_HELP(cursorid);
@@ -552,30 +553,17 @@ void OpDebug::append(const CurOp& curop,
     b.append("ns", nss.ns());
 
     if (!iscommand && networkOp == dbQuery) {
-        appendAsObjOrString("query",
-                            upconvertQueryEntry(curop.query(), nss, ntoreturn, ntoskip),
+        appendAsObjOrString("command",
+                            upconvertQueryEntry(curop.opDescription(), nss, ntoreturn, ntoskip),
                             maxElementSize,
                             &b);
-    } else if (!iscommand && networkOp == dbGetMore) {
-        appendAsObjOrString(
-            "query", upconvertGetMoreEntry(nss, cursorid, ntoreturn), maxElementSize, &b);
-    } else if (curop.haveQuery()) {
-        const char* fieldName = (logicalOp == LogicalOp::opCommand) ? "command" : "query";
-        appendAsObjOrString(fieldName, curop.query(), maxElementSize, &b);
+    } else if (curop.haveOpDescription()) {
+        appendAsObjOrString("command", curop.opDescription(), maxElementSize, &b);
     }
 
     auto originatingCommand = curop.originatingCommand();
     if (!originatingCommand.isEmpty()) {
         appendAsObjOrString("originatingCommand", originatingCommand, maxElementSize, &b);
-    }
-
-    if (!updateobj.isEmpty()) {
-        appendAsObjOrString("updateobj", updateobj, maxElementSize, &b);
-    }
-
-    auto collation = curop.collation();
-    if (!collation.isEmpty()) {
-        appendAsObjOrString("collation", collation, maxElementSize, &b);
     }
 
     OPDEBUG_APPEND_NUMBER(cursorid);

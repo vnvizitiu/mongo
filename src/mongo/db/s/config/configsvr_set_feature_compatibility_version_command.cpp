@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_type.h"
@@ -33,10 +35,18 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_command_parser.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/log.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+
+using CollectionUUID = UUID;
 
 namespace {
 
@@ -48,15 +58,15 @@ namespace {
  *   _configsvrSetFeatureCompatibilityVersion: <string version>
  * }
  */
-class ConfigSvrSetFeatureCompatibilityVersionCommand : public Command {
+class ConfigSvrSetFeatureCompatibilityVersionCommand : public BasicCommand {
 public:
     ConfigSvrSetFeatureCompatibilityVersionCommand()
-        : Command("_configsvrSetFeatureCompatibilityVersion") {}
+        : BasicCommand("_configsvrSetFeatureCompatibilityVersion") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
                 "directly. Sets featureCompatibilityVersion on all shards. See "
-                "http://dochub.mongodb.org/core/3.4-feature-compatibility.";
+                "http://dochub.mongodb.org/core/3.6-feature-compatibility.";
     }
 
     bool slaveOk() const override {
@@ -81,11 +91,9 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const auto version = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
@@ -93,19 +101,62 @@ public:
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << getName()
                               << " can only be run on config servers. See "
-                                 "http://dochub.mongodb.org/core/3.4-feature-compatibility.",
+                                 "http://dochub.mongodb.org/core/3.6-feature-compatibility.",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
+        // Remove after 3.4 -> 3.6 upgrade.
+        if (version == FeatureCompatibilityVersionCommandParser::kVersion36) {
+            _generateUUIDsForExistingShardedCollections(opCtx);
+        }
+
         // Forward to all shards.
-        uassertStatusOK(
-            Grid::get(txn)->catalogManager()->setFeatureCompatibilityVersionOnShards(txn, version));
+        uassertStatusOK(ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+            opCtx, version));
 
         // On success, set featureCompatibilityVersion on self.
-        FeatureCompatibilityVersion::set(txn, version);
+        FeatureCompatibilityVersion::set(opCtx, version);
 
         return true;
     }
 
+private:
+    /**
+     * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
+     * for the collection, and updates the entry with the generated UUID.
+     *
+     * Remove after 3.4 -> 3.6 upgrade.
+     */
+    void _generateUUIDsForExistingShardedCollections(OperationContext* opCtx) {
+        // Retrieve all collections in config.collections that do not have a UUID. Some collections
+        // may already have a UUID if an earlier upgrade attempt failed after making some progress.
+        auto shardedColls =
+            uassertStatusOK(
+                Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+                    opCtx,
+                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                    repl::ReadConcernLevel::kLocalReadConcern,
+                    NamespaceString(CollectionType::ConfigNS),
+                    BSON(CollectionType::uuid.name() << BSON("$exists" << false)),  // query
+                    BSONObj(),                                                      // sort
+                    boost::none                                                     // limit
+                    ))
+                .docs;
+
+        // Generate and persist a new UUID for each collection that did not have a UUID.
+        LOG(0) << "generating UUIDs for all sharded collections that do not yet have one";
+        for (auto& coll : shardedColls) {
+            auto collType = uassertStatusOK(CollectionType::fromBSON(coll));
+            invariant(!collType.getUUID());
+
+            auto uuid = CollectionUUID::gen();
+            collType.setUUID(uuid);
+
+            uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
+                opCtx, collType.getNs().ns(), collType, false /* upsert */));
+            LOG(2) << "updated entry in config.collections for sharded collection "
+                   << collType.getNs() << " with generated UUID " << uuid;
+        }
+    }
 } configsvrSetFeatureCompatibilityVersionCmd;
 
 }  // namespace

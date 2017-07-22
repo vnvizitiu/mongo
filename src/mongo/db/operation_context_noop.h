@@ -27,7 +27,10 @@
  */
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/concurrency/locker_noop.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/stdx/memory.h"
@@ -48,7 +51,6 @@ public:
         setRecoveryUnit(ru, kNotInUnitOfWork);
     }
 
-
     /**
      * This constructor is for use by ServiceContexts, and should not be called directly.
      */
@@ -56,18 +58,6 @@ public:
         setRecoveryUnit(new RecoveryUnitNoop(), kNotInUnitOfWork);
         setLockState(stdx::make_unique<LockerNoop>());
     }
-
-    virtual ~OperationContextNoop() = default;
-
-    virtual ProgressMeter* setMessage_inlock(const char* msg,
-                                             const std::string& name,
-                                             unsigned long long progressMeterTotal,
-                                             int secondsBetween) override {
-        return &_pm;
-    }
-
-private:
-    ProgressMeter _pm;
 };
 
 }  // namespace mongo

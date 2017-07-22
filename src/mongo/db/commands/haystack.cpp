@@ -43,6 +43,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/find_common.h"
 
 /**
@@ -58,9 +59,9 @@ namespace mongo {
 using std::string;
 using std::vector;
 
-class GeoHaystackSearchCommand : public Command {
+class GeoHaystackSearchCommand : public ErrmsgCommandDeprecated {
 public:
-    GeoHaystackSearchCommand() : Command("geoSearch") {}
+    GeoHaystackSearchCommand() : ErrmsgCommandDeprecated("geoSearch") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -74,7 +75,7 @@ public:
         return true;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -94,15 +95,14 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
 
-        AutoGetCollectionForRead ctx(txn, nss.ns());
+        AutoGetCollectionForReadCommand ctx(opCtx, nss);
 
         Collection* collection = ctx.getCollection();
         if (!collection) {
@@ -111,7 +111,7 @@ public:
         }
 
         vector<IndexDescriptor*> idxs;
-        collection->getIndexCatalog()->findIndexByType(txn, IndexNames::GEO_HAYSTACK, idxs);
+        collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_HAYSTACK, idxs);
         if (idxs.size() == 0) {
             errmsg = "no geoSearch index";
             return false;
@@ -136,7 +136,7 @@ public:
         IndexDescriptor* desc = idxs[0];
         HaystackAccessMethod* ham =
             static_cast<HaystackAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
-        ham->searchCommand(txn,
+        ham->searchCommand(opCtx,
                            collection,
                            nearElt.Obj(),
                            maxDistance.numberDouble(),

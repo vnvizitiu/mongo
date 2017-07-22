@@ -33,11 +33,15 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -101,6 +105,16 @@ TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
     assertExpectedRedactSafePortion("{a: {$size: 1}}", "{}");
 
     assertExpectedRedactSafePortion("{$nor: [{a:1}]}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaMinItems: 1}}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaMaxItems: 1}}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaUniqueItems: true}}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaMinLength: 1}}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaMaxLength: 1}}", "{}");
 
     // Combinations
     assertExpectedRedactSafePortion("{a:1, b: 'asdf'}", "{a:1, b: 'asdf'}");
@@ -326,41 +340,110 @@ TEST_F(DocumentSourceMatchTest, ShouldPropagatePauses) {
     ASSERT_TRUE(match->getNext().isEOF());
 }
 
-TEST(ObjectForMatch, ShouldExtractTopLevelFieldIfDottedFieldNeeded) {
-    Document input(fromjson("{a: 1, b: {c: 1, d: 1}}"));
-    BSONObj expected = fromjson("{b: {c: 1, d: 1}}");
-    ASSERT_BSONOBJ_EQ(expected, DocumentSourceMatch::getObjectForMatch(input, {"b.c"}));
+TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
+    const auto match = DocumentSourceMatch::create(BSON("a" << 1), getExpCtx());
+    const auto secondMatch = DocumentSourceMatch::create(BSON("b" << 1), getExpCtx());
+
+    match->joinMatchWith(secondMatch);
+
+    const auto mock = DocumentSourceMock::create({Document{{"a", 1}, {"b", 1}},
+                                                  Document{{"a", 2}, {"b", 1}},
+                                                  Document{{"a", 1}, {"b", 2}},
+                                                  Document{{"a", 2}, {"b", 2}}});
+
+    match->setSource(mock.get());
+
+    // The first result should match.
+    auto next = match->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(), (Document{{"a", 1}, {"b", 1}}));
+
+    // The rest should not match.
+    ASSERT_TRUE(match->getNext().isEOF());
+    ASSERT_TRUE(match->getNext().isEOF());
+    ASSERT_TRUE(match->getNext().isEOF());
 }
 
-TEST(ObjectForMatch, ShouldExtractEntireArray) {
-    Document input(fromjson("{a: [1, 2, 3], b: 1}"));
-    BSONObj expected = fromjson("{a: [1, 2, 3]}");
-    ASSERT_BSONOBJ_EQ(expected, DocumentSourceMatch::getObjectForMatch(input, {"a"}));
+DEATH_TEST_F(DocumentSourceMatchTest,
+             ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
+             "Invariant failure expression::isPathPrefixOf") {
+    const auto expCtx = getExpCtx();
+    const auto matchSpec = BSON("a.b" << 1 << "b.c" << 1);
+    const auto matchExpression = unittest::assertGet(
+        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-TEST(ObjectForMatch, ShouldOnlyAddPrefixedFieldOnceIfTwoDottedSubfields) {
-    Document input(fromjson("{a: 1, b: {c: 1, f: {d: {e: 1}}}}"));
-    BSONObj expected = fromjson("{b: {c: 1, f: {d: {e: 1}}}}");
-    ASSERT_BSONOBJ_EQ(expected, DocumentSourceMatch::getObjectForMatch(input, {"b.f", "b.f.d.e"}));
+DEATH_TEST_F(DocumentSourceMatchTest,
+             ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
+             "Invariant failure node->matchType()") {
+    const auto expCtx = getExpCtx();
+    const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
+    const auto matchExpression = unittest::assertGet(
+        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    BSONObjBuilder out;
+    matchExpression->serialize(&out);
+    DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-TEST(ObjectForMatch, MissingFieldShouldNotAppearInResult) {
-    Document input(fromjson("{a: 1}"));
-    BSONObj expected;
-    ASSERT_BSONOBJ_EQ(expected, DocumentSourceMatch::getObjectForMatch(input, {"b", "c"}));
+// Due to the order of traversal of the MatchExpression tree, this test may actually trigger the
+// invariant failure that the path being descended is not a prefix of the path of the
+// MatchExpression node corresponding to the '$gt' expression, which will report an empty path.
+DEATH_TEST_F(DocumentSourceMatchTest,
+             ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithValue,
+             "Invariant failure") {
+    const auto expCtx = getExpCtx();
+    const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("$gt" << 0)));
+    const auto matchExpression = unittest::assertGet(
+        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-TEST(ObjectForMatch, ShouldSerializeNothingIfNothingIsNeeded) {
-    Document input(fromjson("{a: 1, b: {c: 1}}"));
-    BSONObj expected;
-    ASSERT_BSONOBJ_EQ(expected,
-                      DocumentSourceMatch::getObjectForMatch(input, std::set<std::string>{}));
+TEST_F(DocumentSourceMatchTest, ShouldMatchCorrectlyAfterDescendingMatch) {
+    const auto expCtx = getExpCtx();
+    const auto matchSpec = BSON("a.b" << 1 << "a.c" << 1 << "a.d" << 1);
+    const auto matchExpression = unittest::assertGet(
+        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+
+    const auto descendedMatch =
+        DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
+    const auto mock = DocumentSourceMock::create(
+        {Document{{"b", 1}, {"c", 1}, {"d", 1}},
+         Document{{"b", 1}, {"a", Document{{"c", 1}}}, {"d", 1}},
+         Document{{"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"d", 1}},
+         Document{
+             {"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"a", Document{{"d", 1}}}}});
+    descendedMatch->setSource(mock.get());
+
+    auto next = descendedMatch->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(), (Document{{"b", 1}, {"c", 1}, {"d", 1}}));
+
+    ASSERT_TRUE(descendedMatch->getNext().isEOF());
+    ASSERT_TRUE(descendedMatch->getNext().isEOF());
+    ASSERT_TRUE(descendedMatch->getNext().isEOF());
 }
 
-TEST(ObjectForMatch, ShouldExtractEntireArrayFromPrefixOfDottedField) {
-    Document input(fromjson("{a: [{b: 1}, {b: 2}], c: 1}"));
-    BSONObj expected = fromjson("{a: [{b: 1}, {b: 2}]}");
-    ASSERT_BSONOBJ_EQ(expected, DocumentSourceMatch::getObjectForMatch(input, {"a.b"}));
+TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateElemMatchPredicate) {
+    const auto match =
+        DocumentSourceMatch::create(BSON("a" << BSON("$elemMatch" << BSON("b" << 1))), getExpCtx());
+
+    const std::vector<Document> matchingVector = {Document{{"b", 0}}, Document{{"b", 1}}};
+    const std::vector<Document> nonMatchingVector = {Document{{"b", 0}}, Document{{"b", 2}}};
+    const auto mock = DocumentSourceMock::create(
+        {Document{{"a", matchingVector}}, Document{{"a", nonMatchingVector}}, Document{{"a", 1}}});
+
+    match->setSource(mock.get());
+
+    // The first result should match.
+    auto next = match->getNext();
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_DOCUMENT_EQ(next.releaseDocument(), (Document{{"a", matchingVector}}));
+
+    // The rest should not match.
+    ASSERT_TRUE(match->getNext().isEOF());
+    ASSERT_TRUE(match->getNext().isEOF());
+    ASSERT_TRUE(match->getNext().isEOF());
 }
 
 }  // namespace

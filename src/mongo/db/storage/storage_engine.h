@@ -35,6 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -197,17 +198,17 @@ public:
     /**
      * Closes all file handles associated with a database.
      */
-    virtual Status closeDatabase(OperationContext* txn, StringData db) = 0;
+    virtual Status closeDatabase(OperationContext* opCtx, StringData db) = 0;
 
     /**
      * Deletes all data and metadata for a database.
      */
-    virtual Status dropDatabase(OperationContext* txn, StringData db) = 0;
+    virtual Status dropDatabase(OperationContext* opCtx, StringData db) = 0;
 
     /**
      * @return number of files flushed
      */
-    virtual int flushAllFiles(bool sync) = 0;
+    virtual int flushAllFiles(OperationContext* opCtx, bool sync) = 0;
 
     /**
      * Transitions the storage engine into backup mode.
@@ -228,7 +229,7 @@ public:
      * retried, returns a non-OK status. This function may throw a WriteConflictException, which
      * should trigger a retry by the caller. All other exceptions should be treated as errors.
      */
-    virtual Status beginBackup(OperationContext* txn) {
+    virtual Status beginBackup(OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -240,7 +241,7 @@ public:
      *
      * Storage engines implementing this feature should fassert when unable to leave backup mode.
      */
-    virtual void endBackup(OperationContext* txn) {
+    virtual void endBackup(OperationContext* opCtx) {
         return;
     }
 
@@ -253,7 +254,7 @@ public:
      *
      * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
      */
-    virtual Status repairRecordStore(OperationContext* txn, const std::string& ns) = 0;
+    virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
 
     /**
      * This method will be called before there is a clean shutdown.  Storage engines should
@@ -279,6 +280,43 @@ public:
      * system about journaled write progress.
      */
     virtual void setJournalListener(JournalListener* jl) = 0;
+
+    /**
+     * Returns whether the storage engine supports "recover to stable timestamp". Returns false
+     * if the storage engine supports the "recover to stable timestamp" feature but does not have
+     * a stable timestamp, or if for some reason the storage engine is unable to recover to the
+     * last provided stable timestamp.
+     */
+    virtual bool supportsRecoverToStableTimestamp() const {
+        return false;
+    }
+
+    /**
+     * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
+     * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
+     * used should be one provided by StorageEngine::setStableTimestamp().
+     *
+     * The "local" database is exempt and should not roll back any state except for
+     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which must roll back to
+     * the last stable timestamp.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     */
+    virtual Status recoverToStableTimestamp() {
+        fassertFailed(40547);
+    }
+
+    /**
+     * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
+     * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     */
+    virtual void setStableTimestamp(SnapshotName snapshotName) {}
+
+    /**
+     * Tells the storage engine the timestamp of the data at startup. This is necessary because
+     * timestamps are not persisted in the storage layer.
+     */
+    virtual void setInitialDataTimestamp(SnapshotName snapshotName) {}
 
 protected:
     /**

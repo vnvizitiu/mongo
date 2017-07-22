@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -63,7 +63,7 @@
 #define	WT_MAX(a, b)	((a) < (b) ? (b) : (a))
 
 /* Elements in an array. */
-#define	WT_ELEMENTS(a)	(sizeof(a) / sizeof(a[0]))
+#define	WT_ELEMENTS(a)	(sizeof(a) / sizeof((a)[0]))
 
 /* 10 level skip lists, 1/4 have a link to the next element. */
 #define	WT_SKIP_MAXDEPTH	10
@@ -140,6 +140,7 @@
 
 #define	F_CLR(p, mask)		        FLD_CLR((p)->flags, mask)
 #define	F_ISSET(p, mask)	        FLD_ISSET((p)->flags, mask)
+#define	F_ISSET_ALL(p, mask)	        (FLD_MASK((p)->flags, mask) == (mask))
 #define	F_MASK(p, mask)	                FLD_MASK((p)->flags, mask)
 #define	F_SET(p, mask)		        FLD_SET((p)->flags, mask)
 
@@ -180,14 +181,14 @@
  */
 #define	WT_BINARY_SEARCH(key, arrayp, n, found) do {			\
 	uint32_t __base, __indx, __limit;				\
-	found = false;							\
+	(found) = false;						\
 	for (__base = 0, __limit = (n); __limit != 0; __limit >>= 1) {	\
 		__indx = __base + (__limit >> 1);			\
-		if ((arrayp)[__indx] < key) {				\
+		if ((arrayp)[__indx] < (key)) {				\
 			__base = __indx + 1;				\
 			--__limit;					\
-		} else if ((arrayp)[__indx] == key) {			\
-			found = true;					\
+		} else if ((arrayp)[__indx] == (key)) {			\
+			(found) = true;					\
 			break;						\
 		}							\
 	}								\
@@ -206,8 +207,8 @@
 
 /* Check if a string matches a prefix. */
 #define	WT_PREFIX_MATCH(str, pfx)					\
-	(((const char *)(str))[0] == ((const char *)pfx)[0] &&		\
-	    strncmp((str), (pfx), strlen(pfx)) == 0)
+	(((const char *)(str))[0] == ((const char *)(pfx))[0] &&	\
+	    strncmp(str, pfx, strlen(pfx)) == 0)
 
 /* Check if a string matches a prefix, and move past it. */
 #define	WT_PREFIX_SKIP(str, pfx)					\
@@ -224,8 +225,8 @@
 
 /* Check if a string matches a byte string of len bytes. */
 #define	WT_STRING_MATCH(str, bytes, len)				\
-	(((const char *)str)[0] == ((const char *)bytes)[0] &&		\
-	    strncmp(str, bytes, len) == 0 && (str)[(len)] == '\0')
+	(((const char *)(str))[0] == ((const char *)(bytes))[0] &&	\
+	    strncmp(str, bytes, len) == 0 && (str)[len] == '\0')
 
 /*
  * Macro that produces a string literal that isn't wrapped in quotes, to avoid
@@ -247,6 +248,24 @@
 	(dst).data = (src).data;					\
 	(dst).size = (src).size;					\
 } while (0)
+
+/* Timestamp type and helper macros. */
+#if WT_TIMESTAMP_SIZE > 0
+#define	HAVE_TIMESTAMPS 1
+#else
+#undef HAVE_TIMESTAMPS
+#endif
+
+#ifdef HAVE_TIMESTAMPS
+#define	WT_TIMESTAMP(x) (x)
+typedef uint8_t wt_timestamp_t[WT_TIMESTAMP_SIZE];
+#define	WT_DECL_TIMESTAMP(x) wt_timestamp_t x;
+#else
+#define	WT_TIMESTAMP(x) (NULL)
+#define	WT_DECL_TIMESTAMP(x)
+#endif
+
+#define	WT_GET_TIMESTAMP(x) WT_TIMESTAMP((x)->timestamp)
 
 /*
  * In diagnostic mode we track the locations from which hazard pointers and
@@ -276,5 +295,21 @@ union __wt_rand_state {
 	} x;
 };
 
-/* Shared array for converting to hex */
-extern const u_char __wt_hex[];
+/*
+ * WT_TAILQ_SAFE_REMOVE_BEGIN/END --
+ *	Macro to safely walk a TAILQ where we're expecting some underlying
+ * function to remove elements from the list, but we don't want to stop on
+ * error, nor do we want an error to turn into an infinite loop. Used during
+ * shutdown, when we're shutting down various lists. Unlike TAILQ_FOREACH_SAFE,
+ * this macro works even when the next element gets removed along with the
+ * current one.
+ */
+#define	WT_TAILQ_SAFE_REMOVE_BEGIN(var, head, field, tvar)		\
+	for ((tvar) = NULL; ((var) = TAILQ_FIRST(head)) != NULL;	\
+	    (tvar) = (var)) {						\
+		if ((tvar) == (var)) {					\
+			/* Leak the structure. */			\
+			TAILQ_REMOVE(head, (var), field);		\
+			continue;					\
+		}
+#define	WT_TAILQ_SAFE_REMOVE_END }

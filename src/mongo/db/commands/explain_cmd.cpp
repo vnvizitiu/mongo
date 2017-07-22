@@ -31,7 +31,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -52,10 +51,9 @@ namespace {
  * This command like a dispatcher: it just retrieves a pointer to the nested command and invokes
  * its explain() implementation.
  */
-class CmdExplain : public Command {
+class CmdExplain : public BasicCommand {
 public:
-    CmdExplain() : Command("explain") {}
-
+    CmdExplain() : BasicCommand("explain") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -84,12 +82,26 @@ public:
         help << "explain database reads and writes";
     }
 
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        uassert(ErrorCodes::BadValue,
+                "explain command requires a nested object",
+                Object == cmdObj.firstElement().type());
+        auto explainObj = cmdObj.firstElement().Obj();
+
+        Command* commToExplain = Command::findCommand(explainObj.firstElementFieldName());
+        uassert(ErrorCodes::CommandNotFound,
+                str::stream() << "explain failed due to unknown command: "
+                              << explainObj.firstElementFieldName(),
+                commToExplain);
+        return commToExplain->parseNs(dbname, explainObj);
+    }
+
     /**
      * You are authorized to run an explain if you are authorized to run
      * the command that you are explaining. The auth check is performed recursively
      * on the nested command.
      */
-    virtual Status checkAuthForOperation(OperationContext* txn,
+    virtual Status checkAuthForOperation(OperationContext* opCtx,
                                          const std::string& dbname,
                                          const BSONObj& cmdObj) {
         if (Object != cmdObj.firstElement().type()) {
@@ -105,23 +117,29 @@ public:
             return Status(ErrorCodes::CommandNotFound, ss);
         }
 
-        return commToExplain->checkAuthForOperation(txn, dbname, explainObj);
+        return commToExplain->checkAuthForRequest(
+            opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(explainObj)));
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        ExplainCommon::Verbosity verbosity;
-        Status parseStatus = ExplainCommon::parseCmdBSON(cmdObj, &verbosity);
-        if (!parseStatus.isOK()) {
-            return appendCommandStatus(result, parseStatus);
+        auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
+        if (!verbosity.isOK()) {
+            return appendCommandStatus(result, verbosity.getStatus());
         }
 
         // This is the nested command which we are explaining.
         BSONObj explainObj = cmdObj.firstElement().Obj();
+
+        if (auto innerDb = explainObj["$db"]) {
+            uassert(ErrorCodes::InvalidNamespace,
+                    str::stream() << "Mismatched $db in explain command. Expected " << dbname
+                                  << " but got "
+                                  << innerDb.checkAndGetStringData(),
+                    innerDb.checkAndGetStringData() == dbname);
+        }
 
         Command* commToExplain = Command::findCommand(explainObj.firstElementFieldName());
         if (NULL == commToExplain) {
@@ -135,12 +153,12 @@ public:
         // copied from Command::execCommand and should be abstracted. Until then, make
         // sure to keep it up to date.
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        bool iAmPrimary = replCoord->canAcceptWritesForDatabase(dbname);
+        bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
         bool commandCanRunOnSecondary = commToExplain->slaveOk();
 
         bool commandIsOverriddenToRunOnSecondary = commToExplain->slaveOverrideOk() &&
-            rpc::ServerSelectionMetadata::get(txn).canRunOnSecondary();
-        bool iAmStandalone = !txn->writesAreReplicated();
+            ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
+        bool iAmStandalone = !opCtx->writesAreReplicated();
 
         const bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
             commandIsOverriddenToRunOnSecondary || iAmStandalone;
@@ -154,8 +172,8 @@ public:
         }
 
         // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(
-            txn, dbname, explainObj, verbosity, rpc::ServerSelectionMetadata::get(txn), &result);
+        Status explainStatus =
+            commToExplain->explain(opCtx, dbname, explainObj, verbosity.getValue(), &result);
         if (!explainStatus.isOK()) {
             return appendCommandStatus(result, explainStatus);
         }

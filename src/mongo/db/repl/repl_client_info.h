@@ -45,11 +45,15 @@ class ReplClientInfo {
 public:
     static const Client::Decoration<ReplClientInfo> forClient;
 
-    void setLastOp(const OpTime& op) {
-        _lastOp = op;
-    }
+    void setLastOp(const OpTime& op);
+
     OpTime getLastOp() const {
         return _lastOp;
+    }
+
+    // Resets the last op on this client; should only be used in testing.
+    void clearLastOp_forTest() {
+        _lastOp = OpTime();
     }
 
     void setLastSnapshot(SnapshotName name) {
@@ -72,7 +76,7 @@ public:
      * This is necessary when doing no-op writes, as we need to set the client's lastOp to a proper
      * value for write concern wait to work.
      */
-    void setLastOpToSystemLastOpTime(OperationContext* txn);
+    void setLastOpToSystemLastOpTime(OperationContext* opCtx);
 
 private:
     static const long long kUninitializedTerm = -1;

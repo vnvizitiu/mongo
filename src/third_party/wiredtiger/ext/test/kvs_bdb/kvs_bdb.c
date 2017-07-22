@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2016 MongoDB, Inc.
+ * Public Domain 2014-2017 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -1016,9 +1016,10 @@ wiredtiger_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *config)
 {
 	/*
 	 * List of the WT_DATA_SOURCE methods -- it's static so it breaks at
-	 * compile-time should the structure changes underneath us.
+	 * compile-time should the structure change underneath us.
 	 */
 	static WT_DATA_SOURCE wtds = {
+		NULL,				/* No session.alter */
 		kvs_session_create,		/* session.create */
 		NULL,				/* No session.compaction */
 		kvs_session_drop,		/* session.drop */

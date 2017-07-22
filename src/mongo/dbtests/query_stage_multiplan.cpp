@@ -42,6 +42,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -58,7 +59,7 @@ namespace mongo {
 const std::unique_ptr<ClockSource> clockSource = stdx::make_unique<ClockSourceMock>();
 
 // How we access the external setParameter testing bool.
-extern std::atomic<bool> internalQueryForceIntersectionPlans;  // NOLINT
+extern AtomicBool internalQueryForceIntersectionPlans;
 
 }  // namespace mongo
 
@@ -83,38 +84,38 @@ QuerySolution* createQuerySolution() {
 
 class QueryStageMultiPlanBase {
 public:
-    QueryStageMultiPlanBase() : _client(&_txn) {
-        OldClientWriteContext ctx(&_txn, nss.ns());
+    QueryStageMultiPlanBase() : _client(&_opCtx) {
+        OldClientWriteContext ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
     }
 
     virtual ~QueryStageMultiPlanBase() {
-        OldClientWriteContext ctx(&_txn, nss.ns());
+        OldClientWriteContext ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_txn, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
     }
 
     void insert(const BSONObj& obj) {
-        OldClientWriteContext ctx(&_txn, nss.ns());
+        OldClientWriteContext ctx(&_opCtx, nss.ns());
         _client.insert(nss.ns(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        OldClientWriteContext ctx(&_txn, nss.ns());
+        OldClientWriteContext ctx(&_opCtx, nss.ns());
         _client.remove(nss.ns(), obj);
     }
 
-    OperationContext* txn() {
-        return &_txn;
+    OperationContext* opCtx() {
+        return &_opCtx;
     }
 
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
-    OperationContext& _txn = *_txnPtr;
-    ClockSource* const _clock = _txn.getServiceContext()->getFastClockSource();
+    OperationContext& _opCtx = *_txnPtr;
+    ClockSource* const _clock = _opCtx.getServiceContext()->getFastClockSource();
 
     DBDirectClient _client;
 };
@@ -132,14 +133,15 @@ public:
 
         addIndex(BSON("foo" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
         const Collection* coll = ctx.getCollection();
 
         // Plan 0: IXScan over foo == 7
         // Every call to work() returns something so this should clearly win (by current scoring
         // at least).
         std::vector<IndexDescriptor*> indexes;
-        coll->getIndexCatalog()->findIndexesByKeyPattern(&_txn, BSON("foo" << 1), false, &indexes);
+        coll->getIndexCatalog()->findIndexesByKeyPattern(
+            &_opCtx, BSON("foo" << 1), false, &indexes);
         ASSERT_EQ(indexes.size(), 1U);
 
         IndexScanParams ixparams;
@@ -151,8 +153,8 @@ public:
         ixparams.direction = 1;
 
         unique_ptr<WorkingSet> sharedWs(new WorkingSet());
-        IndexScan* ix = new IndexScan(&_txn, ixparams, sharedWs.get(), NULL);
-        unique_ptr<PlanStage> firstRoot(new FetchStage(&_txn, sharedWs.get(), ix, NULL, coll));
+        IndexScan* ix = new IndexScan(&_opCtx, ixparams, sharedWs.get(), NULL);
+        unique_ptr<PlanStage> firstRoot(new FetchStage(&_opCtx, sharedWs.get(), ix, NULL, coll));
 
         // Plan 1: CollScan with matcher.
         CollectionScanParams csparams;
@@ -168,37 +170,37 @@ public:
         unique_ptr<MatchExpression> filter = std::move(statusWithMatcher.getValue());
         // Make the stage.
         unique_ptr<PlanStage> secondRoot(
-            new CollectionScan(&_txn, csparams, sharedWs.get(), filter.get()));
+            new CollectionScan(&_opCtx, csparams, sharedWs.get(), filter.get()));
 
         // Hand the plans off to the MPS.
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(BSON("foo" << 7));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         verify(NULL != cq.get());
 
         unique_ptr<MultiPlanStage> mps =
-            make_unique<MultiPlanStage>(&_txn, ctx.getCollection(), cq.get());
+            make_unique<MultiPlanStage>(&_opCtx, ctx.getCollection(), cq.get());
         mps->addPlan(createQuerySolution(), firstRoot.release(), sharedWs.get());
         mps->addPlan(createQuerySolution(), secondRoot.release(), sharedWs.get());
 
         // Plan 0 aka the first plan aka the index scan should be the best.
-        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, _clock);
-        mps->pickBestPlan(&yieldPolicy);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+        mps->pickBestPlan(&yieldPolicy).transitional_ignore();
         ASSERT(mps->bestPlanChosen());
         ASSERT_EQUALS(0, mps->bestPlanIdx());
 
         // Takes ownership of arguments other than 'collection'.
-        auto statusWithPlanExecutor = PlanExecutor::make(&_txn,
+        auto statusWithPlanExecutor = PlanExecutor::make(&_opCtx,
                                                          std::move(sharedWs),
                                                          std::move(mps),
                                                          std::move(cq),
                                                          coll,
-                                                         PlanExecutor::YIELD_MANUAL);
+                                                         PlanExecutor::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
-        std::unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         // Get all our results out.
         int results = 0;
@@ -225,7 +227,7 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
         Collection* collection = ctx.getCollection();
 
         // Query for both 'a' and 'b' and sort on 'b'.
@@ -233,18 +235,18 @@ public:
         qr->setFilter(BSON("a" << 1 << "b" << 1));
         qr->setSort(BSON("b" << 1));
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         verify(statusWithCQ.isOK());
         unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
         ASSERT(NULL != cq.get());
 
         // Force index intersection.
-        bool forceIxisectOldValue = internalQueryForceIntersectionPlans;
-        internalQueryForceIntersectionPlans = true;
+        bool forceIxisectOldValue = internalQueryForceIntersectionPlans.load();
+        internalQueryForceIntersectionPlans.store(true);
 
         // Get planner params.
         QueryPlannerParams plannerParams;
-        fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
+        fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
         // Turn this off otherwise it pops up in some plans.
         plannerParams.options &= ~QueryPlannerParams::KEEP_MUTATIONS;
 
@@ -258,19 +260,19 @@ public:
         ASSERT_EQUALS(solutions.size(), 3U);
 
         // Fill out the MultiPlanStage.
-        unique_ptr<MultiPlanStage> mps(new MultiPlanStage(&_txn, collection, cq.get()));
+        unique_ptr<MultiPlanStage> mps(new MultiPlanStage(&_opCtx, collection, cq.get()));
         unique_ptr<WorkingSet> ws(new WorkingSet());
         // Put each solution from the planner into the MPR.
         for (size_t i = 0; i < solutions.size(); ++i) {
             PlanStage* root;
-            ASSERT(StageBuilder::build(&_txn, collection, *cq, *solutions[i], ws.get(), &root));
+            ASSERT(StageBuilder::build(&_opCtx, collection, *cq, *solutions[i], ws.get(), &root));
             // Takes ownership of 'solutions[i]' and 'root'.
             mps->addPlan(solutions[i], root, ws.get());
         }
 
         // This sets a backup plan.
-        PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL, _clock);
-        mps->pickBestPlan(&yieldPolicy);
+        PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+        mps->pickBestPlan(&yieldPolicy).transitional_ignore();
         ASSERT(mps->bestPlanChosen());
         ASSERT(mps->hasBackupPlan());
 
@@ -308,7 +310,7 @@ public:
             soln->root.get()));
 
         // Restore index intersection force parameter.
-        internalQueryForceIntersectionPlans = forceIxisectOldValue;
+        internalQueryForceIntersectionPlans.store(forceIxisectOldValue);
     }
 };
 
@@ -322,8 +324,8 @@ public:
         const int nDocs = 500;
 
         auto ws = stdx::make_unique<WorkingSet>();
-        auto firstPlan = stdx::make_unique<QueuedDataStage>(&_txn, ws.get());
-        auto secondPlan = stdx::make_unique<QueuedDataStage>(&_txn, ws.get());
+        auto firstPlan = stdx::make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto secondPlan = stdx::make_unique<QueuedDataStage>(&_opCtx, ws.get());
 
         for (int i = 0; i < nDocs; ++i) {
             addMember(firstPlan.get(), ws.get(), BSON("x" << 1));
@@ -333,14 +335,14 @@ public:
             secondPlan->pushBack(PlanStage::NEED_TIME);
         }
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
 
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(BSON("x" << 1));
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
-            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
+            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
         unique_ptr<MultiPlanStage> mps =
-            make_unique<MultiPlanStage>(&_txn, ctx.getCollection(), cq.get());
+            make_unique<MultiPlanStage>(&_opCtx, ctx.getCollection(), cq.get());
 
         // Put each plan into the MultiPlanStage. Takes ownership of 'firstPlan' and 'secondPlan'.
         auto firstSoln = stdx::make_unique<QuerySolution>();
@@ -350,7 +352,7 @@ public:
 
         // Making a PlanExecutor chooses the best plan.
         auto exec = uassertStatusOK(PlanExecutor::make(
-            &_txn, std::move(ws), std::move(mps), ctx.getCollection(), PlanExecutor::YIELD_MANUAL));
+            &_opCtx, std::move(ws), std::move(mps), ctx.getCollection(), PlanExecutor::NO_YIELD));
 
         auto root = static_cast<MultiPlanStage*>(exec->getRootStage());
         ASSERT_TRUE(root->bestPlanChosen());
@@ -359,7 +361,7 @@ public:
 
         BSONObjBuilder bob;
         Explain::explainStages(
-            exec.get(), ctx.getCollection(), ExplainCommon::EXEC_ALL_PLANS, &bob);
+            exec.get(), ctx.getCollection(), ExplainOptions::Verbosity::kExecAllPlans, &bob);
         BSONObj explained = bob.done();
 
         ASSERT_EQ(explained["executionStats"]["nReturned"].Int(), nDocs);
@@ -367,7 +369,7 @@ public:
         auto allPlansStats = explained["executionStats"]["allPlansExecution"].Array();
         ASSERT_EQ(allPlansStats.size(), 2UL);
         for (auto&& planStats : allPlansStats) {
-            int maxEvaluationResults = internalQueryPlanEvaluationMaxResults;
+            int maxEvaluationResults = internalQueryPlanEvaluationMaxResults.load();
             ASSERT_EQ(planStats["executionStages"]["stage"].String(), "QUEUED_DATA");
             if (planStats["executionStages"]["needTime"].Int() > 0) {
                 // This is the losing plan. Should only have advanced about half the time.
@@ -408,20 +410,20 @@ public:
         addIndex(BSON("foo" << 1));
         addIndex(BSON("foo" << -1 << "bar" << 1));
 
-        AutoGetCollectionForRead ctx(&_txn, nss.ns());
+        AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
         Collection* coll = ctx.getCollection();
 
         // Create the executor (Matching all documents).
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(BSON("foo" << BSON("$gte" << 0)));
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(
-            txn(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
+            opCtx(), std::move(qr), ExtensionsCallbackDisallowExtensions()));
         auto exec =
-            uassertStatusOK(getExecutor(&_txn, coll, std::move(cq), PlanExecutor::YIELD_MANUAL));
+            uassertStatusOK(getExecutor(&_opCtx, coll, std::move(cq), PlanExecutor::NO_YIELD));
 
         ASSERT_EQ(exec->getRootStage()->stageType(), STAGE_MULTI_PLAN);
 
-        exec->executePlan();
+        exec->executePlan().transitional_ignore();
 
         PlanSummaryStats stats;
         Explain::getSummaryStats(*exec, &stats);

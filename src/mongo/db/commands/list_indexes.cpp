@@ -31,13 +31,13 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
@@ -74,7 +74,7 @@ namespace {
  *   ]
  * }
  */
-class CmdListIndexes : public Command {
+class CmdListIndexes : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -100,7 +100,7 @@ public:
 
         // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
         // 3.0 systems.
-        NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
                                                            ActionType::listIndexes) ||
             authzSession->isAuthorizedForActionsOnResource(
@@ -114,16 +114,13 @@ public:
                                     << ns.coll());
     }
 
-    CmdListIndexes() : Command("listIndexes") {}
+    CmdListIndexes() : BasicCommand("listIndexes") {}
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
-
+        const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
         long long batchSize;
         Status parseCursorStatus =
@@ -132,58 +129,37 @@ public:
             return appendCommandStatus(result, parseCursorStatus);
         }
 
-        AutoGetCollectionForRead autoColl(txn, ns);
+        AutoGetCollectionForReadCommand autoColl(opCtx, ns);
         if (!autoColl.getDb()) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::NamespaceNotFound, "no database"));
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::NamespaceNotFound, "Database " + ns.db() + " doesn't exist"));
         }
 
         const Collection* collection = autoColl.getCollection();
         if (!collection) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::NamespaceNotFound, "no collection"));
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::NamespaceNotFound, "Collection " + ns.ns() + " doesn't exist"));
         }
 
         const CollectionCatalogEntry* cce = collection->getCatalogEntry();
         invariant(cce);
 
         vector<string> indexNames;
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&indexNames, &cce, &opCtx] {
             indexNames.clear();
-            cce->getAllIndexes(txn, &indexNames);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
+            cce->getAllIndexes(opCtx, &indexNames);
+        });
 
         auto ws = make_unique<WorkingSet>();
-        auto root = make_unique<QueuedDataStage>(txn, ws.get());
+        auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
 
         for (size_t i = 0; i < indexNames.size(); i++) {
-            BSONObj indexSpec;
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                indexSpec = cce->getIndexSpec(txn, indexNames[i]);
-            }
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
-
-            if (ns.ns() == FeatureCompatibilityVersion::kCollection &&
-                indexNames[i] == FeatureCompatibilityVersion::k32IncompatibleIndexName) {
-                BSONObjBuilder bob;
-
-                for (auto&& indexSpecElem : indexSpec) {
-                    auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
-                    if (indexSpecElemFieldName == IndexDescriptor::kIndexVersionFieldName) {
-                        // Include the index version in the command response as a decimal type
-                        // instead of as a 32-bit integer. This is a new BSON type that isn't
-                        // supported by versions of MongoDB earlier than 3.4 that will cause 3.2
-                        // secondaries to crash when performing initial sync.
-                        bob.append(IndexDescriptor::kIndexVersionFieldName,
-                                   indexSpecElem.numberDecimal());
-                    } else {
-                        bob.append(indexSpecElem);
-                    }
-                }
-
-                indexSpec = bob.obj();
-            }
+            BSONObj indexSpec =
+                writeConflictRetry(opCtx, "listIndexes", ns.ns(), [&cce, &opCtx, &indexNames, i] {
+                    return cce->getIndexSpec(opCtx, indexNames[i]);
+                });
 
             WorkingSetID id = ws->allocate();
             WorkingSetMember* member = ws->get(id);
@@ -198,11 +174,11 @@ public:
         dassert(ns == cursorNss.getTargetNSForListIndexes());
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            txn, std::move(ws), std::move(root), cursorNss.ns(), PlanExecutor::YIELD_MANUAL);
+            opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
-        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         BSONArrayBuilder firstBatch;
 
@@ -227,12 +203,14 @@ public:
         if (!exec->isEOF()) {
             exec->saveState();
             exec->detachFromOperationContext();
-            ClientCursor* cursor =
-                new ClientCursor(CursorManager::getGlobalCursorManager(),
-                                 exec.release(),
-                                 cursorNss.ns(),
-                                 txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
-            cursorId = cursor->cursorid();
+            auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 cursorNss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 cmdObj});
+            cursorId = pinnedCursor.getCursor()->cursorid();
         }
 
         appendCursorResponseObject(cursorId, cursorNss.ns(), firstBatch.arr(), &result);

@@ -65,9 +65,21 @@ public:
         return _expressions[i];
     }
 
+    /*
+     * Replaces the ith child with nullptr, and releases ownership of the child.
+     */
     virtual std::unique_ptr<MatchExpression> releaseChild(size_t i) {
         auto child = std::unique_ptr<MatchExpression>(_expressions[i]);
         _expressions[i] = nullptr;
+        return child;
+    }
+
+    /*
+     * Removes the ith child, and releases ownership of the child.
+     */
+    virtual std::unique_ptr<MatchExpression> removeChild(size_t i) {
+        auto child = std::unique_ptr<MatchExpression>(_expressions[i]);
+        _expressions.erase(_expressions.begin() + i);
         return child;
     }
 
@@ -76,6 +88,10 @@ public:
     }
 
     bool equivalent(const MatchExpression* other) const;
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
+    }
 
 protected:
     void _debugList(StringBuilder& debug, int level) const;
@@ -172,7 +188,7 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<NotMatchExpression> self = stdx::make_unique<NotMatchExpression>();
-        self->init(_exp->shallowClone().release());
+        self->init(_exp->shallowClone().release()).transitional_ignore();
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
@@ -207,6 +223,10 @@ public:
 
     void resetChild(MatchExpression* newChild) {
         _exp.reset(newChild);
+    }
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
     }
 
 private:

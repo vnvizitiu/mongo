@@ -36,8 +36,8 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/update/log_builder.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -84,28 +84,6 @@ private:
     BSONObj _modObj;
     ModifierAddToSet _mod;
 };
-
-TEST(Init, FailToInitWithInvalidValue) {
-    BSONObj modObj;
-    ModifierAddToSet mod;
-
-    modObj = fromjson("{ $addToSet : { a : { 'x.$.y' : 'bad' } } }");
-    ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                           ModifierInterface::Options::normal()));
-    modObj = fromjson("{ $addToSet : { a : { $each : [ { 'x.$.y' : 'bad' } ] } } }");
-    ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                           ModifierInterface::Options::normal()));
-
-    // An int is not valid after $each
-    modObj = fromjson("{ $addToSet : { a : { $each : 0 } } }");
-    ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                           ModifierInterface::Options::normal()));
-
-    // An object is not valid after $each
-    modObj = fromjson("{ $addToSet : { a : { $each : { a : 1 } } } }");
-    ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                           ModifierInterface::Options::normal()));
-}
 
 TEST(Init, ParsesSimple) {
     Mod(fromjson("{ $addToSet : { a : 1 } }"));

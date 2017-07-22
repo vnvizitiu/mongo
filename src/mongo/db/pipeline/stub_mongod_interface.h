@@ -75,6 +75,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    Status appendRecordCount(const NamespaceString& nss, BSONObjBuilder* builder) const override {
+        MONGO_UNREACHABLE;
+    }
+
     BSONObj getCollectionOptions(const NamespaceString& nss) override {
         MONGO_UNREACHABLE;
     }
@@ -87,9 +91,19 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    StatusWith<boost::intrusive_ptr<Pipeline>> makePipeline(
+    StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx) override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<BSONObj> getCurrentOps(CurrentOpConnectionsMode connMode,
+                                       CurrentOpUserMode userMode,
+                                       CurrentOpTruncateMode truncateMode) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::string getShardName(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
 };

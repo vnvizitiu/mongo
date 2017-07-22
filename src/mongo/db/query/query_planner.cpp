@@ -240,17 +240,18 @@ static BSONObj finishMaxObj(const IndexEntry& indexEntry,
 QuerySolution* buildCollscanSoln(const CanonicalQuery& query,
                                  bool tailable,
                                  const QueryPlannerParams& params) {
-    QuerySolutionNode* solnRoot = QueryPlannerAccess::makeCollectionScan(query, tailable, params);
-    return QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+    std::unique_ptr<QuerySolutionNode> solnRoot(
+        QueryPlannerAccess::makeCollectionScan(query, tailable, params));
+    return QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
 }
 
 QuerySolution* buildWholeIXSoln(const IndexEntry& index,
                                 const CanonicalQuery& query,
                                 const QueryPlannerParams& params,
                                 int direction = 1) {
-    QuerySolutionNode* solnRoot =
-        QueryPlannerAccess::scanWholeIndex(index, query, params, direction);
-    return QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+    std::unique_ptr<QuerySolutionNode> solnRoot(
+        QueryPlannerAccess::scanWholeIndex(index, query, params, direction));
+    return QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
 }
 
 bool providesSort(const CanonicalQuery& query, const BSONObj& kp) {
@@ -272,7 +273,8 @@ Status QueryPlanner::cacheDataFromTaggedTree(const MatchExpression* const tagged
 
     unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
 
-    if (NULL != taggedTree->getTag()) {
+    if (taggedTree->getTag() &&
+        taggedTree->getTag()->getType() == MatchExpression::TagData::Type::IndexTag) {
         IndexTag* itag = static_cast<IndexTag*>(taggedTree->getTag());
         if (itag->index >= relevantIndices.size()) {
             mongoutils::str::stream ss;
@@ -295,6 +297,33 @@ Status QueryPlanner::cacheDataFromTaggedTree(const MatchExpression* const tagged
         indexTree->entry.reset(ientry);
         indexTree->index_pos = itag->pos;
         indexTree->canCombineBounds = itag->canCombineBounds;
+    } else if (taggedTree->getTag() &&
+               taggedTree->getTag()->getType() == MatchExpression::TagData::Type::OrPushdownTag) {
+        OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(taggedTree->getTag());
+
+        if (orPushdownTag->getIndexTag()) {
+            const IndexTag* itag = static_cast<const IndexTag*>(orPushdownTag->getIndexTag());
+
+            if (is2DIndex(relevantIndices[itag->index].keyPattern)) {
+                return Status(ErrorCodes::BadValue, "can't cache '2d' index");
+            }
+
+            std::unique_ptr<IndexEntry> indexEntry =
+                stdx::make_unique<IndexEntry>(relevantIndices[itag->index]);
+            indexTree->entry.reset(indexEntry.release());
+            indexTree->index_pos = itag->pos;
+            indexTree->canCombineBounds = itag->canCombineBounds;
+        }
+
+        for (const auto& dest : orPushdownTag->getDestinations()) {
+            PlanCacheIndexTree::OrPushdown orPushdown;
+            orPushdown.route = dest.route;
+            IndexTag* indexTag = static_cast<IndexTag*>(dest.tagData.get());
+            orPushdown.indexName = relevantIndices[indexTag->index].name;
+            orPushdown.position = indexTag->pos;
+            orPushdown.canCombineBounds = indexTag->canCombineBounds;
+            indexTree->orPushdowns.push_back(std::move(orPushdown));
+        }
     }
 
     for (size_t i = 0; i < taggedTree->numChildren(); ++i) {
@@ -342,15 +371,39 @@ Status QueryPlanner::tagAccordingToCache(MatchExpression* filter,
         }
     }
 
-    if (NULL != indexTree->entry.get()) {
+    if (!indexTree->orPushdowns.empty()) {
+        filter->setTag(new OrPushdownTag());
+        OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
+        for (const auto& orPushdown : indexTree->orPushdowns) {
+            auto index = indexMap.find(orPushdown.indexName);
+            if (index == indexMap.end()) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "Did not find index with name: "
+                                            << orPushdown.indexName);
+            }
+            OrPushdownTag::Destination dest;
+            dest.route = orPushdown.route;
+            dest.tagData = stdx::make_unique<IndexTag>(
+                index->second, orPushdown.position, orPushdown.canCombineBounds);
+            orPushdownTag->addDestination(std::move(dest));
+        }
+    }
+
+    if (indexTree->entry.get()) {
         map<StringData, size_t>::const_iterator got = indexMap.find(indexTree->entry->name);
         if (got == indexMap.end()) {
             mongoutils::str::stream ss;
             ss << "Did not find index with name: " << indexTree->entry->name;
             return Status(ErrorCodes::BadValue, ss);
         }
-        filter->setTag(
-            new IndexTag(got->second, indexTree->index_pos, indexTree->canCombineBounds));
+        if (filter->getTag()) {
+            OrPushdownTag* orPushdownTag = static_cast<OrPushdownTag*>(filter->getTag());
+            orPushdownTag->setIndexTag(
+                new IndexTag(got->second, indexTree->index_pos, indexTree->canCombineBounds));
+        } else {
+            filter->setTag(
+                new IndexTag(got->second, indexTree->index_pos, indexTree->canCombineBounds));
+        }
     }
 
     return Status::OK();
@@ -420,14 +473,14 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
         return s;
     }
 
-    // The planner requires a defined sort order.
-    sortUsingTags(clone.get());
+    // The MatchExpression tree is in canonical order. We must order the nodes for access planning.
+    prepareForAccessPlanning(clone.get());
 
     LOG(5) << "Tagged tree:" << endl << redact(clone->toString());
 
     // Use the cached index assignments to build solnRoot.
-    QuerySolutionNode* solnRoot = QueryPlannerAccess::buildIndexedDataAccess(
-        query, clone.release(), false, params.indices, params);
+    std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
+        query, clone.release(), false, params.indices, params));
 
     if (!solnRoot) {
         return Status(ErrorCodes::BadValue,
@@ -436,7 +489,8 @@ Status QueryPlanner::planFromCache(const CanonicalQuery& query,
     }
 
     // Takes ownership of 'solnRoot'.
-    QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+    QuerySolution* soln =
+        QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
     if (!soln) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "Failed to analyze plan from cache. Query: "
@@ -680,10 +734,12 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         LOG(5) << "Max/min query using index " << params.indices[idxNo].toString();
 
         // Make our scan and output.
-        QuerySolutionNode* solnRoot = QueryPlannerAccess::makeIndexScan(
-            params.indices[idxNo], query, params, finishedMinObj, finishedMaxObj);
+        std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::makeIndexScan(
+            params.indices[idxNo], query, params, finishedMinObj, finishedMaxObj));
+        invariant(solnRoot);
 
-        QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+        QuerySolution* soln =
+            QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
         if (NULL != soln) {
             out->push_back(soln);
         }
@@ -776,16 +832,16 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
         enumParams.indices = &relevantIndices;
 
         PlanEnumerator isp(enumParams);
-        isp.init();
+        isp.init().transitional_ignore();
 
         MatchExpression* rawTree;
         while (isp.getNext(&rawTree) && (out->size() < params.maxIndexedSolutions)) {
             LOG(5) << "About to build solntree from tagged tree:" << endl
                    << redact(rawTree->toString());
 
-            // Store the plan cache index tree before sorting using index tags, so that the
-            // PlanCacheIndexTree has the same sort as the MatchExpression used to generate the plan
-            // cache key.
+            // Store the plan cache index tree before calling prepareForAccessingPlanning(), so that
+            // the PlanCacheIndexTree has the same sort as the MatchExpression used to generate the
+            // plan cache key.
             std::unique_ptr<MatchExpression> clone(rawTree->shallowClone());
             PlanCacheIndexTree* cacheData;
             Status indexTreeStatus =
@@ -795,17 +851,20 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
             }
             unique_ptr<PlanCacheIndexTree> autoData(cacheData);
 
-            sortUsingTags(rawTree);
+            // We have already cached the tree in canonical order, so now we can order the nodes for
+            // access planning.
+            prepareForAccessPlanning(rawTree);
 
             // This can fail if enumeration makes a mistake.
-            QuerySolutionNode* solnRoot = QueryPlannerAccess::buildIndexedDataAccess(
-                query, rawTree, false, relevantIndices, params);
+            std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
+                query, rawTree, false, relevantIndices, params));
 
-            if (NULL == solnRoot) {
+            if (!solnRoot) {
                 continue;
             }
 
-            QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(query, params, solnRoot);
+            QuerySolution* soln =
+                QueryPlannerAnalysis::analyzeDataAccess(query, params, std::move(solnRoot));
             if (NULL != soln) {
                 LOG(5) << "Planner: adding solution:" << endl << redact(soln->toString());
                 if (indexTreeStatus.isOK()) {
@@ -841,10 +900,13 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
     // desired behavior when an index is hinted that is not relevant to the query.
     if (!hintIndex.isEmpty()) {
         if (0 == out->size()) {
-            QuerySolution* soln = buildWholeIXSoln(params.indices[*hintIndexNumber], query, params);
-            verify(NULL != soln);
-            LOG(5) << "Planner: outputting soln that uses hinted index as scan.";
-            out->push_back(soln);
+            // Push hinted index solution to output list if found. It is possible to end up without
+            // a solution in the case where a filtering QueryPlannerParams argument, such as
+            // NO_BLOCKING_SORT, leads to its exclusion.
+            if (auto soln = buildWholeIXSoln(params.indices[*hintIndexNumber], query, params)) {
+                LOG(5) << "Planner: outputting soln that uses hinted index as scan.";
+                out->push_back(soln);
+            }
         }
         return Status::OK();
     }
@@ -936,6 +998,40 @@ Status QueryPlanner::plan(const CanonicalQuery& query,
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    // If a projection exists, there may be an index that allows for a covered plan, even if none
+    // were considered earlier.
+    const auto projection = query.getProj();
+    if (params.options & QueryPlannerParams::GENERATE_COVERED_IXSCANS && out->size() == 0 &&
+        query.getQueryObj().isEmpty() && projection && !projection->requiresDocument()) {
+
+        const auto* indicesToConsider = hintIndex.isEmpty() ? &params.indices : &relevantIndices;
+        for (auto&& index : *indicesToConsider) {
+            if (index.type != INDEX_BTREE || index.multikey || index.sparse || index.filterExpr ||
+                !CollatorInterface::collatorsMatch(index.collator, query.getCollator())) {
+                continue;
+            }
+
+            QueryPlannerParams paramsForCoveredIxScan;
+            paramsForCoveredIxScan.options =
+                params.options | QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
+            auto soln = buildWholeIXSoln(index, query, paramsForCoveredIxScan);
+            if (soln) {
+                LOG(5) << "Planner: outputting soln that uses index to provide projection.";
+                PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();
+                indexTree->setIndexEntry(index);
+
+                SolutionCacheData* scd = new SolutionCacheData();
+                scd->tree.reset(indexTree);
+                scd->solnType = SolutionCacheData::WHOLE_IXSCAN_SOLN;
+                scd->wholeIXSolnDir = 1;
+                soln->cacheData.reset(scd);
+
+                out->push_back(soln);
+                break;
             }
         }
     }

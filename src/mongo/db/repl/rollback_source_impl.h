@@ -58,13 +58,16 @@ public:
 
     const OplogInterface& getOplog() const override;
 
+    const HostAndPort& getSource() const override;
+
     int getRollbackId() const override;
 
     BSONObj getLastOperation() const override;
 
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-    void copyCollectionFromRemote(OperationContext* txn, const NamespaceString& nss) const override;
+    void copyCollectionFromRemote(OperationContext* opCtx,
+                                  const NamespaceString& nss) const override;
 
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 

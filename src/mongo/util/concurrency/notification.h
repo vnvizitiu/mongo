@@ -30,6 +30,7 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/db/operation_context.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
@@ -37,8 +38,6 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-class OperationContext;
 
 /**
  * Allows waiting for a result returned from an asynchronous operation.
@@ -67,8 +66,10 @@ public:
      * If the notification has been set, returns immediately. Otherwise blocks until it becomes set.
      * If the wait is interrupted, throws an exception.
      */
-    T& get(OperationContext* txn) {
-        return get();
+    T& get(OperationContext* opCtx) {
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        opCtx->waitForConditionOrInterrupt(_condVar, lock, [this]() -> bool { return !!_value; });
+        return _value.get();
     }
 
     /**
@@ -99,12 +100,10 @@ public:
      * If the notification is not set, blocks either until it becomes set or until the waitTimeout
      * expires. If the wait is interrupted, throws an exception. Otherwise, returns immediately.
      */
-    bool waitFor(OperationContext* txn, Microseconds waitTimeout) {
-        const auto waitDeadline = Date_t::now() + waitTimeout;
-
+    bool waitFor(OperationContext* opCtx, Milliseconds waitTimeout) {
         stdx::unique_lock<stdx::mutex> lock(_mutex);
-        return _condVar.wait_until(
-            lock, waitDeadline.toSystemTimePoint(), [&]() { return !!_value; });
+        return opCtx->waitForConditionOrInterruptFor(
+            _condVar, lock, waitTimeout, [&]() { return !!_value; });
     }
 
 private:
@@ -122,8 +121,8 @@ public:
         return _notification.operator bool();
     }
 
-    void get(OperationContext* txn) {
-        _notification.get(txn);
+    void get(OperationContext* opCtx) {
+        _notification.get(opCtx);
     }
 
     void get() {
@@ -134,8 +133,8 @@ public:
         _notification.set(true);
     }
 
-    bool waitFor(OperationContext* txn, Microseconds waitTimeout) {
-        return _notification.waitFor(txn, waitTimeout);
+    bool waitFor(OperationContext* opCtx, Milliseconds waitTimeout) {
+        return _notification.waitFor(opCtx, waitTimeout);
     }
 
 private:

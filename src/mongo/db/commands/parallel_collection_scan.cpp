@@ -36,6 +36,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
@@ -48,7 +49,7 @@ using stdx::make_unique;
 
 namespace {
 
-class ParallelCollectionScanCmd : public Command {
+class ParallelCollectionScanCmd : public BasicCommand {
 public:
     struct ExtentInfo {
         ExtentInfo(RecordId dl, size_t s) : diskLoc(dl), size(s) {}
@@ -56,7 +57,7 @@ public:
         size_t size;
     };
 
-    ParallelCollectionScanCmd() : Command("parallelCollectionScan") {}
+    ParallelCollectionScanCmd() : BasicCommand("parallelCollectionScan") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -65,7 +66,7 @@ public:
         return true;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -84,15 +85,13 @@ public:
         return Status(ErrorCodes::Unauthorized, "Unauthorized");
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNs(dbname, cmdObj));
+        const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
 
-        AutoGetCollectionForRead ctx(txn, ns.ns());
+        AutoGetCollectionForReadCommand ctx(opCtx, ns);
 
         Collection* collection = ctx.getCollection();
         if (!collection)
@@ -110,20 +109,20 @@ public:
                                                   << " was: "
                                                   << numCursors));
 
-        auto iterators = collection->getManyCursors(txn);
+        auto iterators = collection->getManyCursors(opCtx);
         if (iterators.size() < numCursors) {
             numCursors = iterators.size();
         }
 
-        std::vector<std::unique_ptr<PlanExecutor>> execs;
+        std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;
         for (size_t i = 0; i < numCursors; i++) {
             unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
             unique_ptr<MultiIteratorStage> mis =
-                make_unique<MultiIteratorStage>(txn, ws.get(), collection);
+                make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
 
             // Takes ownership of 'ws' and 'mis'.
             auto statusWithPlanExecutor = PlanExecutor::make(
-                txn, std::move(ws), std::move(mis), collection, PlanExecutor::YIELD_AUTO);
+                opCtx, std::move(ws), std::move(mis), collection, PlanExecutor::YIELD_AUTO);
             invariant(statusWithPlanExecutor.isOK());
             execs.push_back(std::move(statusWithPlanExecutor.getValue()));
         }
@@ -139,25 +138,24 @@ public:
         {
             BSONArrayBuilder bucketsBuilder;
             for (auto&& exec : execs) {
-                // The PlanExecutor was registered on construction due to the YIELD_AUTO policy.
-                // We have to deregister it, as it will be registered with ClientCursor.
-                exec->deregisterExec();
-
                 // Need to save state while yielding locks between now and getMore().
                 exec->saveState();
                 exec->detachFromOperationContext();
 
-                // transfer ownership of an executor to the ClientCursor (which manages its own
-                // lifetime).
-                ClientCursor* cc =
-                    new ClientCursor(collection->getCursorManager(),
-                                     exec.release(),
-                                     ns.ns(),
-                                     txn->recoveryUnit()->isReadingFromMajorityCommittedSnapshot());
-                cc->setLeftoverMaxTimeMicros(txn->getRemainingMaxTimeMicros());
+                // Create and register a new ClientCursor.
+                auto pinnedCursor = collection->getCursorManager()->registerCursor(
+                    opCtx,
+                    {std::move(exec),
+                     ns,
+                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                     cmdObj});
+                pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(
+                    opCtx->getRemainingMaxTimeMicros());
 
                 BSONObjBuilder threadResult;
-                appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &threadResult);
+                appendCursorResponseObject(
+                    pinnedCursor.getCursor()->cursorid(), ns.ns(), BSONArray(), &threadResult);
                 threadResult.appendBool("ok", 1);
 
                 bucketsBuilder.append(threadResult.obj());

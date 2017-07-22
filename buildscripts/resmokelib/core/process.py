@@ -99,8 +99,9 @@ class Process(object):
         and environment.
         """
 
-        # Ensure that executable files on Windows have a ".exe" extension.
-        if sys.platform == "win32" and os.path.splitext(args[0])[1] != ".exe":
+        # Ensure that executable files that don't already have an
+        # extension on Windows have a ".exe" extension.
+        if sys.platform == "win32" and not os.path.splitext(args[0])[1]:
             args[0] += ".exe"
 
         self.logger = logger
@@ -163,12 +164,12 @@ class Process(object):
                 if return_code == win32con.STILL_ACTIVE:
                     raise
 
-    def stop(self):
+    def stop(self, kill=False):
         """Terminate the process."""
         if sys.platform == "win32":
 
             # Attempt to cleanly shutdown mongod.
-            if len(self.args) > 0 and self.args[0].find("mongod") != -1:
+            if not kill and len(self.args) > 0 and self.args[0].find("mongod") != -1:
                 mongo_signal_handle = None
                 try:
                     mongo_signal_handle = win32event.OpenEvent(
@@ -214,7 +215,10 @@ class Process(object):
                     raise
         else:
             try:
-                self._process.terminate()
+                if kill:
+                    self._process.kill()
+                else:
+                    self._process.terminate()
             except OSError as err:
                 # ESRCH (errno=3) is received when the process has already died.
                 if err.errno != 3:

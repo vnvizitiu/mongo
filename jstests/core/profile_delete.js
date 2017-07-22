@@ -31,13 +31,13 @@
     assert.eq(profileObj.ns, coll.getFullName(), tojson(profileObj));
     assert.eq(profileObj.op, "remove", tojson(profileObj));
     if (db.getMongo().writeMode() === "commands") {
-        assert.eq(profileObj.collation, {locale: "fr"}, tojson(profileObj));
+        assert.eq(profileObj.command.collation, {locale: "fr"}, tojson(profileObj));
     }
     assert.eq(profileObj.ndeleted, 1, tojson(profileObj));
     assert.eq(profileObj.keysExamined, 1, tojson(profileObj));
     assert.eq(profileObj.docsExamined, 1, tojson(profileObj));
     assert.eq(profileObj.keysDeleted, 2, tojson(profileObj));
-    assert.eq(profileObj.planSummary, "IXSCAN { a: 1.0 }", tojson(profileObj));
+    assert.eq(profileObj.planSummary, "IXSCAN { a: 1 }", tojson(profileObj));
     assert(profileObj.execStats.hasOwnProperty("stage"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("millis"), tojson(profileObj));
     assert(profileObj.hasOwnProperty("numYield"), tojson(profileObj));

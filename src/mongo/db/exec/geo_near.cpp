@@ -31,6 +31,9 @@
 
 #include "mongo/db/exec/geo_near.h"
 
+#include <memory>
+#include <vector>
+
 // For s2 search
 #include "third_party/s2/s2regionintersection.h"
 
@@ -46,6 +49,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 
 #include <algorithm>
@@ -99,7 +103,7 @@ struct StoredGeometry {
  */
 static void extractGeometries(const BSONObj& doc,
                               const string& path,
-                              vector<StoredGeometry*>* geometries) {
+                              std::vector<std::unique_ptr<StoredGeometry>>* geometries) {
     BSONElementSet geomElements;
     // NOTE: Annoyingly, we cannot just expand arrays b/c single 2d points are arrays, we need
     // to manually expand all results to check if they are geometries
@@ -111,7 +115,7 @@ static void extractGeometries(const BSONObj& doc,
 
         if (stored.get()) {
             // Valid geometry element
-            geometries->push_back(stored.release());
+            geometries->push_back(std::move(stored));
         } else if (el.type() == Array) {
             // Many geometries may be in an array
             BSONObjIterator arrIt(el.Obj());
@@ -121,7 +125,7 @@ static void extractGeometries(const BSONObj& doc,
 
                 if (stored.get()) {
                     // Valid geometry element
-                    geometries->push_back(stored.release());
+                    geometries->push_back(std::move(stored));
                 } else {
                     warning() << "geoNear stage read non-geometry element " << redact(nextEl)
                               << " in array " << redact(el);
@@ -147,14 +151,13 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
     CRS queryCRS = nearParams.nearQuery->centroid->crs;
 
     // Extract all the geometries out of this document for the near query
-    OwnedPointerVector<StoredGeometry> geometriesOwned;
-    vector<StoredGeometry*>& geometries = geometriesOwned.mutableVector();
+    std::vector<std::unique_ptr<StoredGeometry>> geometries;
     extractGeometries(member->obj.value(), nearParams.nearQuery->field, &geometries);
 
     // Compute the minimum distance of all the geometries in the document
     double minDistance = -1;
     BSONObj minDistanceObj;
-    for (vector<StoredGeometry*>::iterator it = geometries.begin(); it != geometries.end(); ++it) {
+    for (auto it = geometries.begin(); it != geometries.end(); ++it) {
         StoredGeometry& stored = **it;
 
         // NOTE: A stored document with STRICT_SPHERE CRS is treated as a malformed document
@@ -267,8 +270,13 @@ class GeoNear2DStage::DensityEstimator {
 public:
     DensityEstimator(PlanStage::Children* children,
                      const IndexDescriptor* twoDindex,
-                     const GeoNearParams* nearParams)
-        : _children(children), _twoDIndex(twoDindex), _nearParams(nearParams), _currentLevel(0) {
+                     const GeoNearParams* nearParams,
+                     const R2Annulus& fullBounds)
+        : _children(children),
+          _twoDIndex(twoDindex),
+          _nearParams(nearParams),
+          _fullBounds(fullBounds),
+          _currentLevel(0) {
         GeoHashConverter::Parameters hashParams;
         Status status = GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams);
         // The index status should always be valid.
@@ -283,26 +291,27 @@ public:
         _currentLevel = std::max(0u, hashParams.bits - 1u);
     }
 
-    PlanStage::StageState work(OperationContext* txn,
+    PlanStage::StageState work(OperationContext* opCtx,
                                WorkingSet* workingSet,
                                Collection* collection,
                                WorkingSetID* out,
                                double* estimatedDistance);
 
 private:
-    void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
+    void buildIndexScan(OperationContext* opCtx, WorkingSet* workingSet, Collection* collection);
 
     PlanStage::Children* _children;     // Points to PlanStage::_children in the NearStage.
     const IndexDescriptor* _twoDIndex;  // Not owned here.
     const GeoNearParams* _nearParams;   // Not owned here.
-    IndexScan* _indexScan = nullptr;    // Owned in PlanStage::_children.
+    const R2Annulus& _fullBounds;
+    IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
     unique_ptr<GeoHashConverter> _converter;
     GeoHash _centroidCell;
     unsigned _currentLevel;
 };
 
 // Initialize the internal states
-void GeoNear2DStage::DensityEstimator::buildIndexScan(OperationContext* txn,
+void GeoNear2DStage::DensityEstimator::buildIndexScan(OperationContext* opCtx,
                                                       WorkingSet* workingSet,
                                                       Collection* collection) {
     IndexScanParams scanParams;
@@ -342,20 +351,20 @@ void GeoNear2DStage::DensityEstimator::buildIndexScan(OperationContext* txn,
     IndexBoundsBuilder::intersectize(oil, &scanParams.bounds.fields[twoDFieldPosition]);
 
     invariant(!_indexScan);
-    _indexScan = new IndexScan(txn, scanParams, workingSet, NULL);
+    _indexScan = new IndexScan(opCtx, scanParams, workingSet, NULL);
     _children->emplace_back(_indexScan);
 }
 
 // Return IS_EOF is we find a document in it's ancestor cells and set estimated distance
 // from the nearest document.
-PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* txn,
+PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* opCtx,
                                                              WorkingSet* workingSet,
                                                              Collection* collection,
                                                              WorkingSetID* out,
                                                              double* estimatedDistance) {
     if (!_indexScan) {
         // Setup index scan stage for current level.
-        buildIndexScan(txn, workingSet, collection);
+        buildIndexScan(opCtx, workingSet, collection);
     }
 
     WorkingSetID workingSetID;
@@ -363,6 +372,39 @@ PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* t
 
     if (state == PlanStage::IS_EOF) {
         // We ran through the neighbors but found nothing.
+        //
+        // Before going to the next-coarsest level, check whether our search area contains the
+        // entire search annulus, since we don't want to spend time doing density estimation over
+        // areas that are much larger than the requested $maxDistance.
+        //
+        // The search area consists of four cells with side length S. Within its cell, the closest
+        // vertex to the search point must be the vertex shared with the other three cells. If the
+        // search point lies in the upper left cell, this means that it must lie in the lower right
+        // quadrant of that cell. Furthermore, this lower-right quadrant has a side-length of S/2.
+        //
+        //   +-----------+-----------+
+        //   |           |           |
+        //   |       S/2 |           |
+        //   +     +-----+           |
+        //   |     | o   |           |
+        //   |     |     |           |
+        //   +-----+-----+-----------+
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   +-----------+-----------+
+        //         S
+        //
+        // As long as the outer radius of the search annulus is less than S/2, it must be entirely
+        // contained within these four cells.
+        if (_fullBounds.getOuter() < (0.5 * _converter->sizeEdge(_currentLevel))) {
+            // We're covering the entire search annulus. Return EOF to indicate we're done.
+            *estimatedDistance = 0.5 * _converter->sizeEdge(_currentLevel);
+            return PlanStage::IS_EOF;
+        }
+
         if (_currentLevel > 0u) {
             // Advance to the next level and search again.
             _currentLevel--;
@@ -390,17 +432,18 @@ PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* t
     return state;
 }
 
-PlanStage::StageState GeoNear2DStage::initialize(OperationContext* txn,
+PlanStage::StageState GeoNear2DStage::initialize(OperationContext* opCtx,
                                                  WorkingSet* workingSet,
                                                  Collection* collection,
                                                  WorkingSetID* out) {
     if (!_densityEstimator) {
-        _densityEstimator.reset(new DensityEstimator(&_children, _twoDIndex, &_nearParams));
+        _densityEstimator.reset(
+            new DensityEstimator(&_children, _twoDIndex, &_nearParams, _fullBounds));
     }
 
     double estimatedDistance;
     PlanStage::StageState state =
-        _densityEstimator->work(txn, workingSet, collection, out, &estimatedDistance);
+        _densityEstimator->work(opCtx, workingSet, collection, out, &estimatedDistance);
 
     if (state == PlanStage::IS_EOF) {
         // 2d index only works with legacy points as centroid. $nearSphere will project
@@ -436,11 +479,11 @@ PlanStage::StageState GeoNear2DStage::initialize(OperationContext* txn,
 static const string kTwoDIndexNearStage("GEO_NEAR_2D");
 
 GeoNear2DStage::GeoNear2DStage(const GeoNearParams& nearParams,
-                               OperationContext* txn,
+                               OperationContext* opCtx,
                                WorkingSet* workingSet,
                                Collection* collection,
                                IndexDescriptor* twoDIndex)
-    : NearStage(txn, kTwoDIndexNearStage.c_str(), STAGE_GEO_NEAR_2D, workingSet, collection),
+    : NearStage(opCtx, kTwoDIndexNearStage.c_str(), STAGE_GEO_NEAR_2D, workingSet, collection),
       _nearParams(nearParams),
       _twoDIndex(twoDIndex),
       _fullBounds(twoDDistanceBounds(nearParams, twoDIndex)),
@@ -463,7 +506,7 @@ class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
     TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS), _annulus(annulus) {
-        setPath(twoDPath);
+        setPath(twoDPath).transitional_ignore();
     }
 
     void serialize(BSONObjBuilder* out) const final {
@@ -506,12 +549,12 @@ private:
 // Helper class to maintain ownership of a match expression alongside an index scan
 class FetchStageWithMatch final : public FetchStage {
 public:
-    FetchStageWithMatch(OperationContext* txn,
+    FetchStageWithMatch(OperationContext* opCtx,
                         WorkingSet* ws,
                         PlanStage* child,
                         MatchExpression* filter,
                         const Collection* collection)
-        : FetchStage(txn, ws, child, filter, collection), _matcher(filter) {}
+        : FetchStage(opCtx, ws, child, filter, collection), _matcher(filter) {}
 
 private:
     // Owns matcher
@@ -551,7 +594,7 @@ static R2Annulus projectBoundsToTwoDDegrees(R2Annulus sphereBounds) {
 }
 
 StatusWith<NearStage::CoveredInterval*>  //
-    GeoNear2DStage::nextInterval(OperationContext* txn,
+    GeoNear2DStage::nextInterval(OperationContext* opCtx,
                                  WorkingSet* workingSet,
                                  Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
@@ -659,7 +702,7 @@ StatusWith<NearStage::CoveredInterval*>  //
     const int twoDFieldPosition = 0;
 
     std::vector<GeoHash> unorderedCovering = ExpressionMapping::get2dCovering(
-        *coverRegion, _twoDIndex->infoObj(), internalGeoNearQuery2DMaxCoveringCells);
+        *coverRegion, _twoDIndex->infoObj(), internalGeoNearQuery2DMaxCoveringCells.load());
 
     // Make sure the same index key isn't visited twice
     R2CellUnion diffUnion;
@@ -683,10 +726,10 @@ StatusWith<NearStage::CoveredInterval*>  //
 
     // These parameters are stored by the index, and so must be ok
     GeoHashConverter::Parameters hashParams;
-    GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams);
+    GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams).transitional_ignore();
 
     // 2D indexes support covered search over additional fields they contain
-    IndexScan* scan = new IndexScan(txn, scanParams, workingSet, _nearParams.filter);
+    IndexScan* scan = new IndexScan(opCtx, scanParams, workingSet, _nearParams.filter);
 
     MatchExpression* docMatcher = nullptr;
 
@@ -697,7 +740,8 @@ StatusWith<NearStage::CoveredInterval*>  //
     }
 
     // FetchStage owns index scan
-    _children.emplace_back(new FetchStageWithMatch(txn, workingSet, scan, docMatcher, collection));
+    _children.emplace_back(
+        new FetchStageWithMatch(opCtx, workingSet, scan, docMatcher, collection));
 
     return StatusWith<CoveredInterval*>(new CoveredInterval(_children.back().get(),
                                                             true,
@@ -734,11 +778,11 @@ static int getFieldPosition(const IndexDescriptor* index, const string& fieldNam
 static const string kS2IndexNearStage("GEO_NEAR_2DSPHERE");
 
 GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
-                                           OperationContext* txn,
+                                           OperationContext* opCtx,
                                            WorkingSet* workingSet,
                                            Collection* collection,
                                            IndexDescriptor* s2Index)
-    : NearStage(txn, kS2IndexNearStage.c_str(), STAGE_GEO_NEAR_2DSPHERE, workingSet, collection),
+    : NearStage(opCtx, kS2IndexNearStage.c_str(), STAGE_GEO_NEAR_2DSPHERE, workingSet, collection),
       _nearParams(nearParams),
       _s2Index(s2Index),
       _fullBounds(geoNearDistanceBounds(*nearParams.nearQuery)),
@@ -805,11 +849,13 @@ public:
     DensityEstimator(PlanStage::Children* children,
                      const IndexDescriptor* s2Index,
                      const GeoNearParams* nearParams,
-                     const S2IndexingParams& indexParams)
+                     const S2IndexingParams& indexParams,
+                     const R2Annulus& fullBounds)
         : _children(children),
           _s2Index(s2Index),
           _nearParams(nearParams),
           _indexParams(indexParams),
+          _fullBounds(fullBounds),
           _currentLevel(0) {
         // cellId.AppendVertexNeighbors(level, output) requires level < finest,
         // so we use the minimum of max_level - 1 and the user specified finest
@@ -819,25 +865,26 @@ public:
 
     // Search for a document in neighbors at current level.
     // Return IS_EOF is such document exists and set the estimated distance to the nearest doc.
-    PlanStage::StageState work(OperationContext* txn,
+    PlanStage::StageState work(OperationContext* opCtx,
                                WorkingSet* workingSet,
                                Collection* collection,
                                WorkingSetID* out,
                                double* estimatedDistance);
 
 private:
-    void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
+    void buildIndexScan(OperationContext* opCtx, WorkingSet* workingSet, Collection* collection);
 
     PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
     const IndexDescriptor* _s2Index;   // Not owned here.
     const GeoNearParams* _nearParams;  // Not owned here.
     const S2IndexingParams _indexParams;
+    const R2Annulus& _fullBounds;
     int _currentLevel;
     IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
 };
 
 // Setup the index scan stage for neighbors at this level.
-void GeoNear2DSphereStage::DensityEstimator::buildIndexScan(OperationContext* txn,
+void GeoNear2DSphereStage::DensityEstimator::buildIndexScan(OperationContext* opCtx,
                                                             WorkingSet* workingSet,
                                                             Collection* collection) {
     IndexScanParams scanParams;
@@ -866,18 +913,18 @@ void GeoNear2DSphereStage::DensityEstimator::buildIndexScan(OperationContext* tx
 
     // Index scan
     invariant(!_indexScan);
-    _indexScan = new IndexScan(txn, scanParams, workingSet, NULL);
+    _indexScan = new IndexScan(opCtx, scanParams, workingSet, NULL);
     _children->emplace_back(_indexScan);
 }
 
-PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationContext* txn,
+PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationContext* opCtx,
                                                                    WorkingSet* workingSet,
                                                                    Collection* collection,
                                                                    WorkingSetID* out,
                                                                    double* estimatedDistance) {
     if (!_indexScan) {
         // Setup index scan stage for current level.
-        buildIndexScan(txn, workingSet, collection);
+        buildIndexScan(opCtx, workingSet, collection);
     }
 
     WorkingSetID workingSetID;
@@ -885,6 +932,41 @@ PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationCont
 
     if (state == PlanStage::IS_EOF) {
         // We ran through the neighbors but found nothing.
+        //
+        // Before going to the next-coarsest level, check whether our search area contains the
+        // entire search annulus, since we don't want to spend time doing density estimation over
+        // areas that are much larger than the requested $maxDistance.
+        //
+        // The search area consists of four cells at level L. Within its cell, the closest vertex to
+        // the search point must be the vertex shared with the other three cells. If the search
+        // point lies in the upper left cell, this means that it must lie in the lower right
+        // sub-cell at level L+1.
+        //
+        //   +-----------+-----------+
+        //   |           |           |
+        //   |        S  |           |
+        //   +     +-----+           |
+        //   |     | o   |           |
+        //   |     |     |           |
+        //   +-----+-----+-----------+
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   |           |           |
+        //   +-----------+-----------+
+        //
+        // In the diagram above, S is the width of the cell at level L+1. We can determine a lower
+        // bound for the width any cell at this level, i.e. S > minWidth(L+1). As long as the outer
+        // radius of the search annulus is less than minWidth(L+1), it must be entirely contained
+        // within these four level L cells.
+        if (_fullBounds.getOuter() <
+            (S2::kMinWidth.GetValue(_currentLevel + 1) * kRadiusOfEarthInMeters)) {
+            // We're covering the entire search annulus. Return EOF to indicate we're done.
+            *estimatedDistance = S2::kMinWidth.GetValue(_currentLevel + 1) * kRadiusOfEarthInMeters;
+            return PlanStage::IS_EOF;
+        }
+
         if (_currentLevel > 0) {
             // Advance to the next level and search again.
             _currentLevel--;
@@ -913,18 +995,18 @@ PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationCont
 }
 
 
-PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* txn,
+PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* opCtx,
                                                        WorkingSet* workingSet,
                                                        Collection* collection,
                                                        WorkingSetID* out) {
     if (!_densityEstimator) {
         _densityEstimator.reset(
-            new DensityEstimator(&_children, _s2Index, &_nearParams, _indexParams));
+            new DensityEstimator(&_children, _s2Index, &_nearParams, _indexParams, _fullBounds));
     }
 
     double estimatedDistance;
     PlanStage::StageState state =
-        _densityEstimator->work(txn, workingSet, collection, out, &estimatedDistance);
+        _densityEstimator->work(opCtx, workingSet, collection, out, &estimatedDistance);
 
     if (state == IS_EOF) {
         // We find a document in 4 neighbors at current level, but didn't at previous level.
@@ -945,7 +1027,7 @@ PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* txn,
 }
 
 StatusWith<NearStage::CoveredInterval*>  //
-    GeoNear2DSphereStage::nextInterval(OperationContext* txn,
+    GeoNear2DSphereStage::nextInterval(OperationContext* opCtx,
                                        WorkingSet* workingSet,
                                        Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
@@ -1015,10 +1097,10 @@ StatusWith<NearStage::CoveredInterval*>  //
     OrderedIntervalList* coveredIntervals = &scanParams.bounds.fields[s2FieldPosition];
     ExpressionMapping::S2CellIdsToIntervalsWithParents(cover, _indexParams, coveredIntervals);
 
-    IndexScan* scan = new IndexScan(txn, scanParams, workingSet, nullptr);
+    IndexScan* scan = new IndexScan(opCtx, scanParams, workingSet, nullptr);
 
     // FetchStage owns index scan
-    _children.emplace_back(new FetchStage(txn, workingSet, scan, _nearParams.filter, collection));
+    _children.emplace_back(new FetchStage(opCtx, workingSet, scan, _nearParams.filter, collection));
 
     return StatusWith<CoveredInterval*>(new CoveredInterval(_children.back().get(),
                                                             true,

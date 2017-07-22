@@ -62,7 +62,7 @@ using std::stringstream;
 
 const bool autoAuthorizeDefault = true;
 
-class CmdSaslStart : public Command {
+class CmdSaslStart : public BasicCommand {
 public:
     CmdSaslStart();
     virtual ~CmdSaslStart();
@@ -73,11 +73,9 @@ public:
 
     void redactForLogging(mutablebson::Document* cmdObj) override;
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& db,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& ignored,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -92,7 +90,7 @@ public:
     }
 };
 
-class CmdSaslContinue : public Command {
+class CmdSaslContinue : public BasicCommand {
 public:
     CmdSaslContinue();
     virtual ~CmdSaslContinue();
@@ -101,11 +99,9 @@ public:
                                        const BSONObj&,
                                        std::vector<Privilege>*) {}
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& db,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& ignored,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -183,9 +179,9 @@ Status doSaslStep(const Client* client,
               << session->getPrincipalId() << " on " << session->getAuthenticationDatabase()
               << " from client " << client->getRemote().toString() << " ; " << redact(status);
 
-        sleepmillis(saslGlobalParams.authFailedDelay);
+        sleepmillis(saslGlobalParams.authFailedDelay.load());
         // All the client needs to know is that authentication has failed.
-        return Status(ErrorCodes::AuthenticationFailed, "Authentication failed.");
+        return AuthorizationManager::authenticationFailedStatus;
     }
 
     status = buildResponse(session, responsePayload, type, result);
@@ -200,7 +196,7 @@ Status doSaslStep(const Client* client,
             return status;
         }
 
-        if (!serverGlobalParams.quiet) {
+        if (!serverGlobalParams.quiet.load()) {
             log() << "Successfully authenticated as principal " << session->getPrincipalId()
                   << " on " << session->getAuthenticationDatabase();
         }
@@ -256,7 +252,7 @@ Status doSaslContinue(const Client* client,
     return doSaslStep(client, session, cmdObj, result);
 }
 
-CmdSaslStart::CmdSaslStart() : Command(saslStartCommandName) {}
+CmdSaslStart::CmdSaslStart() : BasicCommand(saslStartCommandName) {}
 CmdSaslStart::~CmdSaslStart() {}
 
 void CmdSaslStart::help(std::stringstream& os) const {
@@ -266,15 +262,13 @@ void CmdSaslStart::help(std::stringstream& os) const {
 void CmdSaslStart::redactForLogging(mutablebson::Document* cmdObj) {
     mutablebson::Element element = mutablebson::findFirstChildNamed(cmdObj->root(), "payload");
     if (element.ok()) {
-        element.setValueString("xxx");
+        element.setValueString("xxx").transitional_ignore();
     }
 }
 
-bool CmdSaslStart::run(OperationContext* txn,
+bool CmdSaslStart::run(OperationContext* opCtx,
                        const std::string& db,
-                       BSONObj& cmdObj,
-                       int options,
-                       std::string& ignored,
+                       const BSONObj& cmdObj,
                        BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     AuthenticationSession::set(client, std::unique_ptr<AuthenticationSession>());
@@ -289,7 +283,7 @@ bool CmdSaslStart::run(OperationContext* txn,
 
     std::unique_ptr<AuthenticationSession> sessionGuard(session);
 
-    session->setOpCtxt(txn);
+    session->setOpCtxt(opCtx);
 
     Status status = doSaslStart(client, session, db, cmdObj, &result);
     appendCommandStatus(result, status);
@@ -305,18 +299,16 @@ bool CmdSaslStart::run(OperationContext* txn,
     return status.isOK();
 }
 
-CmdSaslContinue::CmdSaslContinue() : Command(saslContinueCommandName) {}
+CmdSaslContinue::CmdSaslContinue() : BasicCommand(saslContinueCommandName) {}
 CmdSaslContinue::~CmdSaslContinue() {}
 
 void CmdSaslContinue::help(std::stringstream& os) const {
     os << "Subsequent steps in a SASL authentication conversation.";
 }
 
-bool CmdSaslContinue::run(OperationContext* txn,
+bool CmdSaslContinue::run(OperationContext* opCtx,
                           const std::string& db,
-                          BSONObj& cmdObj,
-                          int options,
-                          std::string& ignored,
+                          const BSONObj& cmdObj,
                           BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     std::unique_ptr<AuthenticationSession> sessionGuard;
@@ -339,7 +331,7 @@ bool CmdSaslContinue::run(OperationContext* txn,
                    "Attempt to switch database target during SASL authentication."));
     }
 
-    session->setOpCtxt(txn);
+    session->setOpCtxt(opCtx);
 
     Status status = doSaslContinue(client, session, cmdObj, &result);
     appendCommandStatus(result, status);

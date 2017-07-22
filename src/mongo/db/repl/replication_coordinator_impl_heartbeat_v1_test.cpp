@@ -33,9 +33,9 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
-#include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
@@ -56,7 +56,7 @@ using executor::RemoteCommandResponse;
 class ReplCoordHBV1Test : public ReplCoordTest {
 protected:
     void assertMemberState(MemberState expected, std::string msg = "");
-    ReplSetHeartbeatResponse receiveHeartbeatFrom(const ReplicaSetConfig& rsConfig,
+    ReplSetHeartbeatResponse receiveHeartbeatFrom(const ReplSetConfig& rsConfig,
                                                   int sourceId,
                                                   const HostAndPort& source);
 };
@@ -67,7 +67,7 @@ void ReplCoordHBV1Test::assertMemberState(const MemberState expected, std::strin
                                << " but found " << actual.toString() << " - " << msg;
 }
 
-ReplSetHeartbeatResponse ReplCoordHBV1Test::receiveHeartbeatFrom(const ReplicaSetConfig& rsConfig,
+ReplSetHeartbeatResponse ReplCoordHBV1Test::receiveHeartbeatFrom(const ReplSetConfig& rsConfig,
                                                                  int sourceId,
                                                                  const HostAndPort& source) {
     ReplSetHeartbeatArgsV1 hbArgs;
@@ -86,19 +86,19 @@ ReplSetHeartbeatResponse ReplCoordHBV1Test::receiveHeartbeatFrom(const ReplicaSe
 TEST_F(ReplCoordHBV1Test,
        NodeJoinsExistingReplSetWhenReceivingAConfigContainingTheNodeViaHeartbeat) {
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplicaSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
-                                                        << "mySet"
-                                                        << "version"
-                                                        << 3
-                                                        << "members"
-                                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                                 << "h1:1")
-                                                                      << BSON("_id" << 2 << "host"
-                                                                                    << "h2:1")
-                                                                      << BSON("_id" << 3 << "host"
-                                                                                    << "h3:1"))
-                                                        << "protocolVersion"
-                                                        << 1));
+    ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
+                                                     << "mySet"
+                                                     << "version"
+                                                     << 3
+                                                     << "members"
+                                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                              << "h1:1")
+                                                                   << BSON("_id" << 2 << "host"
+                                                                                 << "h2:1")
+                                                                   << BSON("_id" << 3 << "host"
+                                                                                 << "h3:1"))
+                                                     << "protocolVersion"
+                                                     << 1));
     init("mySet");
     addSelf(HostAndPort("h2", 1));
     const Date_t startDate = getNet()->now();
@@ -138,10 +138,10 @@ TEST_F(ReplCoordHBV1Test,
     noi = net->getNextReadyRequest();
 
     assertMemberState(MemberState::RS_STARTUP2);
-    OperationContextNoop txn;
-    ReplicaSetConfig storedConfig;
+    OperationContextNoop opCtx;
+    ReplSetConfig storedConfig;
     ASSERT_OK(storedConfig.initialize(
-        unittest::assertGet(getExternalState()->loadLocalConfigDocument(&txn))));
+        unittest::assertGet(getExternalState()->loadLocalConfigDocument(&opCtx))));
     ASSERT_OK(storedConfig.validate());
     ASSERT_EQUALS(3, storedConfig.getConfigVersion());
     ASSERT_EQUALS(3, storedConfig.getNumMembers());
@@ -153,21 +153,21 @@ TEST_F(ReplCoordHBV1Test,
 TEST_F(ReplCoordHBV1Test,
        ArbiterJoinsExistingReplSetWhenReceivingAConfigContainingTheArbiterViaHeartbeat) {
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplicaSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
-                                                        << "mySet"
-                                                        << "version"
-                                                        << 3
-                                                        << "members"
-                                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                                 << "h1:1")
-                                                                      << BSON("_id" << 2 << "host"
-                                                                                    << "h2:1"
-                                                                                    << "arbiterOnly"
-                                                                                    << true)
-                                                                      << BSON("_id" << 3 << "host"
-                                                                                    << "h3:1"))
-                                                        << "protocolVersion"
-                                                        << 1));
+    ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
+                                                     << "mySet"
+                                                     << "version"
+                                                     << 3
+                                                     << "members"
+                                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                              << "h1:1")
+                                                                   << BSON("_id" << 2 << "host"
+                                                                                 << "h2:1"
+                                                                                 << "arbiterOnly"
+                                                                                 << true)
+                                                                   << BSON("_id" << 3 << "host"
+                                                                                 << "h3:1"))
+                                                     << "protocolVersion"
+                                                     << 1));
     init("mySet");
     addSelf(HostAndPort("h2", 1));
     const Date_t startDate = getNet()->now();
@@ -207,10 +207,10 @@ TEST_F(ReplCoordHBV1Test,
     noi = net->getNextReadyRequest();
 
     assertMemberState(MemberState::RS_ARBITER);
-    OperationContextNoop txn;
-    ReplicaSetConfig storedConfig;
+    OperationContextNoop opCtx;
+    ReplSetConfig storedConfig;
     ASSERT_OK(storedConfig.initialize(
-        unittest::assertGet(getExternalState()->loadLocalConfigDocument(&txn))));
+        unittest::assertGet(getExternalState()->loadLocalConfigDocument(&opCtx))));
     ASSERT_OK(storedConfig.validate());
     ASSERT_EQUALS(3, storedConfig.getConfigVersion());
     ASSERT_EQUALS(3, storedConfig.getNumMembers());
@@ -224,19 +224,19 @@ TEST_F(ReplCoordHBV1Test,
     // Tests that a node in RS_STARTUP will not transition to RS_REMOVED if it receives a
     // configuration that does not contain it.
     logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(3));
-    ReplicaSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
-                                                        << "mySet"
-                                                        << "version"
-                                                        << 3
-                                                        << "members"
-                                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                                                 << "h1:1")
-                                                                      << BSON("_id" << 2 << "host"
-                                                                                    << "h2:1")
-                                                                      << BSON("_id" << 3 << "host"
-                                                                                    << "h3:1"))
-                                                        << "protocolVersion"
-                                                        << 1));
+    ReplSetConfig rsConfig = assertMakeRSConfig(BSON("_id"
+                                                     << "mySet"
+                                                     << "version"
+                                                     << 3
+                                                     << "members"
+                                                     << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                              << "h1:1")
+                                                                   << BSON("_id" << 2 << "host"
+                                                                                 << "h2:1")
+                                                                   << BSON("_id" << 3 << "host"
+                                                                                 << "h3:1"))
+                                                     << "protocolVersion"
+                                                     << 1));
     init("mySet");
     addSelf(HostAndPort("h4", 1));
     const Date_t startDate = getNet()->now();
@@ -276,9 +276,9 @@ TEST_F(ReplCoordHBV1Test,
     noi = net->getNextReadyRequest();
 
     assertMemberState(MemberState::RS_STARTUP, "2");
-    OperationContextNoop txn;
+    OperationContextNoop opCtx;
 
-    StatusWith<BSONObj> loadedConfig(getExternalState()->loadLocalConfigDocument(&txn));
+    StatusWith<BSONObj> loadedConfig(getExternalState()->loadLocalConfigDocument(&opCtx));
     ASSERT_NOT_OK(loadedConfig.getStatus()) << loadedConfig.getValue();
     exitNetwork();
 }
@@ -314,7 +314,7 @@ TEST_F(ReplCoordHBV1Test,
                                           << BSON("_id" << 2 << "host"
                                                         << "node2:12345"))),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     // process heartbeat
     enterNetwork();
@@ -341,45 +341,6 @@ TEST_F(ReplCoordHBV1Test,
     assertMemberState(MemberState::RS_RECOVERING, "0");
 }
 
-TEST_F(ReplCoordHBV1Test, ArbiterRecordsCommittedOpTimeFromHeartbeatMetadata) {
-    // Tests that an arbiter will update its committed optime from the heartbeat metadata
-    assertStartSuccess(fromjson("{_id:'mySet', version:1, protocolVersion:1, members:["
-                                "{_id:1, host:'node1:12345', arbiterOnly:true}, "
-                                "{_id:2, host:'node2:12345'}]}"),
-                       HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_ARBITER));
-
-    // calls processReplSetMetadata with the "committed" optime and verifies that the arbiter sets
-    // its current optime to 'expected'
-    auto test = [this](OpTime committedOpTime, OpTime expected) {
-        // process heartbeat metadata directly
-        StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(
-            BSON(rpc::kReplSetMetadataFieldName
-                 << BSON("lastOpCommitted" << BSON("ts" << committedOpTime.getTimestamp() << "t"
-                                                        << committedOpTime.getTerm())
-                                           << "lastOpVisible"
-                                           << BSON("ts" << committedOpTime.getTimestamp() << "t"
-                                                        << committedOpTime.getTerm())
-                                           << "configVersion"
-                                           << 1
-                                           << "primaryIndex"
-                                           << 1
-                                           << "term"
-                                           << committedOpTime.getTerm()
-                                           << "syncSourceIndex"
-                                           << 1)));
-        ASSERT_OK(metadata.getStatus());
-        getReplCoord()->processReplSetMetadata(metadata.getValue());
-
-        ASSERT_EQ(getReplCoord()->getMyLastAppliedOpTime().getTimestamp(), expected.getTimestamp());
-    };
-
-    OpTime committedOpTime{Timestamp{10, 10}, 10};
-    test(committedOpTime, committedOpTime);
-    OpTime olderOpTime{Timestamp{2, 2}, 9};
-    test(olderOpTime, committedOpTime);
-}
-
 TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotMatchOurs) {
     // Tests that a secondary node will not update its committed optime from the heartbeat metadata
     // if the replica set ID is inconsistent with the existing configuration.
@@ -397,15 +358,14 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
                             << "protocolVersion"
                             << 1),
                        HostAndPort("node1", 12345));
-    ASSERT(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     auto rsConfig = getReplCoord()->getConfig();
 
     // Prepare heartbeat response.
     OID unexpectedId = OID::gen();
     OpTime opTime{Timestamp{10, 10}, 10};
-    ReplicationExecutor::ResponseStatus heartbeatResponse(ErrorCodes::InternalError,
-                                                          "not initialized");
+    RemoteCommandResponse heartbeatResponse(ErrorCodes::InternalError, "not initialized");
     {
         ReplSetHeartbeatResponse hbResp;
         hbResp.setSetName(rsConfig.getReplSetName());
@@ -419,7 +379,7 @@ TEST_F(ReplCoordHBV1Test, IgnoreTheContentsOfMetadataWhenItsReplicaSetIdDoesNotM
         rpc::ReplSetMetadata metadata(
             opTime.getTerm(), opTime, opTime, rsConfig.getConfigVersion(), unexpectedId, 1, -1);
         BSONObjBuilder metadataBuilder;
-        metadata.writeToMetadata(&metadataBuilder);
+        metadata.writeToMetadata(&metadataBuilder).transitional_ignore();
 
         heartbeatResponse = makeResponseStatus(responseBuilder.obj(), metadataBuilder.obj());
     }

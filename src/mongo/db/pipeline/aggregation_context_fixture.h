@@ -32,7 +32,8 @@
 #include <memory>
 
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/memory.h"
@@ -46,18 +47,23 @@ namespace mongo {
 class AggregationContextFixture : public unittest::Test {
 public:
     AggregationContextFixture()
+        : AggregationContextFixture(NamespaceString("unittests.pipeline_test")) {}
+
+    AggregationContextFixture(NamespaceString nss)
         : _queryServiceContext(stdx::make_unique<QueryTestServiceContext>()),
           _opCtx(_queryServiceContext->makeOperationContext()),
-          _expCtx(new ExpressionContext(
-              _opCtx.get(), AggregationRequest(NamespaceString("unittests.pipeline_test"), {}))) {}
+          _expCtx(new ExpressionContextForTest(_opCtx.get(), AggregationRequest(nss, {}))) {
+        TimeZoneDatabase::set(_queryServiceContext->getServiceContext(),
+                              stdx::make_unique<TimeZoneDatabase>());
+    }
 
-    boost::intrusive_ptr<ExpressionContext> getExpCtx() {
+    boost::intrusive_ptr<ExpressionContextForTest> getExpCtx() {
         return _expCtx.get();
     }
 
 private:
     std::unique_ptr<QueryTestServiceContext> _queryServiceContext;
     ServiceContext::UniqueOperationContext _opCtx;
-    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    boost::intrusive_ptr<ExpressionContextForTest> _expCtx;
 };
 }  // namespace mongo

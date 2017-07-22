@@ -37,18 +37,26 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/op_observer_noop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 void ServiceContextMongoDTest::setUp() {
-    Client::initThread(getThreadName().c_str());
+    Client::initThread(getThreadName());
     ServiceContext* serviceContext = getServiceContext();
+
+    auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+    LogicalClock::set(serviceContext, std::move(logicalClock));
+
     if (!serviceContext->getGlobalStorageEngine()) {
         // When using the "ephemeralForTest" storage engine, it is fine for the temporary directory
         // to go away after the global storage engine is initialized.
@@ -58,39 +66,42 @@ void ServiceContextMongoDTest::setUp() {
         storageGlobalParams.engineSetByUser = true;
         checked_cast<ServiceContextMongoD*>(getGlobalServiceContext())->createLockFile();
         serviceContext->initializeGlobalStorageEngine();
+        serviceContext->setOpObserver(stdx::make_unique<OpObserverNoop>());
     }
 }
 
 void ServiceContextMongoDTest::tearDown() {
     ON_BLOCK_EXIT([&] { Client::destroy(); });
-    auto txn = cc().makeOperationContext();
-    _dropAllDBs(txn.get());
+    auto opCtx = cc().makeOperationContext();
+    _dropAllDBs(opCtx.get());
 }
 
 ServiceContext* ServiceContextMongoDTest::getServiceContext() {
     return getGlobalServiceContext();
 }
 
-void ServiceContextMongoDTest::_dropAllDBs(OperationContext* txn) {
-    dropAllDatabasesExceptLocal(txn);
+void ServiceContextMongoDTest::_doTest() {
+    MONGO_UNREACHABLE;
+}
 
-    ScopedTransaction transaction(txn, MODE_X);
-    Lock::GlobalWrite lk(txn->lockState());
-    AutoGetDb autoDBLocal(txn, "local", MODE_X);
+void ServiceContextMongoDTest::_dropAllDBs(OperationContext* opCtx) {
+    dropAllDatabasesExceptLocal(opCtx);
+
+    Lock::GlobalWrite lk(opCtx);
+    AutoGetDb autoDBLocal(opCtx, "local", MODE_X);
     const auto localDB = autoDBLocal.getDb();
     if (localDB) {
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+        writeConflictRetry(opCtx, "_dropAllDBs", "local", [&] {
             // Do not wrap in a WriteUnitOfWork until SERVER-17103 is addressed.
-            autoDBLocal.getDb()->dropDatabase(txn, localDB);
-        }
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "_dropAllDBs", "local");
+            autoDBLocal.getDb()->dropDatabase(opCtx, localDB);
+        });
     }
 
     // dropAllDatabasesExceptLocal() does not close empty databases. However the holder still
     // allocates resources to track these empty databases. These resources not released by
     // dropAllDatabasesExceptLocal() will be leaked at exit unless we call DatabaseHolder::closeAll.
     BSONObjBuilder unused;
-    invariant(dbHolder().closeAll(txn, unused, false));
+    invariant(dbHolder().closeAll(opCtx, unused, false, "all databases dropped"));
 }
 
 }  // namespace mongo

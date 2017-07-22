@@ -31,9 +31,9 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/s/bson_serializable.h"
 
 namespace mongo {
 
@@ -41,7 +41,7 @@ namespace mongo {
  * This class represents the layout and content of a update document runCommand,
  * in the request side.
  */
-class BatchedUpdateDocument : public BSONSerializable {
+class BatchedUpdateDocument {
     MONGO_DISALLOW_COPYING(BatchedUpdateDocument);
 
 public:
@@ -54,13 +54,9 @@ public:
     static const BSONField<bool> multi;
     static const BSONField<bool> upsert;
     static const BSONField<BSONObj> collation;
-
-    //
-    // construction / destruction
-    //
+    static const BSONField<BSONArray> arrayFilters;
 
     BatchedUpdateDocument();
-    virtual ~BatchedUpdateDocument();
 
     /** Copies all the fields present in 'this' to 'other'. */
     void cloneTo(BatchedUpdateDocument* other) const;
@@ -69,15 +65,11 @@ public:
     // bson serializable interface implementation
     //
 
-    virtual bool isValid(std::string* errMsg) const;
-    virtual BSONObj toBSON() const;
-    virtual bool parseBSON(const BSONObj& source, std::string* errMsg);
-    virtual void clear();
-    virtual std::string toString() const;
-
-    //
-    // individual field accessors
-    //
+    bool isValid(std::string* errMsg) const;
+    BSONObj toBSON() const;
+    bool parseBSON(const BSONObj& source, std::string* errMsg);
+    void clear();
+    std::string toString() const;
 
     void setQuery(const BSONObj& query);
     void unsetQuery();
@@ -104,6 +96,11 @@ public:
     bool isCollationSet() const;
     const BSONObj& getCollation() const;
 
+    void setArrayFilters(const std::vector<BSONObj>& arrayFilters);
+    void unsetArrayFilters();
+    bool isArrayFiltersSet() const;
+    const std::vector<BSONObj>& getArrayFilters() const;
+
 private:
     // Convention: (M)andatory, (O)ptional
 
@@ -126,6 +123,10 @@ private:
     // (O)  the collation which this update should respect.
     BSONObj _collation;
     bool _isCollationSet;
+
+    // (O)  the filters this update uses to determine which array elements to update.
+    std::vector<BSONObj> _arrayFilters;
+    bool _isArrayFiltersSet;
 };
 
 }  // namespace mongo

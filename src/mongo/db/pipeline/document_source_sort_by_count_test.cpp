@@ -68,7 +68,7 @@ public:
 
         // Serialize the DocumentSourceGroup and DocumentSourceSort from $sortByCount so that we can
         // check the explain output to make sure $group and $sort have the correct fields.
-        const bool explain = true;
+        const auto explain = ExplainOptions::Verbosity::kQueryPlanner;
         vector<Value> explainedStages;
         groupStage->serializeToArray(explainedStages, explain);
         sortStage->serializeToArray(explainedStages, explain);
@@ -87,7 +87,7 @@ TEST_F(SortByCountReturnsGroupAndSort, ExpressionFieldPathSpec) {
     BSONObj spec = BSON("$sortByCount"
                         << "$x");
     Value expectedGroupExplain =
-        Value{Document{{"_id", "$x"}, {"count", Document{{"$sum", Document{{"$const", 1}}}}}}};
+        Value{Document{{"_id", "$x"_sd}, {"count", Document{{"$sum", Document{{"$const", 1}}}}}}};
     testCreateFromBsonResult(spec, expectedGroupExplain);
 }
 

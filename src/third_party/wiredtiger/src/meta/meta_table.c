@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -62,14 +62,12 @@ __wt_metadata_cursor_open(
 	 * first update is safe because it's single-threaded from
 	 * wiredtiger_open).
 	 */
+#define	WT_EVICT_META_SKEW	10000
 	if (btree->evict_priority == 0)
 		WT_WITH_BTREE(session, btree,
-		    __wt_evict_priority_set(session, WT_EVICT_INT_SKEW));
+		    __wt_evict_priority_set(session, WT_EVICT_META_SKEW));
 	if (F_ISSET(btree, WT_BTREE_NO_LOGGING))
 		F_CLR(btree, WT_BTREE_NO_LOGGING);
-
-	/* The metadata file always uses checkpoint IDs in visibility checks. */
-	btree->include_checkpoint_txn = true;
 
 	return (0);
 }
@@ -195,7 +193,7 @@ __wt_metadata_update(
 	    __metadata_turtle(key) ? "" : "not ");
 
 	if (__metadata_turtle(key)) {
-		WT_WITH_TURTLE_LOCK(session, ret,
+		WT_WITH_TURTLE_LOCK(session,
 		    ret = __wt_turtle_update(session, key, value));
 		return (ret);
 	}
@@ -262,8 +260,19 @@ __wt_metadata_search(WT_SESSION_IMPL *session, const char *key, char **valuep)
 	    key, WT_META_TRACKING(session) ? "true" : "false",
 	    __metadata_turtle(key) ? "" : "not ");
 
-	if (__metadata_turtle(key))
-		return (__wt_turtle_read(session, key, valuep));
+	if (__metadata_turtle(key)) {
+		/*
+		 * The returned value should only be set if ret is non-zero, but
+		 * Coverity is convinced otherwise. The code path is used enough
+		 * that Coverity complains a lot, add an error check to get some
+		 * peace and quiet.
+		 */
+		WT_WITH_TURTLE_LOCK(session,
+		    ret = __wt_turtle_read(session, key, valuep));
+		if (ret != 0)
+			__wt_free(session, *valuep);
+		return (ret);
+	}
 
 	/*
 	 * All metadata reads are at read-uncommitted isolation.  That's

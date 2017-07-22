@@ -86,16 +86,7 @@ Status TransportLayerMock::wait(Ticket&& ticket) {
 }
 
 void TransportLayerMock::asyncWait(Ticket&& ticket, TicketCallback callback) {
-    callback(Status::OK());
-}
-
-SSLPeerInfo TransportLayerMock::getX509PeerInfo(const ConstSessionHandle& session) const {
-    return _sessions.at(session->id()).peerInfo;
-}
-
-
-void TransportLayerMock::setX509PeerInfo(const SessionHandle& session, SSLPeerInfo peerInfo) {
-    _sessions[session->id()].peerInfo = std::move(peerInfo);
+    callback(wait(std::move(ticket)));
 }
 
 TransportLayer::Stats TransportLayerMock::sessionStats() {
@@ -128,12 +119,8 @@ void TransportLayerMock::end(const SessionHandle& session) {
     _sessions[session->id()].ended = true;
 }
 
-void TransportLayerMock::endAllSessions(Session::TagMask tags) {
-    auto it = _sessions.begin();
-    while (it != _sessions.end()) {
-        end(it->second.session);
-        it++;
-    }
+Status TransportLayerMock::setup() {
+    return Status::OK();
 }
 
 Status TransportLayerMock::start() {
@@ -143,7 +130,6 @@ Status TransportLayerMock::start() {
 void TransportLayerMock::shutdown() {
     if (!inShutdown()) {
         _shutdown = true;
-        endAllSessions(Session::kEmptyTagMask);
     }
 }
 

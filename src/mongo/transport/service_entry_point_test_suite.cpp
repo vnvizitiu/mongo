@@ -131,11 +131,6 @@ void ServiceEntryPointTestSuite::MockTLHarness::asyncWait(Ticket&& ticket,
     return _asyncWait(std::move(ticket), std::move(callback));
 }
 
-SSLPeerInfo ServiceEntryPointTestSuite::MockTLHarness::getX509PeerInfo(
-    const ConstSessionHandle& session) const {
-    return SSLPeerInfo("mock", stdx::unordered_set<RoleName>{});
-}
-
 TransportLayer::Stats ServiceEntryPointTestSuite::MockTLHarness::sessionStats() {
     return Stats();
 }
@@ -144,8 +139,8 @@ void ServiceEntryPointTestSuite::MockTLHarness::end(const SessionHandle& session
     return _end(session);
 }
 
-void ServiceEntryPointTestSuite::MockTLHarness::endAllSessions(Session::TagMask tags) {
-    return _endAllSessions(tags);
+Status ServiceEntryPointTestSuite::MockTLHarness::setup() {
+    return Status::OK();
 }
 
 Status ServiceEntryPointTestSuite::MockTLHarness::start() {

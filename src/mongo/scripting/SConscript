@@ -1,5 +1,7 @@
 # -*- mode: python -*-
 
+import libdeps
+
 Import([
     'env',
     'get_option',
@@ -145,16 +147,18 @@ if usemozjs:
         LIBDEPS=[
             'bson_template_evaluator',
             'scripting_common',
-            '$BUILD_DIR/third_party/shim_mozjs',
             '$BUILD_DIR/mongo/shell/mongojs',
             '$BUILD_DIR/mongo/db/service_context',
-            '$BUILD_DIR/mongo/s/local_sharding_info',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/third_party/shim_mozjs',
         ],
     )
 else:
     env.Library(
         target='scripting',
         source=[
+            'scripting_none.cpp'
         ],
         LIBDEPS=[
             'scripting_none',
@@ -164,6 +168,7 @@ else:
 env.Library(
     target='scripting_server',
     source=[
+        'scripting_server.cpp',
     ],
     LIBDEPS=[
         'scripting' if serverJs else 'scripting_none',

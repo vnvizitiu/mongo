@@ -43,9 +43,9 @@
 namespace mongo {
 namespace {
 
-class ShardingStateCmd : public Command {
+class ShardingStateCmd : public BasicCommand {
 public:
-    ShardingStateCmd() : Command("shardingState") {}
+    ShardingStateCmd() : BasicCommand("shardingState") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -67,13 +67,11 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        ShardingState::get(txn)->appendInfo(txn, result);
+        ShardingState::get(opCtx)->appendInfo(opCtx, result);
         return true;
     }
 

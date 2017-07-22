@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 # WorkingSet target and associated test
 env.Library(
     target = "working_set",
@@ -85,23 +87,34 @@ env.Library(
         "working_set",
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/bson/dotted_path_support",
+        '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/db/catalog/collection_info_cache',
+        '$BUILD_DIR/mongo/db/catalog/index_catalog',
         "$BUILD_DIR/mongo/db/concurrency/write_conflict_exception",
         "$BUILD_DIR/mongo/db/commands",
         "$BUILD_DIR/mongo/db/curop",
         "$BUILD_DIR/mongo/db/fts/base",
         "$BUILD_DIR/mongo/db/index/index_descriptor",
         "$BUILD_DIR/mongo/db/index/key_generator",
-        "$BUILD_DIR/mongo/db/ops/update_driver",
         "$BUILD_DIR/mongo/db/pipeline/pipeline",
         "$BUILD_DIR/mongo/db/repl/repl_coordinator_global",
+        "$BUILD_DIR/mongo/db/update/update_driver",
         "$BUILD_DIR/mongo/scripting/scripting",
         "$BUILD_DIR/mongo/db/storage/storage_options",
         "$BUILD_DIR/mongo/s/common",
         '$BUILD_DIR/third_party/s2/s2',
+        '$BUILD_DIR/mongo/db/query/query_common',
+        #'$BUILD_DIR/mongo/db/write_ops', # CYCLE
+        #'$BUILD_DIR/mongo/db/index/index_access_methods', # CYCLE
+        #'$BUILD_DIR/mongo/db/matcher/expressions_mongod_only', # CYCLE
+        #'$BUILD_DIR/mongo/db/s/sharding', # CYCLE
+        #'$BUILD_DIR/mongo/db/query/query', # CYCLE
+        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
+        #'$BUILD_DIR/mongo/db/pipeline/serveronly', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # A great number of undefined symbols in this library
-        'incomplete',
+        # TODO(ADAM, 2017-01-06): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ]
 )
 

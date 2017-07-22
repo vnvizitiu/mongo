@@ -37,10 +37,11 @@ namespace mongo {
  * Base class for the killCursors command, which attempts to kill all given cursors.  Contains code
  * common to mongos and mongod implementations.
  */
-class KillCursorsCmdBase : public Command {
+class KillCursorsCmdBase : public BasicCommand {
 public:
-    KillCursorsCmdBase() : Command("killCursors") {}
+    KillCursorsCmdBase() : BasicCommand("killCursors") {}
 
+    virtual ~KillCursorsCmdBase() {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -70,21 +71,19 @@ public:
                                const std::string& dbname,
                                const BSONObj& cmdObj) final;
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) final;
 
 private:
     /**
-     * Kill the cursor with id 'cursorId' in namespace 'nss'. Use 'txn' if necessary.
+     * Kill the cursor with id 'cursorId' in namespace 'nss'. Use 'opCtx' if necessary.
      *
      * Returns Status::OK() if the cursor was killed, or ErrorCodes::CursorNotFound if there is no
      * such cursor, or ErrorCodes::OperationFailed if the cursor cannot be killed.
      */
-    virtual Status _killCursor(OperationContext* txn,
+    virtual Status _killCursor(OperationContext* opCtx,
                                const NamespaceString& nss,
                                CursorId cursorId) = 0;
 };

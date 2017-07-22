@@ -36,18 +36,17 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/apply_ops.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/apply_ops_cmd_common.h"
-#include "mongo/db/commands/dbhash.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -62,9 +61,9 @@ using std::stringstream;
 
 namespace {
 
-class ApplyOpsCmd : public Command {
+class ApplyOpsCmd : public ErrmsgCommandDeprecated {
 public:
-    ApplyOpsCmd() : Command("applyOps") {}
+    ApplyOpsCmd() : ErrmsgCommandDeprecated("applyOps") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -80,23 +79,22 @@ public:
     }
 
 
-    virtual Status checkAuthForOperation(OperationContext* txn,
+    virtual Status checkAuthForOperation(OperationContext* opCtx,
                                          const std::string& dbname,
                                          const BSONObj& cmdObj) {
-        return checkAuthForApplyOpsCommand(txn, dbname, cmdObj);
+        return checkAuthForApplyOpsCommand(opCtx, dbname, cmdObj);
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         validateApplyOpsCommand(cmdObj);
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
-            maybeDisableValidation.emplace(txn);
+            maybeDisableValidation.emplace(opCtx);
 
         if (cmdObj.firstElement().type() != Array) {
             errmsg = "ops has to be an array";
@@ -116,14 +114,14 @@ public:
             }
         }
 
-        auto client = txn->getClient();
+        auto client = opCtx->getClient();
         auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
         ScopeGuard lastOpSetterGuard =
             MakeObjGuard(repl::ReplClientInfo::forClient(client),
                          &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
-                         txn);
+                         opCtx);
 
-        auto applyOpsStatus = appendCommandStatus(result, applyOps(txn, dbname, cmdObj, &result));
+        auto applyOpsStatus = appendCommandStatus(result, applyOps(opCtx, dbname, cmdObj, &result));
 
         if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
             // If this operation has already generated a new lastOp, don't bother setting it

@@ -48,8 +48,8 @@ namespace executor {
 namespace {
 
 MONGO_INITIALIZER(ThreadPoolExecutorCommonTests)(InitializerContext*) {
-    addTestsForExecutor("ThreadPoolExecutorCommon", [](std::unique_ptr<NetworkInterfaceMock>* net) {
-        return makeThreadPoolTestExecutor(std::move(*net));
+    addTestsForExecutor("ThreadPoolExecutorCommon", [](std::unique_ptr<NetworkInterfaceMock> net) {
+        return makeThreadPoolTestExecutor(std::move(net));
     });
     return Status::OK();
 }
@@ -75,8 +75,49 @@ TEST_F(ThreadPoolExecutorTest, TimelyCancelationOfScheduleWorkAt) {
     executor.wait(cb1);
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status1);
     ASSERT_EQUALS(startTime + Milliseconds(200), net->now());
-    executor.shutdown();
-    joinExecutorThread();
+}
+
+bool sharedCallbackStateDestroyed = false;
+class SharedCallbackState {
+    MONGO_DISALLOW_COPYING(SharedCallbackState);
+
+public:
+    SharedCallbackState() {}
+    ~SharedCallbackState() {
+        sharedCallbackStateDestroyed = true;
+    }
+};
+
+TEST_F(ThreadPoolExecutorTest,
+       ExecutorResetsCallbackFunctionInCallbackStateUponReturnFromCallbackFunction) {
+    auto net = getNet();
+    auto& executor = getExecutor();
+    launchExecutorThread();
+
+    auto sharedCallbackData = std::make_shared<SharedCallbackState>();
+    auto callbackInvoked = false;
+
+    const auto when = net->now() + Milliseconds(5000);
+    const auto cb1 = unittest::assertGet(executor.scheduleWorkAt(
+        when, [&callbackInvoked, sharedCallbackData](const executor::TaskExecutor::CallbackArgs&) {
+            callbackInvoked = true;
+        }));
+
+    sharedCallbackData.reset();
+    ASSERT_FALSE(sharedCallbackStateDestroyed);
+
+    net->enterNetwork();
+    ASSERT_EQUALS(when, net->runUntil(when));
+    net->exitNetwork();
+
+    executor.wait(cb1);
+
+    // Task executor should reset CallbackState::callback after running callback function.
+    // This ensures that we release resources associated with 'CallbackState::callback' without
+    // having to destroy every outstanding callback handle (which contains a shared pointer
+    // to ThreadPoolTaskExecutor::CallbackState).
+    ASSERT_TRUE(callbackInvoked);
+    ASSERT_TRUE(sharedCallbackStateDestroyed);
 }
 
 TEST_F(ThreadPoolExecutorTest, ShutdownAndScheduleRaceDoesNotCrash) {
@@ -116,7 +157,7 @@ TEST_F(ThreadPoolExecutorTest, ShutdownAndScheduleRaceDoesNotCrash) {
     barrier.countDownAndWait();
     MONGO_FAIL_POINT_PAUSE_WHILE_SET((*fpTPTE1));
     executor.shutdown();
-    joinExecutorThread();
+    executor.join();
     ASSERT_OK(status1);
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, status2);
 }

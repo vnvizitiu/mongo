@@ -51,7 +51,8 @@ function ClusterSpawnHelper(clusterType, startWithAuth, startWithTransitionToAut
         var replSetTestConfig = {
             name: baseName + "_source",
             nodes: 3,
-            nodeOptions: singleNodeConfig
+            nodeOptions: singleNodeConfig,
+            keyFile: singleNodeConfig.keyFile
         };
         var replSetTest = new ReplSetTest(replSetTestConfig);
         replSetTest.startSet();
@@ -77,7 +78,7 @@ function ClusterSpawnHelper(clusterType, startWithAuth, startWithTransitionToAut
         } else if (clusterType === "repl") {
             replSetTest.stopSet();
         } else {
-            MongoRunner.stopMongod(this.conn.port);
+            MongoRunner.stopMongod(this.conn);
         }
     };
 }

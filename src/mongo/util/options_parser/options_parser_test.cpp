@@ -302,7 +302,7 @@ TEST(Parsing, SubSection) {
     moe::OptionSection subSection("Section Name");
 
     subSection.addOptionChaining("port", "port", moe::Int, "Port");
-    testOpts.addSection(subSection);
+    testOpts.addSection(subSection).transitional_ignore();
 
     std::vector<std::string> argv;
     argv.push_back("binaryname");
@@ -1893,6 +1893,64 @@ TEST(ConfigFromFilesystem, Empty) {
 
     moe::Value value;
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+}
+
+TEST(ConfigFromFilesystem, NullByte) {
+
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+    testOpts.addOptionChaining("port", "port", moe::Int, "Port");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(TEST_CONFIG_PATH("nullByte.conf"));
+    std::map<std::string, std::string> env_map;
+
+    moe::Value value;
+    ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+}
+
+TEST(ConfigFromFilesystem, NullSubDir) {
+
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+    testOpts.addOptionChaining("storage.dbPath", "dbPath", moe::String, "path");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(TEST_CONFIG_PATH("dirNullByte.conf"));
+    std::map<std::string, std::string> env_map;
+
+    moe::Value value;
+    ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+}
+
+
+TEST(ConfigFromFilesystem, NullTerminated) {
+
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+    testOpts.addOptionChaining("storage.dbPath", "dbPath", moe::String, "path");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(TEST_CONFIG_PATH("endStringNull.conf"));
+    std::map<std::string, std::string> env_map;
+
+    moe::Value value;
+    ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
 TEST(JSONConfigFile, ComposingStringVector) {
@@ -4020,7 +4078,7 @@ TEST(OptionCount, Basic) {
     moe::OptionSection subSection("Section Name");
     subSection.addOptionChaining("port", "port", moe::Int, "Port")
         .setSources(moe::SourceYAMLConfig);
-    testOpts.addSection(subSection);
+    testOpts.addSection(subSection).transitional_ignore();
 
     int numOptions;
     ASSERT_OK(testOpts.countOptions(&numOptions, true /*visibleOnly*/, moe::SourceCommandLine));

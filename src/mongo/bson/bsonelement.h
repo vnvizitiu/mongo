@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/data_range.h"
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/string_data_comparator_interface.h"
@@ -211,7 +212,7 @@ public:
     /** retrieve a field within this element
         throws exception if *this is not an embedded object
     */
-    BSONElement operator[](const std::string& field) const;
+    BSONElement operator[](StringData field) const;
 
     /** See canonicalizeBSONType in bsontypes.h */
     int canonicalType() const {
@@ -468,6 +469,19 @@ public:
         return (BinDataType)c;
     }
 
+    std::vector<uint8_t> _binDataVector() const {
+        if (binDataType() != ByteArrayDeprecated) {
+            return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(value()) + 5,
+                                        reinterpret_cast<const uint8_t*>(value()) + 5 +
+                                            valuestrsize());
+        } else {
+            // Skip the extra int32 size
+            return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(value()) + 4,
+                                        reinterpret_cast<const uint8_t*>(value()) + 4 +
+                                            valuestrsize() - 4);
+        }
+    }
+
     /** Retrieve the regex std::string for a Regex element */
     const char* regex() const {
         verify(type() == RegEx);
@@ -543,9 +557,6 @@ public:
         return data;
     }
 
-    /** 0 == Equality, just not defined yet */
-    int getGtLtOp(int def = 0) const;
-
     /** Constructs an empty element */
     BSONElement();
 
@@ -578,6 +589,31 @@ public:
         }
         return Timestamp();
     }
+
+    const std::array<unsigned char, 16> uuid() const {
+        int len = 0;
+        const char* data = nullptr;
+        if (type() == BinData && binDataType() == BinDataType::newUUID)
+            data = binData(len);
+        uassert(ErrorCodes::InvalidUUID,
+                "uuid must be a 16-byte binary field with UUID (4) subtype",
+                len == 16);
+        std::array<unsigned char, 16> result;
+        memcpy(&result, data, len);
+        return result;
+    }
+
+    const std::array<unsigned char, 16> md5() const {
+        int len = 0;
+        const char* data = nullptr;
+        if (type() == BinData && binDataType() == BinDataType::MD5Type)
+            data = binData(len);
+        uassert(40437, "md5 must be a 16-byte binary field with MD5 (5) subtype", len == 16);
+        std::array<unsigned char, 16> result;
+        memcpy(&result, data, len);
+        return result;
+    }
+
 
     Date_t timestampTime() const {
         unsigned long long t = ConstDataView(value() + 4).read<LittleEndian<unsigned int>>();

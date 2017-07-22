@@ -1,3 +1,4 @@
+var syncFrom;
 var wait;
 var occasionally;
 var reconnect;
@@ -7,29 +8,76 @@ var reconfig;
 var awaitOpTime;
 var startSetIfSupportsReadMajority;
 var waitUntilAllNodesCaughtUp;
-var updateConfigIfNotDurable;
+var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
 var awaitRSClientHosts;
 var getLastOpTime;
 
 (function() {
     "use strict";
+    load("jstests/libs/write_concern_util.js");
+
     var count = 0;
     var w = 0;
 
-    wait = function(f, msg) {
+    /**
+     * A wrapper around `replSetSyncFrom` to ensure that the desired sync source is ahead of the
+     * syncing node so that the syncing node can choose to sync from the desired sync source.
+     * It first stops replication on the syncing node so that it can do a write on the desired
+     * sync source and make sure it's ahead. When replication is restarted, the desired sync
+     * source will be a valid sync source for the syncing node.
+     */
+    syncFrom = function(syncingNode, desiredSyncSource, rst) {
+        jsTestLog("Forcing " + syncingNode.name + " to sync from " + desiredSyncSource.name);
+
+        // Ensure that 'desiredSyncSource' doesn't already have the dummy write sitting around from
+        // a previous syncFrom attempt.
+        var dummyName = "dummyForSyncFrom";
+        rst.getPrimary().getDB(dummyName).getCollection(dummyName).drop();
+        assert.soonNoExcept(function() {
+            return desiredSyncSource.getDB(dummyName).getCollection(dummyName).findOne() == null;
+        });
+
+        stopServerReplication(syncingNode);
+
+        assert.writeOK(rst.getPrimary().getDB(dummyName).getCollection(dummyName).insert({a: 1}));
+        // Wait for 'desiredSyncSource' to get the dummy write we just did so we know it's
+        // definitely ahead of 'syncingNode' before we call replSetSyncFrom.
+        assert.soonNoExcept(function() {
+            return desiredSyncSource.getDB(dummyName).getCollection(dummyName).findOne({a: 1});
+        });
+
+        assert.commandWorked(syncingNode.adminCommand({replSetSyncFrom: desiredSyncSource.name}));
+        restartServerReplication(syncingNode);
+        rst.awaitSyncSource(syncingNode, desiredSyncSource);
+    };
+
+    /**
+     * Calls a function 'f' once a second until it returns true. Throws an exception once 'f' has
+     * been called more than 'retries' times without returning true. If 'retries' is not given,
+     * it defaults to 200. 'retries' must be an integer greater than or equal to zero.
+     */
+    wait = function(f, msg, retries) {
         w++;
         var n = 0;
+        var default_retries = 200;
+        var delay_interval_ms = 1000;
+
+        // Set default value if 'retries' was not given.
+        if (retries === undefined) {
+            retries = default_retries;
+        }
         while (!f()) {
-            if (n % 4 == 0)
-                print("waiting " + w);
+            if (n % 4 == 0) {
+                print("Waiting " + w);
+            }
             if (++n == 4) {
                 print("" + f);
             }
-            if (n >= 200) {
-                throw new Error('tried 200 times, giving up on ' + msg);
+            if (n >= retries) {
+                throw new Error('Tried ' + retries + ' times, giving up on ' + msg);
             }
-            sleep(1000);
+            sleep(delay_interval_ms);
         }
     };
 
@@ -50,19 +98,32 @@ var getLastOpTime;
         count++;
     };
 
-    reconnect = function(a) {
+    /**
+     * Attempt to re-establish and re-authenticate a Mongo connection if it was dropped, with
+     * multiple retries.
+     *
+     * Returns upon successful re-connnection. If connection cannot be established after 200
+     * retries, throws an exception.
+     *
+     * @param conn - a Mongo connection object or DB object.
+     */
+    reconnect = function(conn) {
+        var retries = 200;
         wait(function() {
             var db;
             try {
-                // make this work with either dbs or connections
-                if (typeof(a.getDB) == "function") {
-                    db = a.getDB('foo');
+                // Make this work with either dbs or connections.
+                if (typeof(conn.getDB) == "function") {
+                    db = conn.getDB('foo');
                 } else {
-                    db = a;
+                    db = conn;
                 }
+
+                // Run a simple command to re-establish connection.
                 db.bar.stats();
-                if (jsTest.options().keyFile) {  // SERVER-4241: Shell connections don't
-                                                 // re-authenticate on reconnect
+
+                // SERVER-4241: Shell connections don't re-authenticate on reconnect.
+                if (jsTest.options().keyFile) {
                     return jsTest.authenticate(db.getMongo());
                 }
                 return true;
@@ -70,7 +131,7 @@ var getLastOpTime;
                 print(e);
                 return false;
             }
-        });
+        }, retries);
     };
 
     getLatestOp = function(server) {
@@ -121,11 +182,13 @@ var getLastOpTime;
         var e;
         var master;
         try {
-            assert.commandWorked(admin.runCommand({replSetReconfig: config, force: force}));
+            assert.commandWorked(admin.runCommand(
+                {replSetReconfig: rs._updateConfigIfNotDurable(config), force: force}));
         } catch (e) {
-            if (tojson(e).indexOf("error doing query: failed") < 0) {
+            if (!isNetworkError(e)) {
                 throw e;
             }
+            print("Calling replSetReconfig failed. " + tojson(e));
         }
 
         var master = rs.getPrimary().getDB("admin");
@@ -212,6 +275,17 @@ var getLastOpTime;
     };
 
     /**
+     * Waits for the given node to reach the given state, ignoring network errors.
+     */
+    waitForState = function(node, state) {
+        assert.soonNoExcept(function() {
+            assert.commandWorked(node.adminCommand(
+                {replSetTest: 1, waitForMemberState: state, timeoutMillis: 60 * 1000 * 5}));
+            return true;
+        });
+    };
+
+    /**
      * Starts each node in the given replica set if the storage engine supports readConcern
      *'majority'.
      * Returns true if the replica set was started successfully and false otherwise.
@@ -234,19 +308,6 @@ var getLastOpTime;
     };
 
     /**
-     * Changes the replica set config if journaling/ephemal storage engine to set
-     * writeConcernMajorityJournalDefault to false.
-     */
-    updateConfigIfNotDurable = function(config) {
-        var runningWithoutJournaling = TestData.noJournal ||
-            0 != ["inMemory", "ephemeralForTest"].filter((a) => a == TestData.storageEngine).length;
-        if (runningWithoutJournaling) {
-            config.writeConcernMajorityJournalDefault = false;
-        }
-        return config;
-    };
-
-    /**
      * Performs a reInitiate() call on 'replSetTest', ignoring errors that are related to an aborted
      * secondary member. All other errors are rethrown.
      */
@@ -257,8 +318,7 @@ var getLastOpTime;
             // reInitiate can throw because it tries to run an ismaster command on
             // all secondaries, including the new one that may have already aborted
             const errMsg = tojson(e);
-            if (errMsg.indexOf("error doing query: failed") > -1 ||
-                errMsg.indexOf("socket exception") > -1) {
+            if (isNetworkError(e)) {
                 // Ignore these exceptions, which are indicative of an aborted node
             } else {
                 throw e;

@@ -33,79 +33,148 @@
 #include "mongo/db/repl/oplog_entry.h"
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
 
-const int OplogEntry::kOplogVersion = 2;
+namespace {
 
-OplogEntry::OplogEntry(BSONObj rawInput) : raw(std::move(rawInput)) {
-    if (MONGO_unlikely(!raw.isOwned())) {
-        raw = raw.copy();
-    }
-
-    for (auto elem : raw) {
-        const auto name = elem.fieldNameStringData();
-        if (name == "ns") {
-            ns = elem.valuestrsafe();
-        } else if (name == "op") {
-            opType = elem.valuestrsafe();
-        } else if (name == "o2") {
-            o2 = elem;
-        } else if (name == "ts") {
-            ts = elem;
-        } else if (name == "v") {
-            version = elem;
-        } else if (name == "o") {
-            o = elem;
-        }
-    }
-}
-
-bool OplogEntry::isCommand() const {
-    return opType[0] == 'c';
-}
-
-bool OplogEntry::isCrudOpType() const {
-    switch (opType[0]) {
-        case 'd':
-        case 'i':
-        case 'u':
-            return opType[1] == 0;
-    }
-    return false;
-}
-
-bool OplogEntry::hasNamespace() const {
-    return !ns.empty();
-}
-
-int OplogEntry::getVersion() const {
-    return version.eoo() ? 1 : version.Int();
-}
-
-BSONElement OplogEntry::getIdElement() const {
-    invariant(isCrudOpType());
-    switch (opType[0]) {
-        case 'u':
-            return o2.Obj()["_id"];
-        case 'd':
-        case 'i':
-            return o.Obj()["_id"];
+OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
+    StringData commandString(objectField.firstElementFieldName());
+    if (commandString == "create") {
+        return OplogEntry::CommandType::kCreate;
+    } else if (commandString == "renameCollection") {
+        return OplogEntry::CommandType::kRenameCollection;
+    } else if (commandString == "drop") {
+        return OplogEntry::CommandType::kDrop;
+    } else if (commandString == "collMod") {
+        return OplogEntry::CommandType::kCollMod;
+    } else if (commandString == "applyOps") {
+        return OplogEntry::CommandType::kApplyOps;
+    } else if (commandString == "dropDatabase") {
+        return OplogEntry::CommandType::kDropDatabase;
+    } else if (commandString == "emptycapped") {
+        return OplogEntry::CommandType::kEmptyCapped;
+    } else if (commandString == "convertToCapped") {
+        return OplogEntry::CommandType::kConvertToCapped;
+    } else if (commandString == "createIndexes") {
+        return OplogEntry::CommandType::kCreateIndexes;
+    } else if (commandString == "dropIndexes") {
+        return OplogEntry::CommandType::kDropIndexes;
+    } else if (commandString == "deleteIndexes") {
+        return OplogEntry::CommandType::kDropIndexes;
+    } else {
+        severe() << "Unknown oplog entry command type: " << commandString
+                 << " Object field: " << redact(objectField);
+        fassertFailedNoTrace(40444);
     }
     MONGO_UNREACHABLE;
 }
 
+}  // namespace
+
+const int OplogEntry::kOplogVersion = 2;
+
+// Static
+StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
+    try {
+        return OplogEntry(object);
+    } catch (...) {
+        return exceptionToStatus();
+    }
+    MONGO_UNREACHABLE;
+}
+
+OplogEntry::OplogEntry(BSONObj rawInput)
+    : raw(std::move(rawInput)), _commandType(OplogEntry::CommandType::kNotCommand) {
+    raw = raw.getOwned();
+
+    parseProtected(IDLParserErrorContext("OplogEntryBase"), raw);
+
+    // Parse command type from 'o' and 'o2' fields.
+    if (isCommand()) {
+        _commandType = parseCommandType(getObject());
+    }
+}
+OplogEntry::OplogEntry(OpTime opTime,
+                       long long hash,
+                       OpTypeEnum opType,
+                       NamespaceString nss,
+                       int version,
+                       const BSONObj& oField,
+                       const BSONObj& o2Field) {
+    setTimestamp(opTime.getTimestamp());
+    setTerm(opTime.getTerm());
+    setHash(hash);
+    setOpType(opType);
+    setNamespace(nss);
+    setVersion(version);
+    setObject(oField);
+    setObject2(o2Field);
+
+    // This is necessary until we remove `raw` in SERVER-29200.
+    raw = toBSON();
+}
+
+OplogEntry::OplogEntry(OpTime opTime,
+                       long long hash,
+                       OpTypeEnum opType,
+                       NamespaceString nss,
+                       int version,
+                       const BSONObj& oField)
+    : OplogEntry(opTime, hash, opType, nss, version, oField, BSONObj()) {}
+
+OplogEntry::OplogEntry(
+    OpTime opTime, long long hash, OpTypeEnum opType, NamespaceString nss, const BSONObj& oField)
+    : OplogEntry(opTime, hash, opType, nss, OplogEntry::kOplogVersion, oField, BSONObj()) {}
+
+OplogEntry::OplogEntry(OpTime opTime,
+                       long long hash,
+                       OpTypeEnum opType,
+                       NamespaceString nss,
+                       const BSONObj& oField,
+                       const BSONObj& o2Field)
+    : OplogEntry(opTime, hash, opType, nss, OplogEntry::kOplogVersion, oField, o2Field) {}
+
+bool OplogEntry::isCommand() const {
+    return getOpType() == OpTypeEnum::kCommand;
+}
+
+bool OplogEntry::isCrudOpType() const {
+    switch (getOpType()) {
+        case OpTypeEnum::kInsert:
+        case OpTypeEnum::kDelete:
+        case OpTypeEnum::kUpdate:
+            return true;
+        case OpTypeEnum::kCommand:
+        case OpTypeEnum::kNoop:
+            return false;
+    }
+    MONGO_UNREACHABLE;
+}
+
+BSONElement OplogEntry::getIdElement() const {
+    invariant(isCrudOpType());
+    if (getOpType() == OpTypeEnum::kUpdate) {
+        return getObject2()->getField("_id");
+    } else {
+        return getObject()["_id"];
+    }
+}
+
+OplogEntry::CommandType OplogEntry::getCommandType() const {
+    invariant(isCommand());
+    invariant(_commandType != OplogEntry::CommandType::kNotCommand);
+    return _commandType;
+}
+
 OpTime OplogEntry::getOpTime() const {
-    return fassertStatusOK(34436, OpTime::parseFromOplogEntry(raw));
-}
-
-Seconds OplogEntry::getTimestampSecs() const {
-    return Seconds(ts.timestamp().getSecs());
-}
-
-StringData OplogEntry::getCollectionName() const {
-    return nsToCollectionSubstring(ns);
+    long long term = OpTime::kUninitializedTerm;
+    if (getTerm()) {
+        term = getTerm().get();
+    }
+    return OpTime(getTimestamp(), term);
 }
 
 std::string OplogEntry::toString() const {

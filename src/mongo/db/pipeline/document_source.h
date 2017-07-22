@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 
@@ -116,6 +117,16 @@ class DocumentSource : public IntrusiveCounterUnsigned {
 public:
     using Parser = stdx::function<std::vector<boost::intrusive_ptr<DocumentSource>>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
+
+    enum class InitialSourceType {
+        // Stage requires input from a preceding DocumentSource.
+        kNotInitialSource,
+        // Stage does not need an input source and should be the first stage in the pipeline.
+        kInitialSource,
+        // Similar to kInitialSource, but does not require an underlying collection to produce
+        // output.
+        kCollectionlessInitialSource
+    };
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -199,57 +210,77 @@ public:
      * this DocumentSource.
      *
      * All implementers must call pExpCtx->checkForInterrupt().
+     *
+     * For performance reasons, a streaming stage must not keep references to documents across calls
+     * to getNext(). Such stages must retrieve a result from their child and then release it (or
+     * return it) before asking for another result. Failing to do so can result in extra work, since
+     * the Document/Value library must copy data on write when that data has a refcount above one.
      */
     virtual GetNextResult getNext() = 0;
 
     /**
-     * Inform the source that it is no longer needed and may release its resources.  After
-     * dispose() is called the source must still be able to handle iteration requests, but may
-     * become eof().
-     * NOTE: For proper mutex yielding, dispose() must be called on any DocumentSource that will
-     * not be advanced until eof(), see SERVER-6123.
+     * Informs the stage that it is no longer needed and can release its resources. After dispose()
+     * is called the stage must still be able to handle calls to getNext(), but can return kEOF.
+     *
+     * This is a non-virtual public interface to ensure dispose() is threaded through the entire
+     * pipeline. Subclasses should override doDispose() to implement their disposal.
      */
-    virtual void dispose();
+    void dispose() {
+        doDispose();
+        if (pSource) {
+            pSource->dispose();
+        }
+    }
 
     /**
-       Get the source's name.
-
-       @returns the std::string name of the source as a constant string;
-         this is static, and there's no need to worry about adopting it
+     * Get the stage's name.
      */
     virtual const char* getSourceName() const;
 
     /**
-      Set the underlying source this source should use to get Documents
-      from.
-
-      It is an error to set the source more than once.  This is to
-      prevent changing sources once the original source has been started;
-      this could break the state maintained by the DocumentSource.
-
-      This pointer is not reference counted because that has led to
-      some circular references.  As a result, this doesn't keep
-      sources alive, and is only intended to be used temporarily for
-      the lifetime of a Pipeline::run().
-
-      @param pSource the underlying source to use
+     * Set the underlying source this source should use to get Documents from. Must not throw
+     * exceptions.
      */
-    virtual void setSource(DocumentSource* pSource);
+    virtual void setSource(DocumentSource* source) {
+        pSource = source;
+    }
 
     /**
      * In the default case, serializes the DocumentSource and adds it to the std::vector<Value>.
      *
-     * A subclass may choose to overwrite this, rather than serialize,
-     * if it should output multiple stages (eg, $sort sometimes also outputs a $limit).
+     * A subclass may choose to overwrite this, rather than serialize, if it should output multiple
+     * stages (eg, $sort sometimes also outputs a $limit).
+     *
+     * The 'explain' parameter indicates the explain verbosity mode, or is equal boost::none if no
+     * explain is requested.
      */
-
-    virtual void serializeToArray(std::vector<Value>& array, bool explain = false) const;
+    virtual void serializeToArray(
+        std::vector<Value>& array,
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const;
 
     /**
-     * Returns true if doesn't require an input source (most DocumentSources do).
+     * Subclasses should return InitialSourceType::kInitialSource if the stage does not require an
+     * input source, or InitialSourceType::kCollectionlessInitialSource if the stage will produce
+     * the input for the pipeline independent of an underlying collection. The latter are specified
+     * with {aggregate: 1}, e.g. $currentOp.
      */
-    virtual bool isValidInitialSource() const {
-        return false;
+    virtual InitialSourceType getInitialSourceType() const {
+        return InitialSourceType::kNotInitialSource;
+    }
+
+    /**
+     * Returns true if this stage does not require an input source.
+     */
+    bool isInitialSource() const {
+        return getInitialSourceType() != InitialSourceType::kNotInitialSource;
+    }
+
+    /**
+     * Returns true if this stage will produce the input for the pipeline independent of an
+     * underlying collection. These are specified with {aggregate: 1}, e.g. $currentOp.
+     */
+    bool isCollectionlessInitialSource() const {
+        return getInitialSourceType() == InitialSourceType::kCollectionlessInitialSource;
     }
 
     /**
@@ -269,22 +300,10 @@ public:
     virtual void reattachToOperationContext(OperationContext* opCtx) {}
 
     /**
-     * Injects a new ExpressionContext into this DocumentSource and propagates the ExpressionContext
-     * to all child expressions, accumulators, etc.
-     *
-     * Stages which require work to propagate the ExpressionContext to their private execution
-     * machinery should override doInjectExpressionContext().
-     */
-    void injectExpressionContext(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-        pExpCtx = expCtx;
-        doInjectExpressionContext();
-    }
-
-    /**
      * Create a DocumentSource pipeline stage from 'stageObj'.
      */
     static std::vector<boost::intrusive_ptr<DocumentSource>> parse(
-        const boost::intrusive_ptr<ExpressionContext> expCtx, BSONObj stageObj);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj);
 
     /**
      * Registers a DocumentSource with a parsing function, so that when a stage with the given name
@@ -375,11 +394,25 @@ public:
             kAllExcept,
         };
 
-        GetModPathsReturn(Type type, std::set<std::string>&& paths)
-            : type(type), paths(std::move(paths)) {}
+        GetModPathsReturn(Type type,
+                          std::set<std::string>&& paths,
+                          StringMap<std::string>&& renames)
+            : type(type), paths(std::move(paths)), renames(std::move(renames)) {}
 
         Type type;
         std::set<std::string> paths;
+
+        // Stages may fill out 'renames' to contain information about path renames. Each entry in
+        // 'renames' maps from the new name of the path (valid in documents flowing *out* of this
+        // stage) to the old name of the path (valid in documents flowing *into* this stage).
+        //
+        // For example, consider the stage
+        //
+        //   {$project: {_id: 0, a: 1, b: "$c"}}
+        //
+        // This stage should return kAllExcept, since it modifies all paths other than "a". It can
+        // also fill out 'renames' with the mapping "b" => "c".
+        StringMap<std::string> renames;
     };
 
     /**
@@ -390,7 +423,7 @@ public:
      * See GetModPathsReturn above for the possible return values and what they mean.
      */
     virtual GetModPathsReturn getModifiedPaths() const {
-        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>{}};
+        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>{}, {}};
     }
 
     /**
@@ -438,19 +471,7 @@ public:
     }
 
 protected:
-    /**
-       Base constructor.
-     */
     explicit DocumentSource(const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
-
-    /**
-     * DocumentSources which need to update their internal state when attaching to a new
-     * ExpressionContext should override this method.
-     *
-     * Any stage subclassing from DocumentSource should override this method if it contains
-     * expressions or accumulators which need to attach to the newly injected ExpressionContext.
-     */
-    virtual void doInjectExpressionContext() {}
 
     /**
      * Attempt to perform an optimization with the following source in the pipeline. 'container'
@@ -469,6 +490,11 @@ protected:
         return std::next(itr);
     };
 
+    /**
+     * Release any resources held by this stage. After doDispose() is called the stage must still be
+     * able to handle calls to getNext(), but can return kEOF.
+     */
+    virtual void doDispose() {}
 
     /*
       Most DocumentSources have an underlying source they get their data
@@ -489,8 +515,12 @@ private:
      * This is used by the default implementation of serializeToArray() to add this object
      * to a pipeline being serialized. Returning a missing() Value results in no entry
      * being added to the array for this stage (DocumentSource).
+     *
+     * The 'explain' parameter indicates the explain verbosity mode, or is equal boost::none if no
+     * explain is requested.
      */
-    virtual Value serialize(bool explain = false) const = 0;
+    virtual Value serialize(
+        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const = 0;
 };
 
 /** This class marks DocumentSources that should be split between the merger and the shards.
@@ -523,6 +553,10 @@ public:
     // Wraps mongod-specific functions to allow linking into mongos.
     class MongodInterface {
     public:
+        enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
+        enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
+        enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
+
         virtual ~MongodInterface(){};
 
         /**
@@ -566,6 +600,12 @@ public:
                                           BSONObjBuilder* builder) const = 0;
 
         /**
+         * Appends the record count for collection "nss" to "builder".
+         */
+        virtual Status appendRecordCount(const NamespaceString& nss,
+                                         BSONObjBuilder* builder) const = 0;
+
+        /**
          * Gets the collection options for the collection given by 'nss'.
          */
         virtual BSONObj getCollectionOptions(const NamespaceString& nss) = 0;
@@ -587,9 +627,24 @@ public:
          *
          * This function returns a non-OK status if parsing the pipeline failed.
          */
-        virtual StatusWith<boost::intrusive_ptr<Pipeline>> makePipeline(
+        virtual StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
             const std::vector<BSONObj>& rawPipeline,
             const boost::intrusive_ptr<ExpressionContext>& expCtx) = 0;
+
+        /**
+         * Returns a vector of owned BSONObjs, each of which contains details of an in-progress
+         * operation or, optionally, an idle connection. If userMode is kIncludeAllUsers, report
+         * operations for all authenticated users; otherwise, report only the current user's
+         * operations.
+         */
+        virtual std::vector<BSONObj> getCurrentOps(CurrentOpConnectionsMode connMode,
+                                                   CurrentOpUserMode userMode,
+                                                   CurrentOpTruncateMode) const = 0;
+
+        /**
+         * Returns the name of the local shard if sharding is enabled, or an empty string.
+         */
+        virtual std::string getShardName(OperationContext* opCtx) const = 0;
 
         // Add new methods as needed.
     };

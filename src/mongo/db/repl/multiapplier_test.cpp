@@ -45,7 +45,6 @@ public:
 private:
     executor::ThreadPoolMock::Options makeThreadPoolMockOptions() const override;
     void setUp() override;
-    void tearDown() override;
 };
 
 executor::ThreadPoolMock::Options MultiApplierTest::makeThreadPoolMockOptions() const {
@@ -60,21 +59,20 @@ void MultiApplierTest::setUp() {
     launchExecutorThread();
 }
 
-void MultiApplierTest::tearDown() {
-    executor::ThreadPoolExecutorTest::shutdownExecutorThread();
-    executor::ThreadPoolExecutorTest::joinExecutorThread();
-
-    // Local tear down steps here.
-
-    executor::ThreadPoolExecutorTest::tearDown();
-}
-
 Status applyOperation(MultiApplier::OperationPtrs*) {
     return Status::OK();
 };
 
+/**
+ * Generates oplog entries with the given number used for the timestamp.
+ */
+OplogEntry makeOplogEntry(int ts) {
+    return OplogEntry(
+        OpTime(Timestamp(ts, 1), 1), 1LL, OpTypeEnum::kNoop, NamespaceString("a.a"), BSONObj());
+}
+
 TEST_F(MultiApplierTest, InvalidConstruction) {
-    const MultiApplier::Operations operations{OplogEntry(BSON("ts" << Timestamp(Seconds(123), 0)))};
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
     auto multiApply = [](OperationContext*,
                          MultiApplier::Operations,
                          MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> {
@@ -96,21 +94,6 @@ TEST_F(MultiApplierTest, InvalidConstruction) {
         UserException,
         ErrorCodes::BadValue,
         "empty list of operations");
-
-    // Last operation missing timestamp field.
-    ASSERT_THROWS_CODE_AND_WHAT(
-        MultiApplier(&getExecutor(), {OplogEntry(BSONObj())}, applyOperation, multiApply, callback),
-        UserException,
-        ErrorCodes::FailedToParse,
-        "last operation missing 'ts' field: {}");
-
-    // "ts" field in last operation not a timestamp.
-    ASSERT_THROWS_CODE_AND_WHAT(
-        MultiApplier(
-            &getExecutor(), {OplogEntry(BSON("ts" << 123))}, applyOperation, multiApply, callback),
-        UserException,
-        ErrorCodes::TypeMismatch,
-        "'ts' in last operation not a timestamp: { ts: 123 }");
 
     // Invalid apply operation function.
     ASSERT_THROWS_CODE_AND_WHAT(
@@ -137,11 +120,26 @@ TEST_F(MultiApplierTest, InvalidConstruction) {
         "callback function cannot be null");
 }
 
+TEST_F(MultiApplierTest, MultiApplierTransitionsDirectlyToCompleteIfShutdownBeforeStarting) {
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
+
+    auto multiApply = [](OperationContext*,
+                         MultiApplier::Operations,
+                         MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> { return OpTime(); };
+    auto callback = [](const Status&) {};
+
+    MultiApplier multiApplier(&getExecutor(), operations, applyOperation, multiApply, callback);
+    ASSERT_EQUALS(MultiApplier::State::kPreStart, multiApplier.getState_forTest());
+
+    multiApplier.shutdown();
+    ASSERT_EQUALS(MultiApplier::State::kComplete, multiApplier.getState_forTest());
+}
+
 TEST_F(MultiApplierTest, MultiApplierInvokesCallbackWithCallbackCanceledStatusUponCancellation) {
-    const MultiApplier::Operations operations{OplogEntry(BSON("ts" << Timestamp(Seconds(123), 0)))};
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
-    auto multiApply = [&](OperationContext* txn,
+    auto multiApply = [&](OperationContext* opCtx,
                           MultiApplier::Operations operations,
                           MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> {
         multiApplyInvoked = true;
@@ -152,17 +150,22 @@ TEST_F(MultiApplierTest, MultiApplierInvokesCallbackWithCallbackCanceledStatusUp
     auto callback = [&](const Status& result) { callbackResult = result; };
 
     MultiApplier multiApplier(&getExecutor(), operations, applyOperation, multiApply, callback);
+    ASSERT_EQUALS(MultiApplier::State::kPreStart, multiApplier.getState_forTest());
     {
         auto net = getNet();
         executor::NetworkInterfaceMock::InNetworkGuard guard(net);
 
         // Executor cannot run multiApply callback while we are on the network thread.
         ASSERT_OK(multiApplier.startup());
+        ASSERT_EQUALS(MultiApplier::State::kRunning, multiApplier.getState_forTest());
+
         multiApplier.shutdown();
+        ASSERT_EQUALS(MultiApplier::State::kShuttingDown, multiApplier.getState_forTest());
 
         net->runReadyNetworkOperations();
     }
     multiApplier.join();
+    ASSERT_EQUALS(MultiApplier::State::kComplete, multiApplier.getState_forTest());
 
     ASSERT_FALSE(multiApplyInvoked);
 
@@ -170,7 +173,7 @@ TEST_F(MultiApplierTest, MultiApplierInvokesCallbackWithCallbackCanceledStatusUp
 }
 
 TEST_F(MultiApplierTest, MultiApplierPassesMultiApplyErrorToCallback) {
-    const MultiApplier::Operations operations{OplogEntry(BSON("ts" << Timestamp(Seconds(123), 0)))};
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
     Status multiApplyError(ErrorCodes::OperationFailed, "multi apply failed");
@@ -199,11 +202,11 @@ TEST_F(MultiApplierTest, MultiApplierPassesMultiApplyErrorToCallback) {
 }
 
 TEST_F(MultiApplierTest, MultiApplierCatchesMultiApplyExceptionAndConvertsToCallbackStatus) {
-    const MultiApplier::Operations operations{OplogEntry(BSON("ts" << Timestamp(Seconds(123), 0)))};
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
 
     bool multiApplyInvoked = false;
     Status multiApplyError(ErrorCodes::OperationFailed, "multi apply failed");
-    auto multiApply = [&](OperationContext* txn,
+    auto multiApply = [&](OperationContext* opCtx,
                           MultiApplier::Operations operations,
                           MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> {
         multiApplyInvoked = true;
@@ -231,14 +234,14 @@ TEST_F(MultiApplierTest, MultiApplierCatchesMultiApplyExceptionAndConvertsToCall
 TEST_F(
     MultiApplierTest,
     MultiApplierProvidesOperationContextToMultiApplyFunctionButDisposesBeforeInvokingFinishCallback) {
-    const MultiApplier::Operations operations{OplogEntry(BSON("ts" << Timestamp(Seconds(123), 0)))};
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
 
     OperationContext* multiApplyTxn = nullptr;
     MultiApplier::Operations operationsToApply;
-    auto multiApply = [&](OperationContext* txn,
+    auto multiApply = [&](OperationContext* opCtx,
                           MultiApplier::Operations operations,
                           MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> {
-        multiApplyTxn = txn;
+        multiApplyTxn = opCtx;
         operationsToApply = operations;
         return operationsToApply.back().getOpTime();
     };
@@ -265,6 +268,57 @@ TEST_F(
 
     ASSERT_OK(callbackResult);
     ASSERT_FALSE(callbackTxn);
+}
+
+class SharedCallbackState {
+    MONGO_DISALLOW_COPYING(SharedCallbackState);
+
+public:
+    explicit SharedCallbackState(bool* sharedCallbackStateDestroyed)
+        : _sharedCallbackStateDestroyed(sharedCallbackStateDestroyed) {}
+    ~SharedCallbackState() {
+        *_sharedCallbackStateDestroyed = true;
+    }
+
+private:
+    bool* _sharedCallbackStateDestroyed;
+};
+
+TEST_F(MultiApplierTest, MultiApplierResetsOnCompletionCallbackFunctionPointerUponCompletion) {
+    bool sharedCallbackStateDestroyed = false;
+    auto sharedCallbackData = std::make_shared<SharedCallbackState>(&sharedCallbackStateDestroyed);
+
+    const MultiApplier::Operations operations{makeOplogEntry(123)};
+
+    auto multiApply = [&](OperationContext*,
+                          MultiApplier::Operations operations,
+                          MultiApplier::ApplyOperationFn) -> StatusWith<OpTime> {
+        return operations.back().getOpTime();
+    };
+
+    auto callbackResult = getDetectableErrorStatus();
+
+    MultiApplier multiApplier(
+        &getExecutor(),
+        operations,
+        applyOperation,
+        multiApply,
+        [&callbackResult, sharedCallbackData](const Status& result) { callbackResult = result; });
+
+    sharedCallbackData.reset();
+    ASSERT_FALSE(sharedCallbackStateDestroyed);
+
+    ASSERT_OK(multiApplier.startup());
+    {
+        auto net = getNet();
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+        net->runReadyNetworkOperations();
+    }
+    multiApplier.join();
+
+    ASSERT_OK(callbackResult);
+    // Shared state should be destroyed when applier is finished.
+    ASSERT_TRUE(sharedCallbackStateDestroyed);
 }
 
 }  // namespace

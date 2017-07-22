@@ -46,8 +46,6 @@ using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-using ResponseStatus = mongo::executor::TaskExecutor::ResponseStatus;
-
 class MockProgressManager {
 public:
     void updateMap(int memberId, const OpTime& lastDurableOpTime, const OpTime& lastAppliedOpTime) {
@@ -122,7 +120,7 @@ public:
      */
     BSONObj processNetworkResponse(const BSONObj& obj,
                                    bool expectReadyRequestsAfterProcessing = false);
-    BSONObj processNetworkResponse(const ResponseStatus rs,
+    BSONObj processNetworkResponse(const RemoteCommandResponse rs,
                                    bool expectReadyRequestsAfterProcessing = false);
 
     void runUntil(Date_t when, bool expectReadyRequestsAfterAdvancingClock = false);
@@ -184,7 +182,8 @@ void ReporterTest::setUp() {
 }
 
 void ReporterTest::tearDown() {
-    executor::ThreadPoolExecutorTest::tearDown();
+    getExecutor().shutdown();
+    getExecutor().join();
     // Executor may still invoke reporter's callback before shutting down.
     reporter.reset();
     posUpdater.reset();
@@ -211,7 +210,7 @@ BSONObj ReporterTest::processNetworkResponse(const BSONObj& obj,
     return cmdObj;
 }
 
-BSONObj ReporterTest::processNetworkResponse(const ResponseStatus rs,
+BSONObj ReporterTest::processNetworkResponse(const RemoteCommandResponse rs,
                                              bool expectReadyRequestsAfterProcessing) {
     auto net = getNet();
     net->enterNetwork();

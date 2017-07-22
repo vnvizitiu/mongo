@@ -31,32 +31,90 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/db/client.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/db/stats/counters.h"
-#include "mongo/s/chunk_manager_targeter.h"
-#include "mongo/s/client/dbclient_multi_command.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/commands/chunk_manager_targeter.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/write_ops/batch_upconvert.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-using std::string;
-using std::stringstream;
-using std::vector;
-
 namespace {
+
+bool batchErrorToLastError(const BatchedCommandRequest& request,
+                           const BatchedCommandResponse& response,
+                           LastError* error) {
+    std::unique_ptr<WriteErrorDetail> commandError;
+    WriteErrorDetail* lastBatchError = NULL;
+
+    if (!response.getOk()) {
+        // Command-level error, all writes failed
+        commandError.reset(new WriteErrorDetail);
+        commandError->setErrCode(response.getErrCode());
+        commandError->setErrMessage(response.getErrMessage());
+
+        lastBatchError = commandError.get();
+    } else if (response.isErrDetailsSet()) {
+        // The last error in the batch is always reported - this matches expected COE semantics for
+        // insert batches. For updates and deletes, error is only reported if the error was on the
+        // last item.
+        const bool lastOpErrored = response.getErrDetails().back()->getIndex() ==
+            static_cast<int>(request.sizeWriteOps() - 1);
+        if (request.getBatchType() == BatchedCommandRequest::BatchType_Insert || lastOpErrored) {
+            lastBatchError = response.getErrDetails().back();
+        }
+    } else {
+        // We don't care about write concern errors, these happen in legacy mode in GLE.
+    }
+
+    // Record an error if one exists
+    if (lastBatchError) {
+        const auto& errMsg = lastBatchError->getErrMessage();
+        error->setLastError(lastBatchError->getErrCode(),
+                            errMsg.empty() ? "see code for details" : errMsg.c_str());
+        return true;
+    }
+
+    // Record write stats otherwise
+    //
+    // NOTE: For multi-write batches, our semantics change a little because we don't have
+    // un-aggregated "n" stats
+    if (request.getBatchType() == BatchedCommandRequest::BatchType_Update) {
+        BSONObj upsertedId;
+        if (response.isUpsertDetailsSet()) {
+            // Only report the very last item's upserted id if applicable
+            if (response.getUpsertDetails().back()->getIndex() + 1 ==
+                static_cast<int>(request.sizeWriteOps())) {
+                upsertedId = response.getUpsertDetails().back()->getUpsertedID();
+            }
+        }
+
+        const int numUpserted = response.isUpsertDetailsSet() ? response.sizeUpsertDetails() : 0;
+        const int numMatched = response.getN() - numUpserted;
+        dassert(numMatched >= 0);
+
+        // Wrap upserted id in "upserted" field
+        BSONObj leUpsertedId;
+        if (!upsertedId.isEmpty()) {
+            leUpsertedId = upsertedId.firstElement().wrap(kUpsertedFieldName);
+        }
+
+        error->recordUpdate(numMatched > 0, response.getN(), leUpsertedId);
+    } else if (request.getBatchType() == BatchedCommandRequest::BatchType_Delete) {
+        error->recordDelete(response.getN());
+    }
+
+    return false;
+}
 
 /**
  * Base class for mongos write commands.  Cluster write commands support batch writes and write
@@ -69,113 +127,92 @@ class ClusterWriteCmd : public Command {
 public:
     virtual ~ClusterWriteCmd() {}
 
-    virtual bool slaveOk() const {
+    bool slaveOk() const final {
         return false;
     }
 
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
         return true;
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        Status status = auth::checkAuthForWriteCommand(AuthorizationSession::get(client),
-                                                       _writeType,
-                                                       NamespaceString(parseNs(dbname, cmdObj)),
-                                                       cmdObj);
+    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
+        Status status = auth::checkAuthForWriteCommand(
+            AuthorizationSession::get(opCtx->getClient()), _writeType, request);
 
         // TODO: Remove this when we standardize GLE reporting from commands
         if (!status.isOK()) {
-            LastError::get(client).setLastError(status.code(), status.reason());
+            LastError::get(opCtx->getClient()).setLastError(status.code(), status.reason());
         }
 
         return status;
     }
 
-    virtual Status explain(OperationContext* txn,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata& serverSelectionMetadata,
-                           BSONObjBuilder* out) const {
-        BatchedCommandRequest request(_writeType);
-
-        string errMsg;
-        if (!request.parseBSON(dbname, cmdObj, &errMsg) || !request.isValid(&errMsg)) {
-            return Status(ErrorCodes::FailedToParse, errMsg);
-        }
+    Status explain(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const final {
+        BatchedCommandRequest batchedRequest(_writeType);
+        OpMsgRequest request;
+        request.body = cmdObj;
+        invariant(request.getDatabase() == dbname);  // Ensured by explain command's run() method.
+        batchedRequest.parseRequest(request);
 
         // We can only explain write batches of size 1.
-        if (request.sizeWriteOps() != 1U) {
+        if (batchedRequest.sizeWriteOps() != 1U) {
             return Status(ErrorCodes::InvalidLength, "explained write batches must be of size 1");
         }
 
-        BSONObjBuilder explainCmdBob;
-        int options = 0;
-        ClusterExplain::wrapAsExplain(
-            cmdObj, verbosity, serverSelectionMetadata, &explainCmdBob, &options);
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
 
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
 
         // Target the command to the shards based on the singleton batch item.
-        BatchItemRef targetingBatchItem(&request, 0);
-        vector<Strategy::CommandResult> shardResults;
+        BatchItemRef targetingBatchItem(&batchedRequest, 0);
+        std::vector<Strategy::CommandResult> shardResults;
         Status status =
-            _commandOpWrite(txn, dbname, explainCmdBob.obj(), targetingBatchItem, &shardResults);
+            _commandOpWrite(opCtx, dbname, explainCmd, targetingBatchItem, &shardResults);
         if (!status.isOK()) {
             return status;
         }
 
         return ClusterExplain::buildExplainResult(
-            txn, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), out);
+            opCtx, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), out);
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
-        BatchedCommandRequest request(_writeType);
-        BatchedCommandResponse response;
+    bool enhancedRun(OperationContext* opCtx,
+                     const OpMsgRequest& request,
+                     BSONObjBuilder& result) final {
+        BatchedCommandRequest batchedRequest(_writeType);
+        batchedRequest.parseRequest(request);
+
+        auto& lastError = LastError::get(opCtx->getClient());
 
         ClusterWriter writer(true, 0);
-
-        LastError* cmdLastError = &LastError::get(cc());
+        BatchedCommandResponse response;
 
         {
             // Disable the last error object for the duration of the write
-            LastError::Disabled disableLastError(cmdLastError);
-
-            // TODO: if we do namespace parsing, push this to the type
-            if (!request.parseBSON(dbname, cmdObj, &errmsg) || !request.isValid(&errmsg)) {
-                // Batch parse failure
-                response.setOk(false);
-                response.setErrCode(ErrorCodes::FailedToParse);
-                response.setErrMessage(errmsg);
-            } else {
-                writer.write(txn, request, &response);
-            }
-
-            dassert(response.isValid(NULL));
+            LastError::Disabled disableLastError(&lastError);
+            writer.write(opCtx, batchedRequest, &response);
         }
 
         // Populate the lastError object based on the write response
-        cmdLastError->reset();
-        batchErrorToLastError(request, response, cmdLastError);
+        lastError.reset();
+        batchErrorToLastError(batchedRequest, response, &lastError);
 
         size_t numAttempts;
 
         if (!response.getOk()) {
             numAttempts = 0;
-        } else if (request.getOrdered() && response.isErrDetailsSet()) {
+        } else if (batchedRequest.getWriteCommandBase().getOrdered() &&
+                   response.isErrDetailsSet()) {
             // Add one failed attempt
             numAttempts = response.getErrDetailsAt(0)->getIndex() + 1;
         } else {
-            numAttempts = request.sizeWriteOps();
+            numAttempts = batchedRequest.sizeWriteOps();
         }
 
         // TODO: increase opcounters by more than one
@@ -195,16 +232,12 @@ public:
 
         // Save the last opTimes written on each shard for this client, to allow GLE to work
         if (haveClient()) {
-            ClusterLastErrorInfo::get(cc()).addHostOpTimes(writer.getStats().getWriteOpTimes());
+            ClusterLastErrorInfo::get(opCtx->getClient())
+                ->addHostOpTimes(writer.getStats().getWriteOpTimes());
         }
 
-        // TODO
-        // There's a pending issue about how to report response here. If we use
-        // the command infra-structure, we should reuse the 'errmsg' field. But
-        // we have already filed that message inside the BatchCommandResponse.
-        // return response.getOk();
         result.appendElements(response.toBSON());
-        return true;
+        return response.getOk();
     }
 
 protected:
@@ -225,7 +258,7 @@ private:
      *
      * Does *not* retry or retarget if the metadata is stale.
      */
-    static Status _commandOpWrite(OperationContext* txn,
+    static Status _commandOpWrite(OperationContext* opCtx,
                                   const std::string& dbName,
                                   const BSONObj& command,
                                   BatchItemRef targetingBatchItem,
@@ -233,79 +266,76 @@ private:
         // Note that this implementation will not handle targeting retries and does not completely
         // emulate write behavior
         TargeterStats stats;
-        ChunkManagerTargeter targeter(
-            NamespaceString(targetingBatchItem.getRequest()->getTargetingNS()), &stats);
-        Status status = targeter.init(txn);
+        ChunkManagerTargeter targeter(targetingBatchItem.getRequest()->getTargetingNSS(), &stats);
+        Status status = targeter.init(opCtx);
         if (!status.isOK())
             return status;
 
-        OwnedPointerVector<ShardEndpoint> endpointsOwned;
-        vector<ShardEndpoint*>& endpoints = endpointsOwned.mutableVector();
+        std::vector<std::unique_ptr<ShardEndpoint>> endpoints;
 
         if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
             ShardEndpoint* endpoint;
-            Status status = targeter.targetInsert(txn, targetingBatchItem.getDocument(), &endpoint);
+            Status status =
+                targeter.targetInsert(opCtx, targetingBatchItem.getDocument(), &endpoint);
             if (!status.isOK())
                 return status;
-            endpoints.push_back(endpoint);
+            endpoints.push_back(std::unique_ptr<ShardEndpoint>{endpoint});
         } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
-            Status status = targeter.targetUpdate(txn, *targetingBatchItem.getUpdate(), &endpoints);
+            Status status =
+                targeter.targetUpdate(opCtx, *targetingBatchItem.getUpdate(), &endpoints);
             if (!status.isOK())
                 return status;
         } else {
             invariant(targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Delete);
-            Status status = targeter.targetDelete(txn, *targetingBatchItem.getDelete(), &endpoints);
+            Status status =
+                targeter.targetDelete(opCtx, *targetingBatchItem.getDelete(), &endpoints);
             if (!status.isOK())
                 return status;
         }
 
-        DBClientMultiCommand dispatcher;
+        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         // Assemble requests
-        for (vector<ShardEndpoint*>::const_iterator it = endpoints.begin(); it != endpoints.end();
-             ++it) {
-            const ShardEndpoint* endpoint = *it;
+        std::vector<AsyncRequestsSender::Request> requests;
+        for (auto it = endpoints.begin(); it != endpoints.end(); ++it) {
+            const ShardEndpoint* endpoint = it->get();
 
-            const ReadPreferenceSetting readPref(ReadPreference::PrimaryOnly, TagSet());
-            auto shardStatus = grid.shardRegistry()->getShard(txn, endpoint->shardName);
+            auto shardStatus = shardRegistry->getShard(opCtx, endpoint->shardName);
             if (!shardStatus.isOK()) {
                 return shardStatus.getStatus();
             }
-            auto swHostAndPort = shardStatus.getValue()->getTargeter()->findHostNoWait(readPref);
-            if (!swHostAndPort.isOK()) {
-                return swHostAndPort.getStatus();
-            }
-
-            ConnectionString host(swHostAndPort.getValue());
-            dispatcher.addCommand(host, dbName, command);
+            requests.emplace_back(shardStatus.getValue()->getId(), command);
         }
 
-        // Errors reported when recv'ing responses
-        dispatcher.sendAll();
+        // Send the requests.
+
+        const ReadPreferenceSetting readPref(ReadPreference::PrimaryOnly, TagSet());
+        AsyncRequestsSender ars(opCtx,
+                                Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                                dbName,
+                                requests,
+                                readPref);
+
+        // Receive the responses.
+
         Status dispatchStatus = Status::OK();
+        while (!ars.done()) {
+            // Block until a response is available.
+            auto response = ars.next();
 
-        // Recv responses
-        while (dispatcher.numPending() > 0) {
-            ConnectionString host;
-            RawBSONSerializable response;
-
-            Status status = dispatcher.recvAny(&host, &response);
-            if (!status.isOK()) {
-                // We always need to recv() all the sent operations
-                dispatchStatus = status;
-                continue;
+            if (!response.swResponse.isOK()) {
+                dispatchStatus = std::move(response.swResponse.getStatus());
+                break;
             }
 
             Strategy::CommandResult result;
-            result.target = host;
-            {
-                auto shardStatus = grid.shardRegistry()->getShard(txn, host.toString());
-                if (!shardStatus.isOK()) {
-                    return shardStatus.getStatus();
-                }
-                result.shardTargetId = shardStatus.getValue()->getId();
-            }
-            result.result = response.toBSON();
+
+            // If the response status was OK, the response must contain which host was targeted.
+            invariant(response.shardHostAndPort);
+            result.target = ConnectionString(std::move(*response.shardHostAndPort));
+
+            result.shardTargetId = std::move(response.shardId);
+            result.result = std::move(response.swResponse.getValue().data);
 
             results->push_back(result);
         }
@@ -314,12 +344,11 @@ private:
     }
 };
 
-
 class ClusterCmdInsert : public ClusterWriteCmd {
 public:
     ClusterCmdInsert() : ClusterWriteCmd("insert", BatchedCommandRequest::BatchType_Insert) {}
 
-    void help(stringstream& help) const {
+    void help(std::stringstream& help) const {
         help << "insert documents";
     }
 
@@ -329,7 +358,7 @@ class ClusterCmdUpdate : public ClusterWriteCmd {
 public:
     ClusterCmdUpdate() : ClusterWriteCmd("update", BatchedCommandRequest::BatchType_Update) {}
 
-    void help(stringstream& help) const {
+    void help(std::stringstream& help) const {
         help << "update documents";
     }
 
@@ -339,7 +368,7 @@ class ClusterCmdDelete : public ClusterWriteCmd {
 public:
     ClusterCmdDelete() : ClusterWriteCmd("delete", BatchedCommandRequest::BatchType_Delete) {}
 
-    void help(stringstream& help) const {
+    void help(std::stringstream& help) const {
         help << "delete documents";
     }
 

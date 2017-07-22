@@ -21,6 +21,7 @@ load('jstests/libs/write_concern_util.js');
     var coll = db[collName];
 
     function dropTestCollection() {
+        replTest.awaitReplication();
         coll.drop();
         assert.eq(0, coll.find().itcount(), "test collection not empty");
     }
@@ -78,7 +79,7 @@ load('jstests/libs/write_concern_util.js');
     });
 
     commands.push({
-        req: {aggregate: collName, pipeline: [{$sort: {type: 1}}, {$out: "foo"}]},
+        req: {aggregate: collName, pipeline: [{$sort: {type: 1}}, {$out: "foo"}], cursor: {}},
         setupFunc: function() {
             coll.insert({_id: 1, type: 'oak'});
             coll.insert({_id: 2, type: 'maple'});
@@ -118,7 +119,7 @@ load('jstests/libs/write_concern_util.js');
     });
 
     function testValidWriteConcern(cmd) {
-        cmd.req.writeConcern = {w: 'majority', wtimeout: 25000};
+        cmd.req.writeConcern = {w: 'majority', wtimeout: ReplSetTest.kDefaultTimeoutMS};
         jsTest.log("Testing " + tojson(cmd.req));
 
         dropTestCollection();

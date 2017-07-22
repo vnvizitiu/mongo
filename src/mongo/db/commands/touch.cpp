@@ -53,7 +53,7 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class TouchCmd : public Command {
+class TouchCmd : public ErrmsgCommandDeprecated {
 public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -80,14 +80,13 @@ public:
         actions.addAction(ActionType::touch);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
-    TouchCmd() : Command("touch") {}
+    TouchCmd() : ErrmsgCommandDeprecated("touch") {}
 
-    virtual bool run(OperationContext* txn,
-                     const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
         if (!nss.isNormal()) {
             errmsg = "bad namespace name";
@@ -102,7 +101,7 @@ public:
             return false;
         }
 
-        AutoGetCollectionForRead context(txn, nss);
+        AutoGetCollectionForReadCommand context(opCtx, nss);
 
         Collection* collection = context.getCollection();
         if (!collection) {
@@ -111,7 +110,7 @@ public:
         }
 
         return appendCommandStatus(result,
-                                   collection->touch(txn, touch_data, touch_indexes, &result));
+                                   collection->touch(opCtx, touch_data, touch_indexes, &result));
     }
 };
 static TouchCmd touchCmd;

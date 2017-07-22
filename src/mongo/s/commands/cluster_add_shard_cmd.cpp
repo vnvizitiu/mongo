@@ -51,9 +51,9 @@ namespace {
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 const char kShardAdded[] = "shardAdded";
 
-class AddShardCmd : public Command {
+class AddShardCmd : public BasicCommand {
 public:
-    AddShardCmd() : Command("addShard", false, "addshard") {}
+    AddShardCmd() : BasicCommand("addShard", "addshard") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -80,17 +80,15 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
 
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           parsedRequest.toCommandForConfig(),
@@ -103,8 +101,8 @@ public:
         result << "shardAdded" << shardAdded;
 
         // Ensure the added shard is visible to this process.
-        auto shardRegistry = Grid::get(txn)->shardRegistry();
-        if (!shardRegistry->getShard(txn, shardAdded).isOK()) {
+        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        if (!shardRegistry->getShard(opCtx, shardAdded).isOK()) {
             return appendCommandStatus(result,
                                        {ErrorCodes::OperationFailed,
                                         "Could not find shard metadata for shard after adding it. "

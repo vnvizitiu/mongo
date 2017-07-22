@@ -49,7 +49,7 @@
 #include "mongo/db/storage/mmap_v1/logfile.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
-#include "mongo/db/storage/paths.h"
+#include "mongo/db/storage/mmap_v1/paths.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/checksum.h"
@@ -725,7 +725,7 @@ void Journal::removeUnneededJournalFiles() {
 }
 
 void Journal::_rotate(unsigned long long lsnOfCurrentJournalEntry) {
-    if (inShutdown() || !_curLogFile)
+    if (globalInShutdownDeprecated() || !_curLogFile)
         return;
 
     j.updateLSNFile(lsnOfCurrentJournalEntry);

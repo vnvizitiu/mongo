@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -23,11 +23,14 @@ struct __wt_lsm_worker_cookie {
 struct __wt_lsm_worker_args {
 	WT_SESSION_IMPL	*session;	/* Session */
 	WT_CONDVAR	*work_cond;	/* Owned by the manager */
+
 	wt_thread_t	tid;		/* Thread id */
+	bool		tid_set;	/* Thread id set */
+
 	u_int		id;		/* My manager slot id */
 	uint32_t	type;		/* Types of operations handled */
-#define	WT_LSM_WORKER_RUN	0x01
-	uint32_t	flags;		/* Worker flags */
+
+	volatile bool	running;	/* Worker is running */
 };
 
 /*
@@ -83,7 +86,7 @@ struct __wt_cursor_lsm {
 struct __wt_lsm_chunk {
 	const char *uri;		/* Data source for this chunk */
 	const char *bloom_uri;		/* URI of Bloom filter, if any */
-	struct timespec create_ts;	/* Creation time (for rate limiting) */
+	struct timespec create_time;	/* Creation time (for rate limiting) */
 	uint64_t count;			/* Approximate count of records */
 	uint64_t size;			/* Final chunk size */
 
@@ -162,6 +165,9 @@ struct __wt_lsm_manager {
 #define	WT_LSM_MAX_WORKERS	20
 #define	WT_LSM_MIN_WORKERS	3
 	WT_LSM_WORKER_ARGS lsm_worker_cookies[WT_LSM_MAX_WORKERS];
+
+#define	WT_LSM_MANAGER_SHUTDOWN	0x01	/* Manager has shut down */
+	uint32_t flags;
 };
 
 /*
@@ -189,7 +195,7 @@ struct __wt_lsm_tree {
 
 #define	LSM_TREE_MAX_QUEUE	100
 	uint32_t queue_ref;
-	WT_RWLOCK *rwlock;
+	WT_RWLOCK rwlock;
 	TAILQ_ENTRY(__wt_lsm_tree) q;
 
 	uint64_t dsk_gen;
@@ -197,10 +203,10 @@ struct __wt_lsm_tree {
 	uint64_t ckpt_throttle;		/* Rate limiting due to checkpoints */
 	uint64_t merge_throttle;	/* Rate limiting due to merges */
 	uint64_t chunk_fill_ms;		/* Estimate of time to fill a chunk */
-	struct timespec last_flush_ts;	/* Timestamp last flush finished */
+	struct timespec last_flush_time;/* Time last flush finished */
 	uint64_t chunks_flushed;	/* Count of chunks flushed since open */
-	struct timespec merge_aggressive_ts;/* Timestamp for merge aggression */
-	struct timespec work_push_ts;	/* Timestamp last work unit added */
+	struct timespec merge_aggressive_time;/* Time for merge aggression */
+	struct timespec work_push_time;	/* Time last work unit added */
 	uint64_t merge_progressing;	/* Bumped when merges are active */
 	uint32_t merge_syncing;		/* Bumped when merges are syncing */
 
@@ -234,11 +240,11 @@ struct __wt_lsm_tree {
 	 * area, copying them into place when a statistics cursor is created.
 	 */
 #define	WT_LSM_TREE_STAT_INCR(session, fld) do {			\
-	if (WT_STAT_ENABLED(session))	\
+	if (WT_STAT_ENABLED(session))					\
 		++(fld);						\
 } while (0)
 #define	WT_LSM_TREE_STAT_INCRV(session, fld, v) do {			\
-	if (WT_STAT_ENABLED(session))	\
+	if (WT_STAT_ENABLED(session))					\
 		(fld) += (int64_t)(v);					\
 } while (0)
 	int64_t bloom_false_positive;
@@ -249,17 +255,21 @@ struct __wt_lsm_tree {
 	int64_t lsm_merge_throttle;
 
 	/*
-	 * The tree is open for business. This used to be a flag, but it is
-	 * susceptible to races.
+	 * Following fields used to be flags but are susceptible to races.
+	 * Don't merge them with flags.
 	 */
-	bool active;
+	bool active;			/* The tree is open for business */
+	bool aggressive_timer_enabled;	/* Timer for merge aggression enabled */
+	bool need_switch;		/* New chunk needs creating */
 
-#define	WT_LSM_TREE_AGGRESSIVE_TIMER	0x01	/* Timer for merge aggression */
-#define	WT_LSM_TREE_COMPACTING		0x02	/* Tree being compacted */
-#define	WT_LSM_TREE_MERGES		0x04	/* Tree should run merges */
-#define	WT_LSM_TREE_NEED_SWITCH		0x08	/* New chunk needs creating */
-#define	WT_LSM_TREE_OPEN		0x10	/* The tree is open */
-#define	WT_LSM_TREE_THROTTLE		0x20	/* Throttle updates */
+	/*
+	 * flags here are not protected for concurrent access, don't put
+	 * anything here that is susceptible to races.
+	 */
+#define	WT_LSM_TREE_COMPACTING		0x01	/* Tree being compacted */
+#define	WT_LSM_TREE_MERGES		0x02	/* Tree should run merges */
+#define	WT_LSM_TREE_OPEN		0x04	/* The tree is open */
+#define	WT_LSM_TREE_THROTTLE		0x08	/* Throttle updates */
 	uint32_t flags;
 };
 

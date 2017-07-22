@@ -185,7 +185,7 @@ void DistributionStatus::report(BSONObjBuilder* builder) const {
 
         BSONArrayBuilder chunkArr(shardEntry.subarrayStart("chunks"));
         for (const auto& chunk : shardChunk.second) {
-            chunkArr.append(chunk.toBSON());
+            chunkArr.append(chunk.toConfigBSON());
         }
         chunkArr.doneFast();
 
@@ -222,8 +222,7 @@ Status BalancerPolicy::isShardSuitableReceiver(const ClusterStatistics::ShardSta
                                                const string& chunkTag) {
     if (stat.isSizeMaxed()) {
         return {ErrorCodes::IllegalOperation,
-                str::stream() << stat.shardId
-                              << " has already reached the maximum total chunk size."};
+                str::stream() << stat.shardId << " has reached its maximum storage size."};
     }
 
     if (stat.isDraining) {
@@ -299,11 +298,10 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
     // migrations for the same shard.
     set<ShardId> usedShards;
 
-    // 1) Check for shards, which are in draining mode or are above the size limit and must have
-    // chunks moved off of them
+    // 1) Check for shards, which are in draining mode
     {
         for (const auto& stat : shardStats) {
-            if (!stat.isDraining && !stat.isSizeExceeded())
+            if (!stat.isDraining)
                 continue;
 
             if (usedShards.count(stat.shardId))

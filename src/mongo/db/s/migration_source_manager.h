@@ -83,7 +83,7 @@ public:
      *  - SendStaleConfigException if the expected collection version does not match what we find it
      *      to be after acquiring the distributed lock.
      */
-    MigrationSourceManager(OperationContext* txn,
+    MigrationSourceManager(OperationContext* opCtx,
                            MoveChunkRequest request,
                            ConnectionString donorConnStr,
                            HostAndPort recipientHost);
@@ -101,7 +101,7 @@ public:
      * Expected state: kCreated
      * Resulting state: kCloning on success, kDone on failure
      */
-    Status startClone(OperationContext* txn);
+    Status startClone(OperationContext* opCtx);
 
     /**
      * Waits for the cloning to catch up sufficiently so we won't have to stay in the critical
@@ -111,7 +111,7 @@ public:
      * Expected state: kCloning
      * Resulting state: kCloneCaughtUp on success, kDone on failure
      */
-    Status awaitToCatchUp(OperationContext* txn);
+    Status awaitToCatchUp(OperationContext* opCtx);
 
     /**
      * Waits for the active clone operation to catch up and enters critical section. Once this call
@@ -122,7 +122,7 @@ public:
      * Expected state: kCloneCaughtUp
      * Resulting state: kCriticalSection on success, kDone on failure
      */
-    Status enterCriticalSection(OperationContext* txn);
+    Status enterCriticalSection(OperationContext* opCtx);
 
     /**
      * Tells the recipient of the chunk to commit the chunk contents, which it received.
@@ -130,7 +130,7 @@ public:
      * Expected state: kCriticalSection
      * Resulting state: kCloneCompleted on success, kDone on failure
      */
-    Status commitChunkOnRecipient(OperationContext* txn);
+    Status commitChunkOnRecipient(OperationContext* opCtx);
 
     /**
      * Tells the recipient shard to fetch the latest portion of data from the donor and to commit it
@@ -144,7 +144,7 @@ public:
      * Expected state: kCloneCompleted
      * Resulting state: kDone
      */
-    Status commitChunkMetadataOnConfig(OperationContext* txn);
+    Status commitChunkMetadataOnConfig(OperationContext* opCtx);
 
     /**
      * May be called at any time. Unregisters the migration source manager from the collection,
@@ -154,7 +154,7 @@ public:
      * Expected state: Any
      * Resulting state: kDone
      */
-    void cleanupOnError(OperationContext* txn);
+    void cleanupOnError(OperationContext* opCtx);
 
     /**
      * Returns the key pattern object for the stored committed metadata.
@@ -176,13 +176,13 @@ public:
 
     /**
      * Retrieves a critical section object to wait on. Will return nullptr if the migration is not
-     * yet in critical section.
+     * yet in the critical section or if the caller is a reader and the migration is still in the
+     * process of transferring the last batch of chunk modifications.
      *
      * Must be called with some form of lock on the collection namespace.
      */
-    std::shared_ptr<Notification<void>> getMigrationCriticalSectionSignal() const {
-        return _critSecSignal;
-    }
+    std::shared_ptr<Notification<void>> getMigrationCriticalSectionSignal(
+        bool isForReadOnlyOperation) const;
 
     /**
      * Returns a report on the active migration.
@@ -200,7 +200,7 @@ private:
      * Called when any of the states fails. May only be called once and will put the migration
      * manager into the kDone state.
      */
-    void _cleanup(OperationContext* txn);
+    void _cleanup(OperationContext* opCtx);
 
     // The parameters to the moveChunk command
     const MoveChunkRequest _args;
@@ -233,6 +233,14 @@ private:
     // callers don't have to hold collection lock in order to wait on it. Available after the
     // critical section stage has completed.
     std::shared_ptr<Notification<void>> _critSecSignal;
+
+    // Used to delay blocking reads up until the commit of the metadata on the config server needs
+    // to happen. This allows the shard to serve reads during transfer of the last batch of mods in
+    // the migration critical section.
+    //
+    // The transition from false to true is protected by the collection X-lock, which happens just
+    // before the config server metadata commit is scheduled.
+    bool _readsShouldWaitOnCritSec{false};
 };
 
 }  // namespace mongo

@@ -41,12 +41,13 @@
 
 namespace mongo {
 
-ClusterClientCursorGuard::ClusterClientCursorGuard(std::unique_ptr<ClusterClientCursor> ccc)
-    : _ccc(std::move(ccc)) {}
+ClusterClientCursorGuard::ClusterClientCursorGuard(OperationContext* opCtx,
+                                                   std::unique_ptr<ClusterClientCursor> ccc)
+    : _opCtx(opCtx), _ccc(std::move(ccc)) {}
 
 ClusterClientCursorGuard::~ClusterClientCursorGuard() {
     if (_ccc && !_ccc->remotesExhausted()) {
-        _ccc->kill();
+        _ccc->kill(_opCtx);
     }
 }
 
@@ -58,21 +59,25 @@ std::unique_ptr<ClusterClientCursor> ClusterClientCursorGuard::releaseCursor() {
     return std::move(_ccc);
 }
 
-ClusterClientCursorGuard ClusterClientCursorImpl::make(executor::TaskExecutor* executor,
+ClusterClientCursorGuard ClusterClientCursorImpl::make(OperationContext* opCtx,
+                                                       executor::TaskExecutor* executor,
                                                        ClusterClientCursorParams&& params) {
     std::unique_ptr<ClusterClientCursor> cursor(
-        new ClusterClientCursorImpl(executor, std::move(params)));
-    return ClusterClientCursorGuard(std::move(cursor));
+        new ClusterClientCursorImpl(executor, std::move(params), opCtx->getLogicalSessionId()));
+    return ClusterClientCursorGuard(opCtx, std::move(cursor));
 }
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(executor::TaskExecutor* executor,
-                                                 ClusterClientCursorParams&& params)
-    : _isTailable(params.isTailable), _root(buildMergerPlan(executor, std::move(params))) {}
+                                                 ClusterClientCursorParams&& params,
+                                                 boost::optional<LogicalSessionId> lsid)
+    : _params(std::move(params)), _root(buildMergerPlan(executor, &_params)), _lsid(lsid) {}
 
-ClusterClientCursorImpl::ClusterClientCursorImpl(std::unique_ptr<RouterStageMock> root)
-    : _root(std::move(root)) {}
+ClusterClientCursorImpl::ClusterClientCursorImpl(std::unique_ptr<RouterStageMock> root,
+                                                 ClusterClientCursorParams&& params,
+                                                 boost::optional<LogicalSessionId> lsid)
+    : _params(std::move(params)), _root(std::move(root)), _lsid(lsid) {}
 
-StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next() {
+StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next(OperationContext* opCtx) {
     // First return stashed results, if there are any.
     if (!_stash.empty()) {
         auto front = std::move(_stash.front());
@@ -81,19 +86,24 @@ StatusWith<ClusterQueryResult> ClusterClientCursorImpl::next() {
         return {front};
     }
 
-    auto next = _root->next();
+    auto next = _root->next(opCtx);
     if (next.isOK() && !next.getValue().isEOF()) {
         ++_numReturnedSoFar;
     }
     return next;
 }
 
-void ClusterClientCursorImpl::kill() {
-    _root->kill();
+void ClusterClientCursorImpl::kill(OperationContext* opCtx) {
+    _root->kill(opCtx);
 }
 
 bool ClusterClientCursorImpl::isTailable() const {
-    return _isTailable;
+    return _params.isTailable;
+}
+
+UserNameIterator ClusterClientCursorImpl::getAuthenticatedUsers() const {
+    return makeUserNameIterator(_params.authenticatedUsers.begin(),
+                                _params.authenticatedUsers.end());
 }
 
 long long ClusterClientCursorImpl::getNumReturnedSoFar() const {
@@ -105,12 +115,6 @@ void ClusterClientCursorImpl::queueResult(const ClusterQueryResult& result) {
     if (resultObj) {
         invariant(resultObj->isOwned());
     }
-
-    auto viewDef = result.getViewDefinition();
-    if (viewDef) {
-        invariant(viewDef->isOwned());
-    }
-
     _stash.push(result);
 }
 
@@ -122,19 +126,18 @@ Status ClusterClientCursorImpl::setAwaitDataTimeout(Milliseconds awaitDataTimeou
     return _root->setAwaitDataTimeout(awaitDataTimeout);
 }
 
-void ClusterClientCursorImpl::setOperationContext(OperationContext* txn) {
-    return _root->setOperationContext(txn);
+boost::optional<LogicalSessionId> ClusterClientCursorImpl::getLsid() const {
+    return _lsid;
 }
 
 std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
-    executor::TaskExecutor* executor, ClusterClientCursorParams&& params) {
-    const auto skip = params.skip;
-    const auto limit = params.limit;
-    const bool hasSort = !params.sort.isEmpty();
+    executor::TaskExecutor* executor, ClusterClientCursorParams* params) {
+    const auto skip = params->skip;
+    const auto limit = params->limit;
+    const bool hasSort = !params->sort.isEmpty();
 
     // The first stage is always the one which merges from the remotes.
-    std::unique_ptr<RouterExecStage> root =
-        stdx::make_unique<RouterStageMerge>(executor, std::move(params));
+    std::unique_ptr<RouterExecStage> root = stdx::make_unique<RouterStageMerge>(executor, params);
 
     if (skip) {
         root = stdx::make_unique<RouterStageSkip>(std::move(root), *skip);

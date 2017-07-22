@@ -70,7 +70,7 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
             }
             break;
         case NumberInt:
-            if (format == JS) {
+            if (format == TenGen) {
                 s << "NumberInt(" << _numberInt() << ")";
                 break;
             }
@@ -306,51 +306,20 @@ string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, 
 
 namespace {
 
-// Map from query operator string name to operator MatchType. Used in BSONElement::getGtLtOp().
-const StringMap<BSONObj::MatchType> queryOperatorMap{
-    // TODO: SERVER-19565 Add $eq after auditing callers.
-    {"lt", BSONObj::LT},
-    {"lte", BSONObj::LTE},
-    {"gte", BSONObj::GTE},
-    {"gt", BSONObj::GT},
-    {"in", BSONObj::opIN},
-    {"ne", BSONObj::NE},
-    {"size", BSONObj::opSIZE},
-    {"all", BSONObj::opALL},
-    {"nin", BSONObj::NIN},
-    {"exists", BSONObj::opEXISTS},
-    {"mod", BSONObj::opMOD},
-    {"type", BSONObj::opTYPE},
-    {"regex", BSONObj::opREGEX},
-    {"options", BSONObj::opOPTIONS},
-    {"elemMatch", BSONObj::opELEM_MATCH},
-    {"near", BSONObj::opNEAR},
-    {"nearSphere", BSONObj::opNEAR},
-    {"geoNear", BSONObj::opNEAR},
-    {"within", BSONObj::opWITHIN},
-    {"geoWithin", BSONObj::opWITHIN},
-    {"geoIntersects", BSONObj::opGEO_INTERSECTS},
-    {"bitsAllSet", BSONObj::opBITS_ALL_SET},
-    {"bitsAllClear", BSONObj::opBITS_ALL_CLEAR},
-    {"bitsAnySet", BSONObj::opBITS_ANY_SET},
-    {"bitsAnyClear", BSONObj::opBITS_ANY_CLEAR},
-};
+// Compares two string elements using a simple binary compare.
+int compareElementStringValues(const BSONElement& leftStr, const BSONElement& rightStr) {
+    // we use memcmp as we allow zeros in UTF8 strings
+    int lsz = leftStr.valuestrsize();
+    int rsz = rightStr.valuestrsize();
+    int common = std::min(lsz, rsz);
+    int res = memcmp(leftStr.valuestr(), rightStr.valuestr(), common);
+    if (res)
+        return res;
+    // longer std::string is the greater one
+    return lsz - rsz;
+}
 
 }  // namespace
-
-int BSONElement::getGtLtOp(int def) const {
-    const char* fn = fieldName();
-    if (fn[0] == '$' && fn[1]) {
-        StringData opName = fieldNameStringData().substr(1);
-
-        StringMap<BSONObj::MatchType>::const_iterator queryOp = queryOperatorMap.find(opName);
-        if (queryOp == queryOperatorMap.end()) {
-            return def;
-        }
-        return queryOp->second;
-    }
-    return def;
-}
 
 /** transform a BSON array into a vector of BSONElements.
     we match array # positions with their vector position, and ignore
@@ -384,18 +353,17 @@ std::vector<BSONElement> BSONElement::Array() const {
 int BSONElement::woCompare(const BSONElement& e,
                            bool considerFieldName,
                            const StringData::ComparatorInterface* comparator) const {
-    int lt = (int)canonicalType();
-    int rt = (int)e.canonicalType();
-    int x = lt - rt;
-    if (x != 0 && (!isNumber() || !e.isNumber()))
-        return x;
-    if (considerFieldName) {
-        x = strcmp(fieldName(), e.fieldName());
-        if (x != 0)
-            return x;
+    if (type() != e.type()) {
+        int lt = (int)canonicalType();
+        int rt = (int)e.canonicalType();
+        if (int diff = lt - rt)
+            return diff;
     }
-    x = compareElementValues(*this, e, comparator);
-    return x;
+    if (considerFieldName) {
+        if (int diff = strcmp(fieldName(), e.fieldName()))
+            return diff;
+    }
+    return compareElementValues(*this, e, comparator);
 }
 
 bool BSONElement::binaryEqual(const BSONElement& rhs) const {
@@ -464,7 +432,7 @@ BSONObj BSONElement::Obj() const {
     return embeddedObjectUserCheck();
 }
 
-BSONElement BSONElement::operator[](const std::string& field) const {
+BSONElement BSONElement::operator[](StringData field) const {
     BSONObj o = Obj();
     return o[field];
 }
@@ -943,20 +911,13 @@ int compareElementValues(const BSONElement& l,
         case jstOID:
             return memcmp(l.value(), r.value(), OID::kOIDSize);
         case Code:
+            return compareElementStringValues(l, r);
         case Symbol:
         case String: {
             if (comparator) {
                 return comparator->compare(l.valueStringData(), r.valueStringData());
             } else {
-                // we use memcmp as we allow zeros in UTF8 strings
-                int lsz = l.valuestrsize();
-                int rsz = r.valuestrsize();
-                int common = std::min(lsz, rsz);
-                int res = memcmp(l.valuestr(), r.valuestr(), common);
-                if (res)
-                    return res;
-                // longer std::string is the greater one
-                return lsz - rsz;
+                return compareElementStringValues(l, r);
             }
         }
         case Object:
@@ -993,16 +954,10 @@ int compareElementValues(const BSONElement& l,
             if (cmp)
                 return cmp;
 
-            return l.codeWScopeObject().woCompare(
-                // woCompare parameters: r, ordering, considerFieldName, comparator.
-                // r: the BSONObj to compare with.
-                // ordering: the sort directions for each key.
-                // considerFieldName: whether field names should be considered in comparison.
-                // comparator: used for all string comparisons, if non-null.
-                r.codeWScopeObject(),
-                BSONObj(),
-                true,
-                comparator);
+            // When comparing the scope object, we should consider field names. Special string
+            // comparison semantics do not apply to strings nested inside the CodeWScope scope
+            // object, so we do not pass through the string comparator.
+            return l.codeWScopeObject().woCompare(r.codeWScopeObject(), BSONObj(), true);
         }
         default:
             verify(false);

@@ -38,6 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/copydb_start_commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 
@@ -86,9 +87,9 @@ using std::stringstream;
  * NOTE: Since internal cluster auth works differently, "copydb" currently doesn't work between
  * shards in a cluster when auth is enabled.  See SERVER-13080.
  */
-class CmdCopyDb : public Command {
+class CmdCopyDb : public ErrmsgCommandDeprecated {
 public:
-    CmdCopyDb() : Command("copydb") {}
+    CmdCopyDb() : ErrmsgCommandDeprecated("copydb") {}
 
     virtual bool adminOnly() const {
         return true;
@@ -114,15 +115,14 @@ public:
              << "[, slaveOk: <bool>, username: <username>, nonce: <nonce>, key: <key>]}";
     }
 
-    virtual bool run(OperationContext* txn,
-                     const string& dbname,
-                     BSONObj& cmdObj,
-                     int,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
-            maybeDisableValidation.emplace(txn);
+            maybeDisableValidation.emplace(opCtx);
 
         string fromhost = cmdObj.getStringField("fromhost");
         bool fromSelf = fromhost.empty();
@@ -134,21 +134,33 @@ public:
         }
 
         CloneOptions cloneOptions;
-        cloneOptions.fromDB = cmdObj.getStringField("fromdb");
+        const auto fromdbElt = cmdObj["fromdb"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'fromdb' must be of type String",
+                fromdbElt.type() == BSONType::String);
+        cloneOptions.fromDB = fromdbElt.str();
         cloneOptions.slaveOk = cmdObj["slaveOk"].trueValue();
         cloneOptions.useReplAuth = false;
         cloneOptions.snapshot = true;
 
-        string todb = cmdObj.getStringField("todb");
-        if (fromhost.empty() || todb.empty() || cloneOptions.fromDB.empty()) {
+        const auto todbElt = cmdObj["todb"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'todb' must be of type String",
+                todbElt.type() == BSONType::String);
+        const std::string todb = todbElt.str();
+
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid 'todb' name: " << todb,
+                NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid 'fromdb' name: " << cloneOptions.fromDB,
+                NamespaceString::validDBName(cloneOptions.fromDB,
+                                             NamespaceString::DollarInDbNameBehavior::Allow));
+
+        if (fromhost.empty()) {
             errmsg =
                 "params missing - {copydb: 1, fromhost: <connection string>, "
                 "fromdb: <db>, todb: <db>}";
-            return false;
-        }
-
-        if (!NamespaceString::validDBName(todb, NamespaceString::DollarInDbNameBehavior::Allow)) {
-            errmsg = "invalid todb name: " + todb;
             return false;
         }
 
@@ -159,7 +171,7 @@ public:
         string nonce = cmdObj.getStringField("nonce");
         string key = cmdObj.getStringField("key");
 
-        auto& authConn = CopyDbAuthConnection::forClient(txn->getClient());
+        auto& authConn = CopyDbAuthConnection::forClient(opCtx->getClient());
 
         if (!username.empty() && !nonce.empty() && !key.empty()) {
             uassert(13008, "must call copydbgetnonce first", authConn.get());
@@ -191,7 +203,7 @@ public:
             }
 
             if (!ret["done"].Bool()) {
-                result.appendElements(ret);
+                filterCommandReplyForPassthrough(ret, &result);
                 return true;
             }
 
@@ -214,13 +226,11 @@ public:
 
         if (fromSelf) {
             // SERVER-4328 todo lock just the two db's not everything for the fromself case
-            ScopedTransaction transaction(txn, MODE_X);
-            Lock::GlobalWrite lk(txn->lockState());
-            uassertStatusOK(cloner.copyDb(txn, todb, fromhost, cloneOptions, NULL));
+            Lock::GlobalWrite lk(opCtx);
+            uassertStatusOK(cloner.copyDb(opCtx, todb, fromhost, cloneOptions, NULL));
         } else {
-            ScopedTransaction transaction(txn, MODE_IX);
-            Lock::DBLock lk(txn->lockState(), todb, MODE_X);
-            uassertStatusOK(cloner.copyDb(txn, todb, fromhost, cloneOptions, NULL));
+            Lock::DBLock lk(opCtx, todb, MODE_X);
+            uassertStatusOK(cloner.copyDb(opCtx, todb, fromhost, cloneOptions, NULL));
         }
 
         return true;

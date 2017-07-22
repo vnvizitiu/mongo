@@ -47,6 +47,7 @@
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 namespace mozjs {
@@ -101,22 +102,26 @@ DBClientBase* getConnection(JS::CallArgs& args) {
     return ret;
 }
 
-void setCursor(JS::HandleObject target,
+void setCursor(MozJSImplScope* scope,
+               JS::HandleObject target,
                std::unique_ptr<DBClientCursor> cursor,
                JS::CallArgs& args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
 
     // Copy the client shared pointer to up the refcount
-    JS_SetPrivate(target, new CursorInfo::CursorHolder(std::move(cursor), *client));
+    JS_SetPrivate(target, scope->trackedNew<CursorInfo::CursorHolder>(std::move(cursor), *client));
 }
 
-void setCursorHandle(JS::HandleObject target, long long cursorId, JS::CallArgs& args) {
+void setCursorHandle(MozJSImplScope* scope,
+                     JS::HandleObject target,
+                     long long cursorId,
+                     JS::CallArgs& args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
 
     // Copy the client shared pointer to up the refcount.
-    JS_SetPrivate(target, new CursorHandleInfo::CursorTracker(cursorId, *client));
+    JS_SetPrivate(target, scope->trackedNew<CursorHandleInfo::CursorTracker>(cursorId, *client));
 }
 
 void setHiddenMongo(JSContext* cx,
@@ -143,9 +148,9 @@ void setHiddenMongo(JSContext* cx,
         } else {
             scope->getProto<MongoExternalInfo>().newObject(&newMongo);
         }
-        JS_SetPrivate(
-            newMongo,
-            new std::shared_ptr<DBClientBase>(connSharedPtr, static_cast<DBClientBase*>(resPtr)));
+        JS_SetPrivate(newMongo,
+                      scope->trackedNew<std::shared_ptr<DBClientBase>>(
+                          connSharedPtr, static_cast<DBClientBase*>(resPtr)));
 
         ObjectWrapper from(cx, args.thisv());
         ObjectWrapper to(cx, newMongo);
@@ -168,7 +173,7 @@ void MongoBase::finalize(JSFreeOp* fop, JSObject* obj) {
     auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
 
     if (conn) {
-        delete conn;
+        getScope(fop)->trackedDelete(conn);
     }
 }
 
@@ -214,33 +219,28 @@ void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
 }
 
 void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallArgs args) {
-    if (args.length() != 4)
-        uasserted(ErrorCodes::BadValue, "runCommandWithMetadata needs 4 args");
+    if (args.length() != 3)
+        uasserted(ErrorCodes::BadValue, "runCommandWithMetadata needs 3 args");
 
     if (!args.get(0).isString())
         uasserted(ErrorCodes::BadValue,
                   "the database parameter to runCommandWithMetadata must be a string");
 
-    if (!args.get(1).isString())
-        uasserted(ErrorCodes::BadValue,
-                  "the commandName parameter to runCommandWithMetadata must be a string");
-
-    if (!args.get(2).isObject())
+    if (!args.get(1).isObject())
         uasserted(ErrorCodes::BadValue,
                   "the metadata argument to runCommandWithMetadata must be an object");
 
-    if (!args.get(3).isObject())
+    if (!args.get(2).isObject())
         uasserted(ErrorCodes::BadValue,
                   "the commandArgs argument to runCommandWithMetadata must be an object");
 
     std::string database = ValueWriter(cx, args.get(0)).toString();
-    std::string commandName = ValueWriter(cx, args.get(1)).toString();
-    BSONObj metadata = ValueWriter(cx, args.get(2)).toBSON();
-    BSONObj commandArgs = ValueWriter(cx, args.get(3)).toBSON();
+    BSONObj metadata = ValueWriter(cx, args.get(1)).toBSON();
+    BSONObj commandArgs = ValueWriter(cx, args.get(2)).toBSON();
 
     auto conn = getConnection(args);
     auto resTuple =
-        conn->runCommandWithMetadataAndTarget(database, commandName, metadata, commandArgs);
+        conn->runCommandWithTarget(OpMsgRequest::fromDBAndBody(database, commandArgs, metadata));
     auto res = std::move(std::get<0>(resTuple));
 
     BSONObjBuilder mergedResultBob;
@@ -295,7 +295,7 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     JS::RootedObject c(cx);
     scope->getProto<CursorInfo>().newObject(&c);
 
-    setCursor(c, std::move(cursor), args);
+    setCursor(scope, c, std::move(cursor), args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -503,7 +503,7 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
     JS::RootedObject c(cx);
     scope->getProto<CursorInfo>().newObject(&c);
 
-    setCursor(c, std::move(cursor), args);
+    setCursor(scope, c, std::move(cursor), args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -523,7 +523,7 @@ void MongoBase::Functions::cursorHandleFromId::call(JSContext* cx, JS::CallArgs 
     JS::RootedObject c(cx);
     scope->getProto<CursorHandleInfo>().newObject(&c);
 
-    setCursorHandle(c, cursorId, args);
+    setCursorHandle(scope, c, cursorId, args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -552,7 +552,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
     session->setParameter(SaslClientSession::parameterMechanism, "SCRAM-SHA-1");
     session->setParameter(SaslClientSession::parameterUser, user);
     session->setParameter(SaslClientSession::parameterPassword, hashedPwd);
-    session->initialize();
+    session->initialize().transitional_ignore();
 
     BSONObj saslFirstCommandPrefix =
         BSON("copydbsaslstart" << 1 << "fromhost" << fromHost << "fromdb" << fromDb
@@ -578,9 +578,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
         status = session->step(payload, &responsePayload);
         uassertStatusOK(status);
 
-        BSONObjBuilder commandBuilder;
-
-        commandBuilder.appendElements(saslCommandPrefix);
+        BSONObjBuilder commandBuilder(std::move(saslCommandPrefix));
         commandBuilder.appendBinData(saslCommandPayloadFieldName,
                                      static_cast<int>(responsePayload.size()),
                                      BinDataGeneral,
@@ -677,14 +675,14 @@ void MongoLocalInfo::construct(JSContext* cx, JS::CallArgs args) {
     if (args.length() != 0)
         uasserted(ErrorCodes::BadValue, "local Mongo constructor takes no args");
 
-    auto txn = scope->getOpContext();
-    auto conn = DBDirectClientFactory::get(txn).create(txn);
+    auto opCtx = scope->getOpContext();
+    auto conn = DBDirectClientFactory::get(opCtx).create(opCtx);
 
     JS::RootedObject thisv(cx);
     scope->getProto<MongoLocalInfo>().newObject(&thisv);
     ObjectWrapper o(cx, thisv);
 
-    JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
+    JS_SetPrivate(thisv, scope->trackedNew<std::shared_ptr<DBClientBase>>(conn.release()));
 
     o.setBoolean(InternedString::slaveOk, false);
     o.setString(InternedString::host, "EMBEDDED");
@@ -717,7 +715,7 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     scope->getProto<MongoExternalInfo>().newObject(&thisv);
     ObjectWrapper o(cx, thisv);
 
-    JS_SetPrivate(thisv, new std::shared_ptr<DBClientBase>(conn.release()));
+    JS_SetPrivate(thisv, scope->trackedNew<std::shared_ptr<DBClientBase>>(conn.release()));
 
     o.setBoolean(InternedString::slaveOk, false);
     o.setString(InternedString::host, cs.toString());
@@ -754,11 +752,7 @@ void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) 
 }
 
 void MongoExternalInfo::Functions::quit::call(JSContext* cx, JS::CallArgs args) {
-    auto scope = getScope(cx);
-
-    scope->setQuickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
-
-    uasserted(ErrorCodes::JSUncatchableError, "Calling Quit");
+    quickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
 }
 
 void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallArgs args) {

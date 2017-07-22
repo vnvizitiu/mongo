@@ -58,9 +58,9 @@ using std::string;
  *   writeConcern: <BSONObj>
  * }
  */
-class ConfigsvrUpdateZoneKeyRangeCommand : public Command {
+class ConfigsvrUpdateZoneKeyRangeCommand : public BasicCommand {
 public:
-    ConfigsvrUpdateZoneKeyRangeCommand() : Command("_configsvrUpdateZoneKeyRange") {}
+    ConfigsvrUpdateZoneKeyRangeCommand() : BasicCommand("_configsvrUpdateZoneKeyRange") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
@@ -89,11 +89,9 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
             uasserted(ErrorCodes::IllegalOperation,
@@ -109,11 +107,11 @@ public:
         }
 
         if (parsedRequest.isRemove()) {
-            uassertStatusOK(Grid::get(txn)->catalogManager()->removeKeyRangeFromZone(
-                txn, parsedRequest.getNS(), parsedRequest.getRange()));
+            uassertStatusOK(ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
+                opCtx, parsedRequest.getNS(), parsedRequest.getRange()));
         } else {
-            uassertStatusOK(Grid::get(txn)->catalogManager()->assignKeyRangeToZone(
-                txn, parsedRequest.getNS(), parsedRequest.getRange(), zoneName));
+            uassertStatusOK(ShardingCatalogManager::get(opCtx)->assignKeyRangeToZone(
+                opCtx, parsedRequest.getNS(), parsedRequest.getRange(), zoneName));
         }
 
         return true;

@@ -260,24 +260,29 @@ void ProgramOutputMultiplexer::clear() {
 }
 
 ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
-    verify(!args.isEmpty());
+    uassert(ErrorCodes::FailedToParse,
+            "cannot pass an empty argument to ProgramRunner",
+            !args.isEmpty());
 
     string program(args.firstElement().valuestrsafe());
-    verify(!program.empty());
+    uassert(ErrorCodes::FailedToParse,
+            "invalid program name passed to ProgramRunner",
+            !program.empty());
     boost::filesystem::path programPath = findProgram(program);
+    boost::filesystem::path programName = programPath.stem();
 
     string prefix("mongod-");
-    bool isMongodProgram =
-        string("mongod") == program || program.compare(0, prefix.size(), prefix) == 0;
+    bool isMongodProgram = string("mongod") == programName ||
+        programName.string().compare(0, prefix.size(), prefix) == 0;
     prefix = "mongos-";
-    bool isMongosProgram =
-        string("mongos") == program || program.compare(0, prefix.size(), prefix) == 0;
+    bool isMongosProgram = string("mongos") == programName ||
+        programName.string().compare(0, prefix.size(), prefix) == 0;
 
     if (isMongodProgram) {
         _name = "d";
     } else if (isMongosProgram) {
         _name = "s";
-    } else if (program == "mongobridge") {
+    } else if (programName == "mongobridge") {
         _name = "b";
     } else {
         _name = "sh";
@@ -356,7 +361,7 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env) {
         ++environEntry;
     }
 #endif
-    bool needsPort = isMongodProgram || isMongosProgram || (program == "mongobridge");
+    bool needsPort = isMongodProgram || isMongosProgram || (programName == "mongobridge");
     if (!needsPort) {
         _port = -1;
     }
@@ -474,6 +479,11 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
         p = prog + ".exe";
     }
 #endif
+
+    // The file could exist if it is specified as a full path.
+    if (p.is_absolute() && boost::filesystem::exists(p)) {
+        return p;
+    }
 
     // Check if the binary exists in the current working directory
     boost::filesystem::path t = boost::filesystem::current_path() / p;
@@ -735,8 +745,12 @@ BSONObj ClearRawMongoProgramOutput(const BSONObj& args, void* data) {
 
 BSONObj CheckProgram(const BSONObj& args, void* data) {
     ProcessId pid = ProcessId::fromNative(singleArg(args).numberInt());
-    bool isDead = wait_for_pid(pid, false);
-    return BSON(string("") << (!isDead));
+    int exit_code = -123456;  // sentinel value
+    bool isDead = wait_for_pid(pid, false, &exit_code);
+    if (!isDead) {
+        return BSON("" << BSON("alive" << true));
+    }
+    return BSON("" << BSON("alive" << false << "exitCode" << exit_code));
 }
 
 BSONObj WaitProgram(const BSONObj& a, void* data) {
@@ -992,8 +1006,8 @@ BSONObj getStopMongodOpts(const BSONObj& a) {
 /** stopMongoProgram(port[, signal]) */
 BSONObj StopMongoProgram(const BSONObj& a, void* data) {
     int nFields = a.nFields();
-    verify(nFields >= 1 && nFields <= 3);
-    uassert(15853, "stopMongo needs a number", a.firstElement().isNumber());
+    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields >= 1 && nFields <= 3);
+    uassert(ErrorCodes::BadValue, "stopMongoProgram needs a number", a.firstElement().isNumber());
     int port = int(a.firstElement().number());
     int code = killDb(port, ProcessId::fromNative(0), getSignal(a), getStopMongodOpts(a));
     log() << "shell: stopped mongo program on port " << port;
@@ -1001,11 +1015,13 @@ BSONObj StopMongoProgram(const BSONObj& a, void* data) {
 }
 
 BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
-    verify(a.nFields() == 1 || a.nFields() == 2);
-    uassert(15852, "stopMongoByPid needs a number", a.firstElement().isNumber());
+    int nFields = a.nFields();
+    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields >= 1 && nFields <= 3);
+    uassert(
+        ErrorCodes::BadValue, "stopMongoProgramByPid needs a number", a.firstElement().isNumber());
     ProcessId pid = ProcessId::fromNative(int(a.firstElement().number()));
-    int code = killDb(0, pid, getSignal(a));
-    log() << "shell: stopped mongo program on pid " << pid;
+    int code = killDb(0, pid, getSignal(a), getStopMongodOpts(a));
+    log() << "shell: stopped mongo program with pid " << pid;
     return BSON("" << (double)code);
 }
 

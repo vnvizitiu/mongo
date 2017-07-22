@@ -13,11 +13,11 @@
 
     // Test aggregation command output format.
     var commandResult = testDB.runCommand(
-        {aggregate: testColl.getName(), pipeline: [{$collStats: {latencyStats: {}}}]});
+        {aggregate: testColl.getName(), pipeline: [{$collStats: {latencyStats: {}}}], cursor: {}});
     assert.commandWorked(commandResult);
-    assert(commandResult.result.length == 1);
+    assert(commandResult.cursor.firstBatch.length == 1);
 
-    var stats = commandResult.result[0];
+    var stats = commandResult.cursor.firstBatch[0];
     var histogramTypes = ["reads", "writes", "commands"];
 
     assert(stats.hasOwnProperty("localTime"));
@@ -85,9 +85,7 @@
     for (var i = 0; i < numRecords; i++) {
         testColl.aggregate([{$match: {x: i}}, {$group: {_id: "$x"}}]);
     }
-    // TODO SERVER-24704: Agg is currently counted by Top as two operations, but should be counted
-    // as one.
-    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, 2 * numRecords, 0, 0);
+    lastHistogram = assertHistogramDiffEq(testColl, lastHistogram, numRecords, 0, 0);
 
     // Count
     for (var i = 0; i < numRecords; i++) {

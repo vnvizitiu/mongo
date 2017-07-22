@@ -34,6 +34,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/time_support.h"
 
@@ -43,8 +44,7 @@ namespace {
 
 // Period of time after which mortal cursors are killed for inactivity. Configurable with server
 // parameter "cursorTimeoutMillis".
-std::atomic<long long> cursorTimeoutMillis(  // NOLINT
-    durationCount<Milliseconds>(Minutes(10)));
+AtomicInt64 cursorTimeoutMillis(durationCount<Milliseconds>(Minutes(10)));
 
 ExportedServerParameter<long long, ServerParameterType::kStartupAndRuntime>
     cursorTimeoutMillisConfig(ServerParameterSet::getGlobal(),
@@ -67,11 +67,18 @@ void ClusterCursorCleanupJob::run() {
     ClusterCursorManager* manager = grid.getCursorManager();
     invariant(manager);
 
-    while (!inShutdown()) {
-        manager->killMortalCursorsInactiveSince(Date_t::now() -
-                                                Milliseconds(cursorTimeoutMillis.load()));
+    while (!globalInShutdownDeprecated()) {
+        // Mirroring the behavior in CursorManager::timeoutCursors(), a negative value for
+        // cursorTimeoutMillis has the same effect as a 0 value: cursors are cleaned immediately.
+        auto cursorTimeoutValue = cursorTimeoutMillis.load();
+        Date_t cutoff = (cursorTimeoutValue > 0)
+            ? (Date_t::now() - Milliseconds(cursorTimeoutValue))
+            : Date_t::now();
+        manager->killMortalCursorsInactiveSince(cutoff);
         manager->incrementCursorsTimedOut(manager->reapZombieCursors());
-        sleepsecs(clientCursorMonitorFrequencySecs);
+
+        MONGO_IDLE_THREAD_BLOCK;
+        sleepsecs(clientCursorMonitorFrequencySecs.load());
     }
 }
 

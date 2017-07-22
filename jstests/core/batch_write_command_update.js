@@ -1,3 +1,8 @@
+// Cannot implicitly shard accessed collections because of following errmsg: A single
+// update/delete on a sharded collection must contain an exact match on _id or contain the shard
+// key.
+// @tags: [assumes_unsharded_collection]
+
 //
 // Ensures that mongod respects the batch write protocols for updates
 //
@@ -106,9 +111,8 @@ result = coll.runCommand(request);
 assert(resultOK(result), tojson(result));
 assert.eq(1, coll.count({}));
 
-for (var field in result) {
-    assert.eq('ok', field, 'unexpected field found in result: ' + field);
-}
+var fields = ['ok'];
+assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
 
 //
 // Two document upsert, write concern 0 specified, ordered = true
@@ -126,9 +130,7 @@ result = coll.runCommand(request);
 assert(resultOK(result), tojson(result));
 assert.eq(2, coll.count());
 
-for (var field in result) {
-    assert.eq('ok', field, 'unexpected field found in result: ' + field);
-}
+assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
 
 //
 // Single document update
@@ -267,9 +269,7 @@ result = coll.runCommand(request);
 assert(result.ok, tojson(result));
 assert.eq(1, coll.count());
 
-for (var field in result) {
-    assert.eq('ok', field, 'unexpected field found in result: ' + field);
-}
+assert.hasFields(result, fields, 'fields in result do not match: ' + tojson(fields));
 
 //
 // Upsert fail due to duplicate key index, w:1, ordered:true

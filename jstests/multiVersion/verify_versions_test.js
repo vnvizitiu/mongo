@@ -20,7 +20,7 @@
 
     // The current version is in the 3.4 series. This has to be changed very time we bump
     // the major version pair, but it provides a useful test of assumptions.
-    assertBinVersionsEqual("3.4", version());
+    assertBinVersionsEqual("3.5", version());
 
     // "latest" is the same version as the shell, "last-stable" is not.
     assertBinVersionsEqual("latest", version());
@@ -34,6 +34,9 @@
     assertBinVersionsEqual("3.2.4", "3.2");
     assertBinVersionsNotEqual("3.2", "3.0");
     assertBinVersionsNotEqual("3.0.9", "3.2.9");
+
+    assertBinVersionsEqual("3.4", "3.4.0-abcd");
+    assertBinVersionsNotEqual("3.4.0", "3.4.0-abcd");
 
     // Prohibit versions that don't have at least two components (3 is no good, 3.2 is).
     assert.throws(MongoRunner.areBinVersionsTheSame, ["3", "3.2"]);

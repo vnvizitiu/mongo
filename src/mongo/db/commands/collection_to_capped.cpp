@@ -49,9 +49,9 @@ using std::unique_ptr;
 using std::string;
 using std::stringstream;
 
-class CmdCloneCollectionAsCapped : public Command {
+class CmdCloneCollectionAsCapped : public ErrmsgCommandDeprecated {
 public:
-    CmdCloneCollectionAsCapped() : Command("cloneCollectionAsCapped") {}
+    CmdCloneCollectionAsCapped() : ErrmsgCommandDeprecated("cloneCollectionAsCapped") {}
     virtual bool slaveOk() const {
         return false;
     }
@@ -72,34 +72,55 @@ public:
         targetActions.addAction(ActionType::insert);
         targetActions.addAction(ActionType::createIndex);
         targetActions.addAction(ActionType::convertToCapped);
-        std::string collection = cmdObj.getStringField("toCollection");
-        uassert(16708, "bad 'toCollection' value", !collection.empty());
 
-        out->push_back(
-            Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbname, collection)),
-                      targetActions));
+        const auto nssElt = cmdObj["toCollection"];
+        uassert(ErrorCodes::TypeMismatch,
+                "'toCollection' must be of type String",
+                nssElt.type() == BSONType::String);
+        const NamespaceString nss(dbname, nssElt.valueStringData());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid target namespace: " << nss.ns(),
+                nss.isValid());
+
+        out->push_back(Privilege(ResourcePattern::forExactNamespace(nss), targetActions));
     }
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& jsobj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        string from = jsobj.getStringField("cloneCollectionAsCapped");
-        string to = jsobj.getStringField("toCollection");
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        const auto fromElt = jsobj["cloneCollectionAsCapped"];
+        const auto toElt = jsobj["toCollection"];
+
+        uassert(ErrorCodes::TypeMismatch,
+                "'cloneCollectionAsCapped' must be of type String",
+                fromElt.type() == BSONType::String);
+        uassert(ErrorCodes::TypeMismatch,
+                "'toCollection' must be of type String",
+                toElt.type() == BSONType::String);
+
+        const StringData from(fromElt.valueStringData());
+        const StringData to(toElt.valueStringData());
+
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid source collection name: " << from,
+                NamespaceString::validCollectionName(from));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid target collection name: " << to,
+                NamespaceString::validCollectionName(to));
+
         double size = jsobj.getField("size").number();
         bool temp = jsobj.getField("temp").trueValue();
 
-        if (from.empty() || to.empty() || size == 0) {
+        if (size == 0) {
             errmsg = "invalid command spec";
             return false;
         }
 
-        ScopedTransaction transaction(txn, MODE_IX);
-        AutoGetDb autoDb(txn, dbname, MODE_X);
+        AutoGetDb autoDb(opCtx, dbname, MODE_X);
 
         NamespaceString nss(dbname, to);
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(nss)) {
+        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss)) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::NotMaster,
@@ -116,7 +137,8 @@ public:
                        str::stream() << "database " << dbname << " not found"));
         }
 
-        Status status = cloneCollectionAsCapped(txn, db, from, to, size, temp);
+        Status status =
+            cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
         return appendCommandStatus(result, status);
     }
 } cmdCloneCollectionAsCapped;
@@ -126,9 +148,9 @@ public:
    This command is not highly used, and is not currently supported with sharded
    environments.
    */
-class CmdConvertToCapped : public Command {
+class CmdConvertToCapped : public ErrmsgCommandDeprecated {
 public:
-    CmdConvertToCapped() : Command("convertToCapped") {}
+    CmdConvertToCapped() : ErrmsgCommandDeprecated("convertToCapped") {}
     virtual bool slaveOk() const {
         return false;
     }
@@ -146,22 +168,20 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& jsobj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        string shortSource = jsobj.getStringField("convertToCapped");
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& jsobj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
         double size = jsobj.getField("size").number();
 
-        if (shortSource.empty() || size == 0) {
+        if (size == 0) {
             errmsg = "invalid command spec";
             return false;
         }
 
-        return appendCommandStatus(
-            result, convertToCapped(txn, NamespaceString(dbname, shortSource), size));
+        return appendCommandStatus(result, convertToCapped(opCtx, nss, size));
     }
 
 } cmdConvertToCapped;

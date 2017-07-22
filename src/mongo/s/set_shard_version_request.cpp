@@ -83,15 +83,6 @@ SetShardVersionRequest SetShardVersionRequest::makeForInit(
     return SetShardVersionRequest(configServer, shardName, shardConnectionString);
 }
 
-SetShardVersionRequest SetShardVersionRequest::makeForInitNoPersist(
-    const ConnectionString& configServer,
-    const ShardId& shardName,
-    const ConnectionString& shardConnectionString) {
-    auto ssv = SetShardVersionRequest(configServer, shardName, shardConnectionString);
-    ssv._noConnectionVersioning = true;
-    return ssv;
-}
-
 SetShardVersionRequest SetShardVersionRequest::makeForVersioning(
     const ConnectionString& configServer,
     const ShardId& shardName,
@@ -119,19 +110,6 @@ SetShardVersionRequest SetShardVersionRequest::makeForVersioningNoPersist(
 
 StatusWith<SetShardVersionRequest> SetShardVersionRequest::parseFromBSON(const BSONObj& cmdObj) {
     SetShardVersionRequest request;
-
-    {
-        std::string configServer;
-        Status status = bsonExtractStringField(cmdObj, kConfigServer, &configServer);
-        if (!status.isOK())
-            return status;
-
-        auto configServerStatus = ConnectionString::parse(configServer);
-        if (!configServerStatus.isOK())
-            return configServerStatus.getStatus();
-
-        request._configServer = std::move(configServerStatus.getValue());
-    }
 
     {
         std::string shardName;
@@ -214,6 +192,7 @@ BSONObj SetShardVersionRequest::toBSON() const {
     cmdBuilder.append(kCmdName, _init ? "" : _nss.get().ns());
     cmdBuilder.append(kInit, _init);
     cmdBuilder.append(kAuthoritative, _isAuthoritative);
+    // 'configdb' field is only included for v3.4 backwards compatibility
     cmdBuilder.append(kConfigServer, _configServer.toString());
     cmdBuilder.append(kShardName, _shardName.toString());
     cmdBuilder.append(kShardConnectionString, _shardCS.toString());

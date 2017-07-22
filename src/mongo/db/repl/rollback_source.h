@@ -31,6 +31,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -59,6 +60,11 @@ public:
     virtual const OplogInterface& getOplog() const = 0;
 
     /**
+     * Returns rollback sync source HostAndPort.
+     */
+    virtual const HostAndPort& getSource() const = 0;
+
+    /**
      * Returns rollback ID.
      */
     virtual int getRollbackId() const = 0;
@@ -76,7 +82,7 @@ public:
     /**
      * Clones a single collection from the sync source.
      */
-    virtual void copyCollectionFromRemote(OperationContext* txn,
+    virtual void copyCollectionFromRemote(OperationContext* opCtx,
                                           const NamespaceString& nss) const = 0;
 
     /**

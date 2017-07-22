@@ -2,15 +2,22 @@
 
 Import("env")
 
+env = env.Clone()
+
 # These commands are linked both in MongoS and MongoD
 env.Library(
     target='shared_cluster_commands',
     source=[
+        'cluster_commands_helpers.cpp',
         'cluster_get_shard_map_cmd.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/db/commands/killcursors_common',
+        '$BUILD_DIR/mongo/db/commands/current_op_common',
+        '$BUILD_DIR/mongo/s/async_requests_sender',
+        '$BUILD_DIR/mongo/s/client/parallel',
         '$BUILD_DIR/mongo/s/coreshard',
     ]
 )
@@ -19,14 +26,18 @@ env.Library(
 env.Library(
     target='cluster_commands',
     source=[
+        'chunk_manager_targeter.cpp',
         'cluster_add_shard_cmd.cpp',
         'cluster_add_shard_to_zone_cmd.cpp',
         'cluster_aggregate.cpp',
-        'cluster_commands_common.cpp',
+        'cluster_apply_ops_cmd.cpp',
+        'cluster_available_query_options_cmd.cpp',
+        'cluster_compact_cmd.cpp',
         'cluster_control_balancer_cmd.cpp',
         'cluster_count_cmd.cpp',
         'cluster_current_op.cpp',
         'cluster_db_stats_cmd.cpp',
+        'cluster_drop_cmd.cpp',
         'cluster_drop_database_cmd.cpp',
         'cluster_enable_sharding_cmd.cpp',
         'cluster_explain.cpp',
@@ -57,7 +68,6 @@ env.Library(
         'cluster_profile_cmd.cpp',
         'cluster_remove_shard_cmd.cpp',
         'cluster_remove_shard_from_zone_cmd.cpp',
-        'cluster_repair_database_cmd.cpp',
         'cluster_repl_set_get_status_cmd.cpp',
         'cluster_reset_error_cmd.cpp',
         'cluster_set_feature_compatibility_version_cmd.cpp',
@@ -70,20 +80,24 @@ env.Library(
         'cluster_write.cpp',
         'cluster_write_cmd.cpp',
         'commands_public.cpp',
-        'request.cpp',
-        'run_on_all_shards_cmd.cpp',
-        'sharded_command_processing.cpp',
         'strategy.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/client/parallel',
+        '$BUILD_DIR/mongo/db/auth/authmongos',
         '$BUILD_DIR/mongo/db/commands/apply_ops_cmd_common',
         '$BUILD_DIR/mongo/db/commands/killcursors_common',
+        '$BUILD_DIR/mongo/db/ftdc/ftdc_server',
+        '$BUILD_DIR/mongo/db/commands/write_commands_common',
         '$BUILD_DIR/mongo/db/pipeline/aggregation',
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/rpc/client_metadata',
+        '$BUILD_DIR/mongo/s/async_requests_sender',
+        '$BUILD_DIR/mongo/s/client/parallel',
         '$BUILD_DIR/mongo/s/coreshard',
-        '$BUILD_DIR/mongo/s/mongoscore',
+        '$BUILD_DIR/mongo/s/query/cluster_query',
+        '$BUILD_DIR/mongo/s/write_ops/cluster_write_op',
+        '$BUILD_DIR/mongo/s/write_ops/cluster_write_op_conversion',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
+        'shared_cluster_commands',
     ]
 )

@@ -36,9 +36,9 @@
 namespace mongo {
 namespace {
 
-class NetStatCmd : public Command {
+class NetStatCmd : public BasicCommand {
 public:
-    NetStatCmd() : Command("netstat", false, "netstat") {}
+    NetStatCmd() : BasicCommand("netstat") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -65,11 +65,9 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         result.append("configserver",
                       grid.shardRegistry()->getConfigServerConnectionString().toString());

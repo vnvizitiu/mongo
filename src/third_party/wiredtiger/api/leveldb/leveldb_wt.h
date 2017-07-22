@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2016 MongoDB, Inc.
+ * Public Domain 2014-2017 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -43,6 +43,7 @@
 #include "basho/perf_count.h"
 #endif
 
+#include <pthread.h>
 #include "wiredtiger.h"
 
 #define WT_URI          "table:data"

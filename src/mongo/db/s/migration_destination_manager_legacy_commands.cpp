@@ -42,7 +42,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/range_deleter_service.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
@@ -56,9 +55,9 @@ using std::string;
 
 namespace {
 
-class RecvChunkStartCommand : public Command {
+class RecvChunkStartCommand : public ErrmsgCommandDeprecated {
 public:
-    RecvChunkStartCommand() : Command("_recvChunkStart") {}
+    RecvChunkStartCommand() : ErrmsgCommandDeprecated("_recvChunkStart") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -85,45 +84,16 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* txn,
-             const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
-        ShardingState* const shardingState = ShardingState::get(txn);
-
-        // Pending deletes (for migrations) are serialized by the distributed collection lock,
-        // we are sure we registered a delete for a range *before* we can migrate-in a
-        // subrange.
-        const size_t numDeletes = getDeleter()->getTotalDeletes();
-        if (numDeletes > 0) {
-            errmsg = str::stream() << "can't accept new chunks because "
-                                   << " there are still " << numDeletes
-                                   << " deletes from previous migration";
-
-            warning() << errmsg;
-            return false;
-        }
+    bool errmsgRun(OperationContext* opCtx,
+                   const string&,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
+        auto shardingState = ShardingState::get(opCtx);
+        uassertStatusOK(shardingState->canAcceptShardedCommands());
 
         const ShardId toShard(cmdObj["toShardName"].String());
         const ShardId fromShard(cmdObj["fromShardName"].String());
-
-        if (!shardingState->enabled()) {
-            if (!cmdObj["configServer"].eoo()) {
-                dassert(cmdObj["configServer"].type() == String);
-                shardingState->initializeFromConfigConnString(
-                    txn, cmdObj["configServer"].String(), toShard.toString());
-            } else {
-                errmsg = str::stream()
-                    << "cannot start recv'ing chunk, "
-                    << "sharding is not enabled and no config server was provided";
-
-                warning() << errmsg;
-                return false;
-            }
-        }
-
 
         const NamespaceString nss(cmdObj.firstElement().String());
 
@@ -134,7 +104,7 @@ public:
         // consistent and predictable, generally we'd refresh anyway, and to be paranoid.
         ChunkVersion currentVersion;
 
-        Status status = shardingState->refreshMetadataNow(txn, nss, &currentVersion);
+        Status status = shardingState->refreshMetadataNow(opCtx, nss, &currentVersion);
         if (!status.isOK()) {
             errmsg = str::stream() << "cannot start receiving chunk "
                                    << redact(chunkRange.toString()) << causedBy(redact(status));
@@ -146,7 +116,7 @@ public:
         const auto secondaryThrottle =
             uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
         const auto writeConcern = uassertStatusOK(
-            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(txn, secondaryThrottle));
+            ChunkMoveWriteConcernOptions::getEffectiveWriteConcern(opCtx, secondaryThrottle));
 
         BSONObj shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
 
@@ -163,6 +133,7 @@ public:
         const MigrationSessionId migrationSessionId(
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
+        // Ensure this shard is not currently receiving or donating any chunks.
         auto scopedRegisterReceiveChunk(
             uassertStatusOK(shardingState->registerReceiveChunk(nss, chunkRange, fromShard)));
 
@@ -185,9 +156,9 @@ public:
 
 } recvChunkStartCmd;
 
-class RecvChunkStatusCommand : public Command {
+class RecvChunkStatusCommand : public BasicCommand {
 public:
-    RecvChunkStatusCommand() : Command("_recvChunkStatus") {}
+    RecvChunkStatusCommand() : BasicCommand("_recvChunkStatus") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -213,21 +184,19 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
+        ShardingState::get(opCtx)->migrationDestinationManager()->report(result);
         return true;
     }
 
 } recvChunkStatusCommand;
 
-class RecvChunkCommitCommand : public Command {
+class RecvChunkCommitCommand : public BasicCommand {
 public:
-    RecvChunkCommitCommand() : Command("_recvChunkCommit") {}
+    RecvChunkCommitCommand() : BasicCommand("_recvChunkCommit") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -254,26 +223,26 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        const MigrationSessionId migrationSessionid(
-            uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
-        const bool ok =
-            ShardingState::get(txn)->migrationDestinationManager()->startCommit(migrationSessionid);
-
-        ShardingState::get(txn)->migrationDestinationManager()->report(result);
-        return ok;
+        auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
+        auto mdm = ShardingState::get(opCtx)->migrationDestinationManager();
+        Status const status = mdm->startCommit(sessionId);
+        mdm->report(result);
+        if (!status.isOK()) {
+            log() << status.reason();
+            return appendCommandStatus(result, status);
+        }
+        return true;
     }
 
 } recvChunkCommitCommand;
 
-class RecvChunkAbortCommand : public Command {
+class RecvChunkAbortCommand : public BasicCommand {
 public:
-    RecvChunkAbortCommand() : Command("_recvChunkAbort") {}
+    RecvChunkAbortCommand() : BasicCommand("_recvChunkAbort") {}
 
     void help(std::stringstream& h) const {
         h << "internal";
@@ -300,28 +269,27 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        auto const mdm = ShardingState::get(txn)->migrationDestinationManager();
+        auto const mdm = ShardingState::get(opCtx)->migrationDestinationManager();
 
         auto migrationSessionIdStatus(MigrationSessionId::extractFromBSON(cmdObj));
 
         if (migrationSessionIdStatus.isOK()) {
-            const bool ok = mdm->abort(migrationSessionIdStatus.getValue());
+            Status const status = mdm->abort(migrationSessionIdStatus.getValue());
             mdm->report(result);
-            return ok;
+            if (!status.isOK()) {
+                log() << status.reason();
+                return appendCommandStatus(result, status);
+            }
         } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {
             mdm->abortWithoutSessionIdCheck();
             mdm->report(result);
-            return true;
         }
-
         uassertStatusOK(migrationSessionIdStatus.getStatus());
-        MONGO_UNREACHABLE;
+        return true;
     }
 
 } recvChunkAbortCommand;

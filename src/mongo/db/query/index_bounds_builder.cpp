@@ -142,7 +142,7 @@ string IndexBoundsBuilder::simpleRegex(const char* regex,
                         ss << c;  // character should match itself
                     }
                 }
-            } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '0') ||
+            } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
                        (c == '\0')) {
                 // don't know what to do with these
                 r = ss;
@@ -520,9 +520,18 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
     } else if (MatchExpression::TYPE_OPERATOR == expr->matchType()) {
         const TypeMatchExpression* tme = static_cast<const TypeMatchExpression*>(expr);
 
+        if (tme->getBSONType() == BSONType::Array) {
+            // We have $type:"array". Since arrays are indexed by creating a key for each element,
+            // we have to fetch all indexed documents and check whether the full document contains
+            // an array.
+            oilOut->intervals.push_back(allValues());
+            *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
+            return;
+        }
+
         // If we are matching all numbers, we just use the bounds for NumberInt, as these bounds
         // also include all NumberDouble and NumberLong values.
-        BSONType type = tme->matchesAllNumbers() ? BSONType::NumberInt : tme->getType();
+        BSONType type = tme->matchesAllNumbers() ? BSONType::NumberInt : tme->getBSONType();
         BSONObjBuilder bob;
         bob.appendMinForType("", type);
         bob.appendMaxForType("", type);
@@ -586,7 +595,7 @@ void IndexBoundsBuilder::translate(const MatchExpression* expr,
             const R2Region& region = gme->getGeoExpression().getGeometry().getR2Region();
 
             ExpressionMapping::cover2d(
-                region, index.infoObj, internalGeoPredicateQuery2DMaxCoveringCells, oilOut);
+                region, index.infoObj, internalGeoPredicateQuery2DMaxCoveringCells.load(), oilOut);
 
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         } else {

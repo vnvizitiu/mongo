@@ -186,39 +186,41 @@
     // Positive test for "aggregate".
     configureMaxTimeAlwaysTimeOut("alwaysOn");
     assert.commandFailedWithCode(
-        coll.runCommand("aggregate", {pipeline: [], maxTimeMS: 60 * 1000}),
+        coll.runCommand("aggregate", {pipeline: [], cursor: {}, maxTimeMS: 60 * 1000}),
         ErrorCodes.ExceededTimeLimit,
         "expected aggregate to fail with code " + ErrorCodes.ExceededTimeLimit +
             " due to maxTimeAlwaysTimeOut fail point, but instead got: " + tojson(res));
 
     // Negative test for "aggregate".
     configureMaxTimeAlwaysTimeOut("off");
-    assert.commandWorked(coll.runCommand("aggregate", {pipeline: [], maxTimeMS: 60 * 1000}),
-                         "expected aggregate to not hit time limit in mongod");
+    assert.commandWorked(
+        coll.runCommand("aggregate", {pipeline: [], cursor: {}, maxTimeMS: 60 * 1000}),
+        "expected aggregate to not hit time limit in mongod");
 
-    // Positive test for "moveChunk".
-    configureMaxTimeAlwaysTimeOut("alwaysOn");
-    res = admin.runCommand({
-        moveChunk: coll.getFullName(),
-        find: {_id: 0},
-        to: "shard0000",
-        maxTimeMS: 1000 * 60 * 60 * 24
-    });
-    assert.commandFailed(
-        res,
-        "expected moveChunk to fail due to maxTimeAlwaysTimeOut fail point, but instead got: " +
-            tojson(res));
+    // The moveChunk tests are disabled due to SERVER-30179
+    //
+    // // Positive test for "moveChunk".
+    // configureMaxTimeAlwaysTimeOut("alwaysOn");
+    // res = admin.runCommand({
+    // moveChunk: coll.getFullName(),
+    // find: {_id: 0},
+    // to: "shard0000",
+    // maxTimeMS: 1000 * 60 * 60 * 24
+    // });
+    // assert.commandFailed(
+    // res,
+    // "expected moveChunk to fail due to maxTimeAlwaysTimeOut fail point, but instead got: " +
+    // tojson(res));
 
-    // Negative test for "moveChunk".
-    configureMaxTimeAlwaysTimeOut("off");
-    assert.commandWorked(admin.runCommand({
-        moveChunk: coll.getFullName(),
-        find: {_id: 0},
-        to: "shard0000",
-        maxTimeMS: 1000 * 60 * 60 * 24
-    }),
-                         "expected moveChunk to not hit time limit in mongod");
+    // // Negative test for "moveChunk".
+    // configureMaxTimeAlwaysTimeOut("off");
+    // assert.commandWorked(admin.runCommand({
+    // moveChunk: coll.getFullName(),
+    // find: {_id: 0},
+    // to: "shard0000",
+    // maxTimeMS: 1000 * 60 * 60 * 24
+    // }),
+    // "expected moveChunk to not hit time limit in mongod");
 
     st.stop();
-
 })();

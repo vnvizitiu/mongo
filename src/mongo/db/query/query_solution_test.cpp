@@ -768,4 +768,132 @@ TEST(QuerySolutionTest, ExclusionProjectionTruncatesSort) {
     ASSERT(proj.getSort().count(BSON("a" << 1)));
 }
 
+TEST(QuerySolutionTest, NonMultikeyIndexWithoutPathLevelInfoCanCoverItsFields) {
+    auto node = stdx::make_unique<IndexScanNode>(IndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+    node->index.multikey = false;
+    node->index.multikeyPaths = MultikeyPaths{};
+    ASSERT_TRUE(node->hasField("a"));
+    ASSERT_TRUE(node->hasField("b.c.d"));
+    ASSERT_FALSE(node->hasField("b.c"));
+    ASSERT_FALSE(node->hasField("b"));
+    ASSERT_FALSE(node->hasField("e"));
+}
+
+TEST(QuerySolutionTest, NonMultikeyIndexWithPathLevelInfoCanCoverItsFields) {
+    auto node = stdx::make_unique<IndexScanNode>(IndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+    node->index.multikey = false;
+    node->index.multikeyPaths = MultikeyPaths{{}, {}};
+    ASSERT_TRUE(node->hasField("a"));
+    ASSERT_TRUE(node->hasField("b.c.d"));
+    ASSERT_FALSE(node->hasField("b.c"));
+    ASSERT_FALSE(node->hasField("b"));
+    ASSERT_FALSE(node->hasField("e"));
+}
+
+TEST(QuerySolutionTest, MultikeyIndexWithoutPathLevelInfoCannotCoverAnyFields) {
+    auto node = stdx::make_unique<IndexScanNode>(IndexEntry(BSON("a" << 1 << "b.c.d" << 1)));
+    node->index.multikey = true;
+    node->index.multikeyPaths = MultikeyPaths{};
+    ASSERT_FALSE(node->hasField("a"));
+    ASSERT_FALSE(node->hasField("b.c.d"));
+    ASSERT_FALSE(node->hasField("b.c"));
+    ASSERT_FALSE(node->hasField("b"));
+    ASSERT_FALSE(node->hasField("e"));
+}
+
+TEST(QuerySolutionTest, MultikeyIndexWithPathLevelInfoCanCoverNonMultikeyFields) {
+    auto node =
+        stdx::make_unique<IndexScanNode>(IndexEntry(BSON("a" << 1 << "b" << 1 << "c" << 1)));
+
+    // Add metadata indicating that "b" is multikey.
+    node->index.multikey = true;
+    node->index.multikeyPaths = MultikeyPaths{{}, {0U}, {}};
+
+    ASSERT_TRUE(node->hasField("a"));
+    ASSERT_FALSE(node->hasField("b"));
+    ASSERT_FALSE(node->hasField("b.c"));
+    ASSERT_TRUE(node->hasField("c"));
+}
+
+TEST(QuerySolutionTest, MultikeyIndexCannotCoverFieldWithAnyMultikeyPathComponent) {
+    auto node =
+        stdx::make_unique<IndexScanNode>(IndexEntry(BSON("a" << 1 << "b.c.d" << 1 << "e" << 1)));
+
+    // Add metadata indicating that "b.c" is multikey.
+    node->index.multikey = true;
+    node->index.multikeyPaths = MultikeyPaths{{}, {1U}, {}};
+
+    ASSERT_TRUE(node->hasField("a"));
+    ASSERT_FALSE(node->hasField("b"));
+    ASSERT_FALSE(node->hasField("b.c"));
+    ASSERT_FALSE(node->hasField("b.c.d"));
+    ASSERT_TRUE(node->hasField("e"));
+}
+
+TEST(QuerySolutionTest, MultikeyIndexWithoutPathLevelInfoCannotProvideAnySorts) {
+    IndexScanNode node{IndexEntry(BSON("a" << 1 << "b" << 1 << "c" << 1))};
+    node.index.multikey = true;
+
+    {
+        OrderedIntervalList oil{};
+        oil.name = "a";
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << 1)));
+        node.bounds.fields.push_back(oil);
+    }
+
+    for (auto&& name : {"b"_sd, "c"_sd}) {
+        OrderedIntervalList oil{};
+        oil.name = name.toString();
+        oil.intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+            BSON("" << 1 << "" << 2), BoundInclusion::kIncludeBothStartAndEndKeys));
+        node.bounds.fields.push_back(oil);
+    }
+
+    node.computeProperties();
+    ASSERT(node.getSort().empty());
+}
+
+TEST(QuerySolutionTest, SimpleRangeAllEqualExcludesFieldWithMultikeyComponent) {
+    IndexScanNode node{
+        IndexEntry(BSON("a" << 1 << "b" << 1 << "c.z" << 1 << "d" << 1 << "e" << 1))};
+    node.bounds.isSimpleRange = true;
+    node.bounds.startKey = BSON("a" << 1 << "b" << 1 << "c.z" << 1 << "d" << 1 << "e" << 1);
+    node.bounds.endKey = BSON("a" << 1 << "b" << 1 << "c.z" << 1 << "d" << 1 << "e" << 1);
+
+    // Add metadata indicating that "c.z" is multikey.
+    node.index.multikey = true;
+    node.index.multikeyPaths = MultikeyPaths{{}, {}, {1U}, {}, {}};
+
+    node.computeProperties();
+
+    ASSERT_EQUALS(node.getSort().size(), 4U);
+    ASSERT(node.getSort().count(BSON("a" << 1 << "b" << 1)));
+    ASSERT(node.getSort().count(BSON("a" << 1)));
+    ASSERT(node.getSort().count(BSON("d" << 1 << "e" << 1)));
+    ASSERT(node.getSort().count(BSON("e" << 1)));
+}
+
+TEST(QuerySolutionTest, NonSimpleRangeAllEqualExcludesFieldWithMultikeyComponent) {
+    IndexScanNode node{
+        IndexEntry(BSON("a" << 1 << "b" << 1 << "c.z" << 1 << "d" << 1 << "e" << 1))};
+    // Add metadata indicating that "c.z" is multikey.
+    node.index.multikey = true;
+    node.index.multikeyPaths = MultikeyPaths{{}, {}, {1U}, {}, {}};
+
+    for (auto&& name : {"a"_sd, "b"_sd, "c.z"_sd, "d"_sd, "e"_sd}) {
+        OrderedIntervalList oil{};
+        oil.name = name.toString();
+        oil.intervals.push_back(IndexBoundsBuilder::makePointInterval(BSON("" << 1)));
+        node.bounds.fields.push_back(oil);
+    }
+
+    node.computeProperties();
+
+    ASSERT_EQUALS(node.getSort().size(), 4U);
+    ASSERT(node.getSort().count(BSON("a" << 1 << "b" << 1)));
+    ASSERT(node.getSort().count(BSON("a" << 1)));
+    ASSERT(node.getSort().count(BSON("d" << 1 << "e" << 1)));
+    ASSERT(node.getSort().count(BSON("e" << 1)));
+}
+
 }  // namespace

@@ -2,10 +2,13 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
     target="cluster_query",
     source=[
         "cluster_find.cpp",
+        "cluster_query_knobs.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands',
@@ -51,7 +54,6 @@ env.CppUnitTest(
         'router_exec_stage',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
-        '$BUILD_DIR/mongo/s/mongoscore',
     ],
 )
 
@@ -60,10 +62,12 @@ env.Library(
     source=[
         "async_results_merger.cpp",
         "cluster_client_cursor_params.cpp",
+        "establish_cursors.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/query/command_request_response",
         "$BUILD_DIR/mongo/executor/task_executor_interface",
+        "$BUILD_DIR/mongo/s/async_requests_sender",
         "$BUILD_DIR/mongo/s/client/sharding_client",
         "$BUILD_DIR/mongo/s/coreshard",
     ],
@@ -116,7 +120,6 @@ env.CppUnitTest(
         'store_possible_cursor',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
-        '$BUILD_DIR/mongo/s/mongoscore',
         '$BUILD_DIR/mongo/util/clock_source_mock',
     ],
 )
@@ -137,6 +140,7 @@ env.CppUnitTest(
         "cluster_cursor_manager_test.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/util/clock_source_mock",
         "cluster_client_cursor_mock",
         "cluster_cursor_manager",
@@ -163,6 +167,5 @@ env.CppUnitTest(
         'cluster_client_cursor',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
-        '$BUILD_DIR/mongo/s/mongoscore',
     ],
 )

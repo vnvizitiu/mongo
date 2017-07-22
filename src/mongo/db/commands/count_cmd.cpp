@@ -30,9 +30,9 @@
 
 #include "mongo/platform/basic.h"
 
-
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/count.h"
@@ -40,9 +40,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/view_response_formatter.h"
-#include "mongo/db/range_preserver.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/util/log.h"
 
@@ -56,9 +54,9 @@ using std::stringstream;
 /**
  * Implements the MongoD side of the count command.
  */
-class CmdCount : public Command {
+class CmdCount : public BasicCommand {
 public:
-    CmdCount() : Command("count") {}
+    CmdCount() : BasicCommand("count") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -81,7 +79,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -101,11 +99,10 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    virtual Status explain(OperationContext* txn,
+    virtual Status explain(OperationContext* opCtx,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata&,
+                           ExplainOptions::Verbosity verbosity,
                            BSONObjBuilder* out) const {
         const bool isExplain = true;
         auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
@@ -113,16 +110,8 @@ public:
             return request.getStatus();
         }
 
-        if (!request.getValue().getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
-        }
-
         // Acquire the db read lock.
-        AutoGetCollectionOrViewForRead ctx(txn, request.getValue().getNs());
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -133,17 +122,25 @@ public:
                 return viewAggregation.getStatus();
             }
 
-            std::string errmsg;
-            (void)Command::findCommand("aggregate")
-                ->run(txn, dbname, viewAggregation.getValue(), 0, errmsg, *out);
-            return Status::OK();
+            auto viewAggRequest = AggregationRequest::parseFromBSON(
+                request.getValue().getNs(), viewAggregation.getValue(), verbosity);
+            if (!viewAggRequest.isOK()) {
+                return viewAggRequest.getStatus();
+            }
+
+            return runAggregate(opCtx,
+                                viewAggRequest.getValue().getNamespaceString(),
+                                viewAggRequest.getValue(),
+                                viewAggregation.getValue(),
+                                *out);
         }
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        RangePreserver preserver(collection);
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, request.getValue().getNs())->getMetadata();
 
-        auto statusWithPlanExecutor = getExecutorCount(txn,
+        auto statusWithPlanExecutor = getExecutorCount(opCtx,
                                                        collection,
                                                        request.getValue(),
                                                        true,  // explain
@@ -152,17 +149,15 @@ public:
             return statusWithPlanExecutor.getStatus();
         }
 
-        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         Explain::explainStages(exec.get(), collection, verbosity, out);
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         const bool isExplain = false;
         auto request = CountRequest::parseFromBSON(dbname, cmdObj, isExplain);
@@ -170,17 +165,7 @@ public:
             return appendCommandStatus(result, request.getStatus());
         }
 
-        if (!request.getValue().getCollation().isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::InvalidOptions,
-                       "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                       "http://dochub.mongodb.org/core/3.4-feature-compatibility."));
-        }
-
-        AutoGetCollectionOrViewForRead ctx(txn, request.getValue().getNs());
+        AutoGetCollectionOrViewForReadCommand ctx(opCtx, request.getValue().getNs());
         Collection* collection = ctx.getCollection();
 
         if (ctx.getView()) {
@@ -191,16 +176,15 @@ public:
                 return appendCommandStatus(result, viewAggregation.getStatus());
             }
 
-            BSONObjBuilder aggResult;
-            (void)Command::findCommand("aggregate")
-                ->run(txn, dbname, viewAggregation.getValue(), options, errmsg, aggResult);
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
 
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult.asTempObj())) {
-                result.appendElements(aggResult.obj());
+            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
+                result.appendElements(aggResult);
                 return false;
             }
 
-            ViewResponseFormatter formatter(aggResult.obj());
+            ViewResponseFormatter formatter(aggResult);
             Status formatStatus = formatter.appendAsCountResponse(&result);
             if (!formatStatus.isOK()) {
                 return appendCommandStatus(result, formatStatus);
@@ -210,9 +194,10 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        RangePreserver preserver(collection);
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, request.getValue().getNs())->getMetadata();
 
-        auto statusWithPlanExecutor = getExecutorCount(txn,
+        auto statusWithPlanExecutor = getExecutorCount(opCtx,
                                                        collection,
                                                        request.getValue(),
                                                        false,  // !explain
@@ -221,12 +206,12 @@ public:
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
 
-        unique_ptr<PlanExecutor> exec = std::move(statusWithPlanExecutor.getValue());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
         // Store the plan summary string in CurOp.
-        auto curOp = CurOp::get(txn);
+        auto curOp = CurOp::get(opCtx);
         {
-            stdx::lock_guard<Client> lk(*txn->getClient());
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
         }
 
@@ -238,7 +223,7 @@ public:
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*exec, &summaryStats);
         if (collection) {
-            collection->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+            collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 

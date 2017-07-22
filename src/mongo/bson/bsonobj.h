@@ -196,17 +196,31 @@ public:
      * data this BSONObj is viewing. This can happen if this is a subobject or sibling object
      * contained in a larger buffer.
      */
-    void shareOwnershipWith(ConstSharedBuffer buffer) {
+    BSONObj& shareOwnershipWith(ConstSharedBuffer buffer) & {
         invariant(buffer);
         _ownedBuffer = buffer;
+        return *this;
     }
-    void shareOwnershipWith(const BSONObj& other) {
+    BSONObj& shareOwnershipWith(const BSONObj& other) & {
         shareOwnershipWith(other.sharedBuffer());
+        return *this;
+    }
+    BSONObj&& shareOwnershipWith(ConstSharedBuffer buffer) && {
+        return std::move(shareOwnershipWith(buffer));
+    }
+    BSONObj&& shareOwnershipWith(const BSONObj& other) && {
+        return std::move(shareOwnershipWith(other));
     }
 
-    ConstSharedBuffer sharedBuffer() const {
+    const ConstSharedBuffer& sharedBuffer() const {
         invariant(isOwned());
         return _ownedBuffer;
+    }
+
+    ConstSharedBuffer releaseSharedBuffer() {
+        invariant(isOwned());
+        BSONObj sink = std::move(*this);  // Leave *this in a valid moved-from state.
+        return std::move(sink._ownedBuffer);
     }
 
     /** If the data buffer is under the control of this BSONObj, return it.
@@ -238,6 +252,13 @@ public:
 
     /** note: addFields always adds _id even if not specified */
     int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
+
+    /**
+     * Add specific field to the end of the object if it did not exist, otherwise replace it
+     * preserving original field order. Returns newly built object. Returns copy of this for empty
+     * field.
+     */
+    BSONObj addField(const BSONElement& field) const;
 
     /** remove specified field and return a new object with the remaining fields.
         slowish as builds a full new object
@@ -351,49 +372,11 @@ public:
         return x > 0 && x <= BSONObjMaxInternalSize;
     }
 
-    /** @return ok if it can be stored as a valid embedded doc.
-     *  Not valid if any field name:
-     *      - contains a "."
-     *      - starts with "$"
-     *          -- unless it is a dbref ($ref/$id/[$db]/...)
-     */
-    inline bool okForStorage() const {
-        return _okForStorage(false, true).isOK();
-    }
-
-    /** Same as above with the following extra restrictions
-     *  Not valid if:
-     *      - "_id" field is a
-     *          -- Regex
-     *          -- Array
-     */
-    inline bool okForStorageAsRoot() const {
-        return _okForStorage(true, true).isOK();
-    }
-
     /**
-     * Validates that this can be stored as an embedded document
-     * See details above in okForStorage
-     *
-     * If 'deep' is true then validation is done to children
-     *
-     * If not valid a user readable status message is returned.
+     * Validates that the element is okay to be stored in a collection.
+     * Recursively validates children.
      */
-    inline Status storageValidEmbedded(const bool deep = true) const {
-        return _okForStorage(false, deep);
-    }
-
-    /**
-     * Validates that this can be stored as a document (in a collection)
-     * See details above in okForStorageAsRoot
-     *
-     * If 'deep' is true then validation is done to children
-     *
-     * If not valid a user readable status message is returned.
-     */
-    inline Status storageValid(const bool deep = true) const {
-        return _okForStorage(true, deep);
-    }
+    Status storageValidEmbedded() const;
 
     /** @return true if object is empty -- i.e.,  {} */
     bool isEmpty() const {
@@ -529,32 +512,6 @@ public:
      */
     bool valid(BSONVersion version) const;
 
-    enum MatchType {
-        Equality = 0,
-        LT = 0x1,
-        LTE = 0x3,
-        GTE = 0x6,
-        GT = 0x4,
-        opIN = 0x8,  // { x : { $in : [1,2,3] } }
-        NE = 0x9,
-        opSIZE = 0x0A,
-        opALL = 0x0B,
-        NIN = 0x0C,
-        opEXISTS = 0x0D,
-        opMOD = 0x0E,
-        opTYPE = 0x0F,
-        opREGEX = 0x10,
-        opOPTIONS = 0x11,
-        opELEM_MATCH = 0x12,
-        opNEAR = 0x13,
-        opWITHIN = 0x14,
-        opGEO_INTERSECTS = 0x16,
-        opBITS_ALL_SET = 0x17,
-        opBITS_ALL_CLEAR = 0x18,
-        opBITS_ANY_SET = 0x19,
-        opBITS_ANY_CLEAR = 0x1A,
-    };
-
     /** add all elements of the object to the specified vector */
     void elems(std::vector<BSONElement>&) const;
     /** add all elements of the object to the specified list */
@@ -604,14 +561,6 @@ private:
         if (!isValid())
             _assertInvalid();
     }
-
-    /**
-     * Validate if the element is okay to be stored in a collection, maybe as the root element
-     *
-     * If 'root' is true then checks against _id are made.
-     * If 'deep' is false then do not traverse through children
-     */
-    Status _okForStorage(bool root, bool deep) const;
 
     const char* _objdata;
     ConstSharedBuffer _ownedBuffer;

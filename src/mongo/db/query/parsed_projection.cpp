@@ -183,10 +183,8 @@ Status ParsedProjection::make(const BSONObj& spec,
         } else if (mongoutils::str::equals(elem.fieldName(), "_id") && !elem.trueValue()) {
             pp->_hasId = false;
         } else {
-            // Projections of dotted fields aren't covered.
-            if (mongoutils::str::contains(elem.fieldName(), '.')) {
-                requiresDocument = true;
-            }
+            pp->_hasDottedFieldPath = pp->_hasDottedFieldPath ||
+                elem.fieldNameStringData().find('.') != std::string::npos;
 
             if (elem.trueValue()) {
                 pp->_includedFields.push_back(elem.fieldNameStringData());
@@ -382,7 +380,7 @@ bool ParsedProjection::_isPositionalOperator(const char* fieldName) {
 // static
 bool ParsedProjection::_hasPositionalOperatorMatch(const MatchExpression* const query,
                                                    const std::string& matchfield) {
-    if (query->isLogical()) {
+    if (query->getCategory() == MatchExpression::MatchCategory::kLogical) {
         for (unsigned int i = 0; i < query->numChildren(); ++i) {
             if (_hasPositionalOperatorMatch(query->getChild(i), matchfield)) {
                 return true;

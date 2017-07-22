@@ -60,8 +60,12 @@ printjson(lastOp);
 
 // Overwrite minvalid document to simulate an inconsistent state (as might result from a server
 // crash.
-local.replset.minvalid.update(
-    {}, {ts: new Timestamp(lastOp.ts.t, lastOp.ts.i + 1)}, {upsert: true});
+local.replset.minvalid.update({},
+                              {
+                                ts: new Timestamp(lastOp.ts.t, lastOp.ts.i + 1),
+                                t: NumberLong(-1),
+                              },
+                              {upsert: true});
 printjson(local.replset.minvalid.findOne());
 
 print("5: shut down master");
@@ -90,4 +94,4 @@ assert.soon(function() {
         'it does not contain the necessary operations for us to reach a consistent state');
 });
 
-replTest.stopSet(undefined, undefined, {allowedExitCodes: [MongoRunner.EXIT_ABRUPT]});
+replTest.stopSet();

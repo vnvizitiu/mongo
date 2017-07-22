@@ -38,10 +38,6 @@
     var injectedMinValidDoc = {
         _id: ObjectId(),
 
-        // minvalid:
-        ts: newTs,
-        t: term,
-
         // appliedThrough
         begin: {
             ts: lastTs,
@@ -49,6 +45,10 @@
         },
 
         oplogDeleteFromPoint: Timestamp(),
+
+        // minvalid:
+        t: term,
+        ts: newTs,
     };
 
     // This weird mechanism is the only way to bypass mongod's attempt to fill in null
@@ -61,5 +61,5 @@
               "If the Timestamps differ, the server may be filling in the null timestamps");
 
     assert.throws(() => rst.restart(0));  // Restart in replSet mode again.
-    print('\n\n\t\t^^^^^^^^  This was supposed to fassert ^^^^^^^^^^^\n\n');
+    rst.stopSet();
 })();

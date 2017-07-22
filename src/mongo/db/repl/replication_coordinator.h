@@ -57,8 +57,7 @@ struct ConnectionPoolStats;
 
 namespace rpc {
 
-class ReplSetMetadata;
-class RequestInterface;
+class OplogQueryMetadata;
 class ReplSetMetadata;
 
 }  // namespace rpc
@@ -72,8 +71,7 @@ class OldUpdatePositionArgs;
 class OplogReader;
 class OpTime;
 class ReadConcernArgs;
-class ReplicaSetConfig;
-class ReplicationExecutor;
+class ReplSetConfig;
 class ReplSetHeartbeatArgs;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
@@ -123,19 +121,14 @@ public:
      * components of the replication system to start up whatever threads and do whatever
      * initialization they need.
      */
-    virtual void startup(OperationContext* txn) = 0;
+    virtual void startup(OperationContext* opCtx) = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
      * components of the replication system to shut down and stop any threads they are using,
      * blocking until all replication-related shutdown tasks are complete.
      */
-    virtual void shutdown(OperationContext* txn) = 0;
-
-    /**
-     * Returns a pointer to the ReplicationExecutor.
-     */
-    virtual ReplicationExecutor* getExecutor() = 0;
+    virtual void shutdown(OperationContext* opCtx) = 0;
 
     /**
      * Returns a reference to the parsed command line arguments that are related to replication.
@@ -194,7 +187,7 @@ public:
      * writeConcern.wTimeout of -1 indicates return immediately after checking. Return codes:
      * ErrorCodes::WriteConcernFailed if the writeConcern.wTimeout is reached before
      *     the data has been sufficiently replicated
-     * ErrorCodes::ExceededTimeLimit if the txn->getMaxTimeMicrosRemaining is reached before
+     * ErrorCodes::ExceededTimeLimit if the opCtx->getMaxTimeMicrosRemaining is reached before
      *     the data has been sufficiently replicated
      * ErrorCodes::NotMaster if the node is not Primary/Master
      * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
@@ -202,16 +195,16 @@ public:
      * ErrorCodes::ShutdownInProgress if we are mid-shutdown
      * ErrorCodes::Interrupted if the operation was killed with killop()
      */
-    virtual StatusAndDuration awaitReplication(OperationContext* txn,
+    virtual StatusAndDuration awaitReplication(OperationContext* opCtx,
                                                const OpTime& opTime,
                                                const WriteConcernOptions& writeConcern) = 0;
 
     /**
      * Like awaitReplication(), above, but waits for the replication of the last operation
-     * performed on the client associated with "txn".
+     * performed on the client associated with "opCtx".
      */
     virtual StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* txn, const WriteConcernOptions& writeConcern) = 0;
+        OperationContext* opCtx, const WriteConcernOptions& writeConcern) = 0;
 
     /**
      * Causes this node to relinquish being primary for at least 'stepdownTime'.  If 'force' is
@@ -222,7 +215,7 @@ public:
      * ErrorCodes::SecondaryAheadOfPrimary if we are primary but there is another node that
      * seems to be ahead of us in replication, and Status::OK otherwise.
      */
-    virtual Status stepDown(OperationContext* txn,
+    virtual Status stepDown(OperationContext* opCtx,
                             bool force,
                             const Milliseconds& waitTime,
                             const Milliseconds& stepdownTime) = 0;
@@ -245,7 +238,14 @@ public:
      * NOTE: This function can only be meaningfully called while the caller holds the global
      * lock in some mode other than MODE_NONE.
      */
-    virtual bool canAcceptWritesForDatabase(StringData dbName) = 0;
+    virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) = 0;
+
+    /**
+     * Version which does not check for the global lock.  Do not use in new code.
+     * Without the global lock held, the return value may be inaccurate by the time
+     * the function returns.
+     */
+    virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) = 0;
 
     /**
      * Returns true if it is valid for this node to accept writes on the given namespace.
@@ -253,7 +253,14 @@ public:
      * The result of this function should be consistent with canAcceptWritesForDatabase()
      * for the database the namespace refers to, with additional checks on the collection.
      */
-    virtual bool canAcceptWritesFor(const NamespaceString& ns) = 0;
+    virtual bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) = 0;
+
+    /**
+     * Version which does not check for the global lock.  Do not use in new code.
+     * Without the global lock held, the return value may be inaccurate by the time
+     * the function returns.
+     */
+    virtual bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
      * Checks if the current replica set configuration can satisfy the given write concern.
@@ -270,9 +277,18 @@ public:
      * Returns Status::OK() if it is valid for this node to serve reads on the given collection
      * and an errorcode indicating why the node cannot if it cannot.
      */
-    virtual Status checkCanServeReadsFor(OperationContext* txn,
+    virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          bool slaveOk) = 0;
+
+    /**
+     * Version which does not check for the global lock.  Do not use in new code.
+     * Without the global lock held, the return value may be inaccurate by the time
+     * the function returns.
+     */
+    virtual Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
+                                                const NamespaceString& ns,
+                                                bool slaveOk) = 0;
 
     /**
      * Returns true if this node should ignore index constraints for idempotency reasons.
@@ -280,7 +296,8 @@ public:
      * The namespace "ns" is passed in because the "local" database is usually writable
      * and we need to enforce the constraints for it.
      */
-    virtual bool shouldRelaxIndexConstraints(const NamespaceString& ns) = 0;
+    virtual bool shouldRelaxIndexConstraints(OperationContext* opCtx,
+                                             const NamespaceString& ns) = 0;
 
     /**
      * Updates our internal tracking of the last OpTime applied for the given slave
@@ -355,7 +372,7 @@ public:
      *
      * Returns whether the wait was successful.
      */
-    virtual Status waitUntilOpTimeForRead(OperationContext* txn,
+    virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& settings) = 0;
 
     /**
@@ -379,8 +396,9 @@ public:
     /**
      * Sets this node into a specific follower mode.
      *
-     * Returns true if the follower mode was successfully set.  Returns false if the
-     * node is or becomes a leader before setFollowerMode completes.
+     * Returns OK if the follower mode was successfully set.  Returns NotSecondary if the
+     * node is a leader when setFollowerMode is called and ElectionInProgess if the node is in the
+     * process of trying to elect itself primary.
      *
      * Follower modes are RS_STARTUP2 (initial sync), RS_SECONDARY, RS_ROLLBACK and
      * RS_RECOVERING.  They are the valid states of a node whose topology coordinator has the
@@ -390,21 +408,65 @@ public:
      * becoming a candidate or accepting reads, depending on circumstances in the oplog
      * application process.
      */
-    virtual bool setFollowerMode(const MemberState& newState) = 0;
+    virtual Status setFollowerMode(const MemberState& newState) = 0;
 
     /**
-     * Returns true if the coordinator wants the applier to pause application.
+     * Step-up
+     * =======
+     * On stepup, repl coord enters catch-up mode. It's the same as the secondary mode from
+     * the perspective of producer and applier, so there's nothing to do with them.
+     * When a node enters drain mode, producer state = Stopped, applier state = Draining.
      *
-     * If this returns true, the applier should call signalDrainComplete() when it has
-     * completed draining its operation buffer and no further ops are being applied.
+     * If the applier state is Draining, it will signal repl coord when there's nothing to apply.
+     * The applier goes into Stopped state at the same time.
+     *
+     * The states go like the following:
+     * - secondary and during catchup mode
+     * (producer: Running, applier: Running)
+     *      |
+     *      | finish catch-up, enter drain mode
+     *      V
+     * - drain mode
+     * (producer: Stopped, applier: Draining)
+     *      |
+     *      | applier signals drain is complete
+     *      V
+     * - primary is in master mode
+     * (producer: Stopped, applier: Stopped)
+     *
+     *
+     * Step-down
+     * =========
+     * The state transitions become:
+     * - primary is in master mode
+     * (producer: Stopped, applier: Stopped)
+     *      |
+     *      | step down
+     *      V
+     * - secondary mode, starting bgsync
+     * (producer: Starting, applier: Running)
+     *      |
+     *      | bgsync runs start()
+     *      V
+     * - secondary mode, normal
+     * (producer: Running, applier: Running)
+     *
+     * When a node steps down during draining mode, it's OK to change from (producer: Stopped,
+     * applier: Draining) to (producer: Starting, applier: Running).
+     *
+     * When a node steps down during catchup mode, the states remain the same (producer: Running,
+     * applier: Running).
      */
-    virtual bool isWaitingForApplierToDrain() = 0;
+    enum class ApplierState { Running, Draining, Stopped };
 
     /**
-     * A new primary tries to have its oplog catch up after winning an election.
-     * Return true if the coordinator is waiting for catch-up to finish.
+     * In normal cases: Running -> Draining -> Stopped -> Running.
+     * Draining -> Running is also possible if a node steps down during drain mode.
+     *
+     * Only the applier can make the transition from Draining to Stopped by calling
+     * signalDrainComplete().
      */
-    virtual bool isCatchingUp() = 0;
+    virtual ApplierState getApplierState() = 0;
 
     /**
      * Signals that a previously requested pause and drain of the applier buffer
@@ -412,12 +474,18 @@ public:
      *
      * This is an interface that allows the applier to reenable writes after
      * a successful election triggers the draining of the applier buffer.
+     *
+     * The applier signals drain complete when the buffer is empty and it's in Draining
+     * state. We need to make sure the applier checks both conditions in the same term.
+     * Otherwise, it's possible that the applier confirms the empty buffer, but the node
+     * steps down and steps up so quickly that the applier signals drain complete in the wrong
+     * term.
      */
-    virtual void signalDrainComplete(OperationContext* txn) = 0;
+    virtual void signalDrainComplete(OperationContext* opCtx, long long termWhenBufferIsEmpty) = 0;
 
     /**
      * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
-     * Returns OK if isWaitingForApplierToDrain() returns false.
+     * Returns OK if we are not in drain mode.
      * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
      * buffer.
      * Returns ErrorCodes::BadValue if timeout is negative.
@@ -454,7 +522,7 @@ public:
     /**
      * Does an initial sync of data, after dropping existing data.
      */
-    virtual Status resyncData(OperationContext* txn, bool waitUntilCompleted) = 0;
+    virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) = 0;
 
     /**
      * Handles an incoming isMaster command for a replica set node.  Should not be
@@ -469,9 +537,9 @@ public:
     virtual void appendSlaveInfoData(BSONObjBuilder* result) = 0;
 
     /**
-     * Returns a copy of the current ReplicaSetConfig.
+     * Returns a copy of the current ReplSetConfig.
      */
-    virtual ReplicaSetConfig getConfig() const = 0;
+    virtual ReplSetConfig getConfig() const = 0;
 
     /**
      * Handles an incoming replSetGetConfig command. Adds BSON to 'result'.
@@ -479,14 +547,18 @@ public:
     virtual void processReplSetGetConfig(BSONObjBuilder* result) = 0;
 
     /**
-     * Processes the ReplSetMetadata returned from a command run against another replica set
-     * member and updates protocol version 1 information (most recent optime that is committed,
-     * member id of the current PRIMARY, the current config version and the current term).
+     * Processes the ReplSetMetadata returned from a command run against another
+     * replica set member and so long as the config version in the metadata matches the replica set
+     * config version this node currently has, updates the current term.
      *
-     * TODO(dannenberg): Move this method to be testing only if it does not end up being used
-     * to process the find and getmore metadata responses from the DataReplicator.
+     * This does NOT update this node's notion of the commit point.
      */
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) = 0;
+
+    /**
+     * This updates the node's notion of the commit point.
+     */
+    virtual void advanceCommitPoint(const OpTime& committedOptime) = 0;
 
     /**
      * Elections under protocol version 1 are triggered by a timer.
@@ -515,7 +587,7 @@ public:
      * returns Status::OK if the sync target could be set and an ErrorCode indicating why it
      * couldn't otherwise.
      */
-    virtual Status processReplSetSyncFrom(OperationContext* txn,
+    virtual Status processReplSetSyncFrom(OperationContext* opCtx,
                                           const HostAndPort& target,
                                           BSONObjBuilder* resultObj) = 0;
 
@@ -548,7 +620,7 @@ public:
      * Handles an incoming replSetReconfig command. Adds BSON to 'resultObj';
      * returns a Status with either OK or an error message.
      */
-    virtual Status processReplSetReconfig(OperationContext* txn,
+    virtual Status processReplSetReconfig(OperationContext* opCtx,
                                           const ReplSetReconfigArgs& args,
                                           BSONObjBuilder* resultObj) = 0;
 
@@ -557,20 +629,9 @@ public:
      * configuration to use.
      * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
      */
-    virtual Status processReplSetInitiate(OperationContext* txn,
+    virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj) = 0;
-
-    /*
-     * Handles an incoming replSetGetRBID command.
-     * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
-     */
-    virtual Status processReplSetGetRBID(BSONObjBuilder* resultObj) = 0;
-
-    /**
-     * Increments this process's rollback id.  Called every time a rollback occurs.
-     */
-    virtual void incrementRollbackID() = 0;
 
     /**
      * Arguments to the replSetFresh command.
@@ -633,7 +694,7 @@ public:
      *
      * Returns ErrorCodes::IllegalOperation if we're not running with master/slave replication.
      */
-    virtual Status processHandshake(OperationContext* txn, const HandshakeArgs& handshake) = 0;
+    virtual Status processHandshake(OperationContext* opCtx, const HandshakeArgs& handshake) = 0;
 
     /**
      * Returns a bool indicating whether or not this node builds indexes.
@@ -672,7 +733,7 @@ public:
      * Loads the optime from the last op in the oplog into the coordinator's lastAppliedOpTime and
      * lastDurableOpTime values.
      */
-    virtual void resetLastOpTimesFromOplog(OperationContext* txn) = 0;
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) = 0;
 
     /**
      * Returns the OpTime of the latest replica set-committed op known to this server.
@@ -685,14 +746,17 @@ public:
     * Handles an incoming replSetRequestVotes command.
     * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
     */
-    virtual Status processReplSetRequestVotes(OperationContext* txn,
+    virtual Status processReplSetRequestVotes(OperationContext* opCtx,
                                               const ReplSetRequestVotesArgs& args,
                                               ReplSetRequestVotesResponse* response) = 0;
 
     /**
-     * Prepares a metadata object describing the current term, primary, and lastOp information.
+     * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
+     * on what has been requested.
      */
-    virtual void prepareReplMetadata(const OpTime& lastOpTimeFromClient,
+    virtual void prepareReplMetadata(OperationContext* opCtx,
+                                     const BSONObj& metadataRequestObj,
+                                     const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 
     /**
@@ -724,7 +788,7 @@ public:
      * the rest of the work, because the term is still the same).
      * Returns StaleTerm if the supplied term was higher than the current term.
      */
-    virtual Status updateTerm(OperationContext* txn, long long term) = 0;
+    virtual Status updateTerm(OperationContext* opCtx, long long term) = 0;
 
     /**
      * Reserves a unique SnapshotName.
@@ -740,7 +804,7 @@ public:
      * A null OperationContext can be used in cases where the snapshot to wait for should not be
      * adjusted.
      */
-    virtual SnapshotName reserveSnapshotName(OperationContext* txn) = 0;
+    virtual SnapshotName reserveSnapshotName(OperationContext* opCtx) = 0;
 
     /**
      * Signals the SnapshotThread, if running, to take a forced snapshot even if the global
@@ -751,16 +815,19 @@ public:
     virtual void forceSnapshotCreation() = 0;
 
     /**
-     * Called when a new snapshot is created.
+     * Creates a new snapshot in the storage engine and registers it for use in the replication
+     * coordinator.
      */
-    virtual void onSnapshotCreate(OpTime timeOfSnapshot, SnapshotName name) = 0;
+    virtual void createSnapshot(OperationContext* opCtx,
+                                OpTime timeOfSnapshot,
+                                SnapshotName name) = 0;
 
     /**
      * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',
      * or we are interrupted for any reason, including shutdown or maxTimeMs expiration.
-     * 'txn' is used to checkForInterrupt and enforce maxTimeMS.
+     * 'opCtx' is used to checkForInterrupt and enforce maxTimeMS.
      */
-    virtual void waitUntilSnapshotCommitted(OperationContext* txn,
+    virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const SnapshotName& untilSnapshot) = 0;
 
     /**
@@ -772,6 +839,11 @@ public:
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
+
+    /**
+     * Appends diagnostics about the replication subsystem.
+     */
+    virtual void appendDiagnosticBSON(BSONObjBuilder* bob) = 0;
 
     /**
      * Appends connection information to the provided BSONObjBuilder.
@@ -795,6 +867,19 @@ public:
     virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
     virtual Status stepUpIfEligible() = 0;
+
+    virtual ServiceContext* getServiceContext() = 0;
+
+    /**
+     * Abort catchup if the node is in catchup mode.
+     */
+    virtual Status abortCatchupIfNeeded() = 0;
+
+    /**
+     * Returns true if logOp() should not append an entry to the oplog for the namespace for this
+     * operation.
+     */
+    bool isOplogDisabledFor(OperationContext* opCtx, const NamespaceString& nss);
 
 protected:
     ReplicationCoordinator();

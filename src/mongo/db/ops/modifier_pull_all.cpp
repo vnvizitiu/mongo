@@ -31,10 +31,10 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
-#include "mongo/db/ops/field_checker.h"
-#include "mongo/db/ops/log_builder.h"
-#include "mongo/db/ops/path_support.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/field_checker.h"
+#include "mongo/db/update/log_builder.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -212,7 +212,7 @@ Status ModifierPullAll::apply() const {
     vector<mutablebson::Element>::const_iterator curr = _preparedState->elementsToRemove.begin();
     const vector<mutablebson::Element>::const_iterator end = _preparedState->elementsToRemove.end();
     for (; curr != end; ++curr) {
-        const_cast<mutablebson::Element&>(*curr).remove();
+        const_cast<mutablebson::Element&>(*curr).remove().transitional_ignore();
     }
     return Status::OK();
 }

@@ -34,24 +34,29 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+namespace {
 
 using std::unique_ptr;
 using std::string;
 
-namespace {
+stdx::function<std::unique_ptr<KVHarnessHelper>()> basicFactory =
+    []() -> std::unique_ptr<KVHarnessHelper> { fassertFailed(40355); };
+
 class MyOperationContext : public OperationContextNoop {
 public:
     MyOperationContext(KVEngine* engine) : OperationContextNoop(engine->newRecoveryUnit()) {}
 };
 
 const std::unique_ptr<ClockSource> clock = stdx::make_unique<ClockSourceMock>();
-}
 
 TEST(KVEngineTestHarness, SimpleRS1) {
     unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
@@ -174,14 +179,15 @@ TEST(KVCatalogTest, Coll1) {
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, false, false));
+        catalog.reset(new KVCatalog(rs.get(), false, false));
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions()));
+        ASSERT_OK(
+            catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed));
         ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
         uow.commit();
     }
@@ -190,7 +196,7 @@ TEST(KVCatalogTest, Coll1) {
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        catalog.reset(new KVCatalog(rs.get(), true, false, false));
+        catalog.reset(new KVCatalog(rs.get(), false, false));
         catalog->init(&opCtx);
         uow.commit();
     }
@@ -199,8 +205,9 @@ TEST(KVCatalogTest, Coll1) {
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        catalog->dropCollection(&opCtx, "a.b");
-        catalog->newCollection(&opCtx, "a.b", CollectionOptions());
+        catalog->dropCollection(&opCtx, "a.b").transitional_ignore();
+        catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed)
+            .transitional_ignore();
         uow.commit();
     }
     ASSERT_NOT_EQUALS(ident, catalog->getCollectionIdent("a.b"));
@@ -218,14 +225,15 @@ TEST(KVCatalogTest, Idx1) {
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, false, false));
+        catalog.reset(new KVCatalog(rs.get(), false, false));
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions()));
+        ASSERT_OK(
+            catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed));
         ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
         uow.commit();
@@ -241,7 +249,8 @@ TEST(KVCatalogTest, Idx1) {
                                                                             << "foo"),
                                                                        false,
                                                                        RecordId(),
-                                                                       false));
+                                                                       false,
+                                                                       KVPrefix::kNotPrefixed));
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -269,7 +278,8 @@ TEST(KVCatalogTest, Idx1) {
                                                                             << "foo"),
                                                                        false,
                                                                        RecordId(),
-                                                                       false));
+                                                                       false,
+                                                                       KVPrefix::kNotPrefixed));
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -291,14 +301,15 @@ TEST(KVCatalogTest, DirectoryPerDb1) {
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, true, false));
+        catalog.reset(new KVCatalog(rs.get(), true, false));
         uow.commit();
     }
 
     {  // collection
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions()));
+        ASSERT_OK(
+            catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed));
         ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "a/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
         uow.commit();
@@ -314,7 +325,8 @@ TEST(KVCatalogTest, DirectoryPerDb1) {
                                                                             << "foo"),
                                                                        false,
                                                                        RecordId(),
-                                                                       false));
+                                                                       false,
+                                                                       KVPrefix::kNotPrefixed));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -333,14 +345,15 @@ TEST(KVCatalogTest, Split1) {
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, false, true));
+        catalog.reset(new KVCatalog(rs.get(), false, true));
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions()));
+        ASSERT_OK(
+            catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed));
         ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "collection/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
         uow.commit();
@@ -356,7 +369,8 @@ TEST(KVCatalogTest, Split1) {
                                                                             << "foo"),
                                                                        false,
                                                                        RecordId(),
-                                                                       false));
+                                                                       false,
+                                                                       KVPrefix::kNotPrefixed));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -375,14 +389,15 @@ TEST(KVCatalogTest, DirectoryPerAndSplit1) {
         WriteUnitOfWork uow(&opCtx);
         ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
         rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
-        catalog.reset(new KVCatalog(rs.get(), true, true, true));
+        catalog.reset(new KVCatalog(rs.get(), true, true));
         uow.commit();
     }
 
     {
         MyOperationContext opCtx(engine);
         WriteUnitOfWork uow(&opCtx);
-        ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions()));
+        ASSERT_OK(
+            catalog->newCollection(&opCtx, "a.b", CollectionOptions(), KVPrefix::kNotPrefixed));
         ASSERT_STRING_CONTAINS(catalog->getCollectionIdent("a.b"), "a/collection/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
         uow.commit();
@@ -398,11 +413,87 @@ TEST(KVCatalogTest, DirectoryPerAndSplit1) {
                                                                             << "foo"),
                                                                        false,
                                                                        RecordId(),
-                                                                       false));
+                                                                       false,
+                                                                       KVPrefix::kNotPrefixed));
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
         uow.commit();
     }
 }
+
+TEST(KVCatalogTest, RestartForPrefixes) {
+    storageGlobalParams.groupCollections = true;
+    ON_BLOCK_EXIT([&] { storageGlobalParams.groupCollections = false; });
+
+    KVPrefix abCollPrefix = KVPrefix::getNextPrefix(NamespaceString("a.b"));
+    KVPrefix fooIndexPrefix = KVPrefix::getNextPrefix(NamespaceString("a.b"));
+
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    {
+        unique_ptr<RecordStore> rs;
+        unique_ptr<KVCatalog> catalog;
+        {
+            MyOperationContext opCtx(engine);
+            WriteUnitOfWork uow(&opCtx);
+            ASSERT_OK(engine->createRecordStore(&opCtx, "catalog", "catalog", CollectionOptions()));
+            rs = engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
+            catalog.reset(new KVCatalog(rs.get(), false, false));
+            uow.commit();
+        }
+
+        {
+            MyOperationContext opCtx(engine);
+            WriteUnitOfWork uow(&opCtx);
+            ASSERT_OK(catalog->newCollection(&opCtx, "a.b", CollectionOptions(), abCollPrefix));
+            ASSERT_NOT_EQUALS("a.b", catalog->getCollectionIdent("a.b"));
+            ASSERT_TRUE(catalog->isUserDataIdent(catalog->getCollectionIdent("a.b")));
+            uow.commit();
+        }
+
+        {
+            MyOperationContext opCtx(engine);
+            WriteUnitOfWork uow(&opCtx);
+
+            BSONCollectionCatalogEntry::MetaData md;
+            md.ns = "a.b";
+            md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
+                                                                                << "foo"),
+                                                                           false,
+                                                                           RecordId(),
+                                                                           false,
+                                                                           fooIndexPrefix));
+            md.prefix = abCollPrefix;
+            catalog->putMetaData(&opCtx, "a.b", md);
+            uow.commit();
+        }
+    }
+
+    engine = helper->restartEngine();
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        unique_ptr<RecordStore> rs =
+            engine->getRecordStore(&opCtx, "catalog", "catalog", CollectionOptions());
+        unique_ptr<KVCatalog> catalog = stdx::make_unique<KVCatalog>(rs.get(), false, false);
+        catalog->init(&opCtx);
+
+        const BSONCollectionCatalogEntry::MetaData md = catalog->getMetaData(&opCtx, "a.b");
+        ASSERT_EQ("a.b", md.ns);
+        ASSERT_EQ(abCollPrefix, md.prefix);
+        ASSERT_EQ(fooIndexPrefix, md.indexes[md.findIndexOffset("foo")].prefix);
+    }
 }
+
+}  // namespace
+
+std::unique_ptr<KVHarnessHelper> KVHarnessHelper::create() {
+    return basicFactory();
+};
+
+void KVHarnessHelper::registerFactory(stdx::function<std::unique_ptr<KVHarnessHelper>()> factory) {
+    basicFactory = std::move(factory);
+};
+
+}  // namespace mongo

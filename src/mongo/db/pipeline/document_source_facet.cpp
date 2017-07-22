@@ -149,6 +149,13 @@ void DocumentSourceFacet::setSource(DocumentSource* source) {
     _teeBuffer->setSource(source);
 }
 
+void DocumentSourceFacet::doDispose() {
+    for (auto&& facet : _facets) {
+        facet.pipeline.get_deleter().dismissDisposal();
+        facet.pipeline->dispose(pExpCtx->opCtx);
+    }
+}
+
 DocumentSource::GetNextResult DocumentSourceFacet::getNext() {
     pExpCtx->checkForInterrupt();
 
@@ -179,11 +186,11 @@ DocumentSource::GetNextResult DocumentSourceFacet::getNext() {
     return resultDoc.freeze();
 }
 
-Value DocumentSourceFacet::serialize(bool explain) const {
+Value DocumentSourceFacet::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     MutableDocument serialized;
     for (auto&& facet : _facets) {
-        serialized[facet.name] =
-            Value(explain ? facet.pipeline->writeExplainOps() : facet.pipeline->serialize());
+        serialized[facet.name] = Value(explain ? facet.pipeline->writeExplainOps(*explain)
+                                               : facet.pipeline->serialize());
     }
     return Value(Document{{"$facet", serialized.freezeToValue()}});
 }
@@ -201,12 +208,6 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::optimize() {
         facet.pipeline->optimizePipeline();
     }
     return this;
-}
-
-void DocumentSourceFacet::doInjectExpressionContext() {
-    for (auto&& facet : _facets) {
-        facet.pipeline->injectExpressionContext(pExpCtx);
-    }
 }
 
 void DocumentSourceFacet::doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
@@ -269,21 +270,7 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::createFromBson(
     for (auto&& rawFacet : extractRawPipelines(elem)) {
         const auto facetName = rawFacet.first;
 
-        auto pipeline = uassertStatusOK(Pipeline::parse(rawFacet.second, expCtx));
-
-        uassert(40172,
-                str::stream() << "sub-pipeline in $facet stage cannot be empty: " << facetName,
-                !pipeline->getSources().empty());
-
-        // Disallow any stages that need to be the first stage in the pipeline.
-        for (auto&& stage : pipeline->getSources()) {
-            if (stage->isValidInitialSource()) {
-                uasserted(40173,
-                          str::stream() << stage->getSourceName()
-                                        << " is not allowed to be used within a $facet stage: "
-                                        << elem.toString());
-            }
-        }
+        auto pipeline = uassertStatusOK(Pipeline::parseFacetPipeline(rawFacet.second, expCtx));
 
         facetPipelines.emplace_back(facetName, std::move(pipeline));
     }

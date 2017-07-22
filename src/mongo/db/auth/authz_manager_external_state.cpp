@@ -40,12 +40,13 @@ stdx::function<std::unique_ptr<AuthzManagerExternalState>()> AuthzManagerExterna
 AuthzManagerExternalState::AuthzManagerExternalState() = default;
 AuthzManagerExternalState::~AuthzManagerExternalState() = default;
 
-bool AuthzManagerExternalState::shouldUseRolesFromConnection(OperationContext* txn,
+bool AuthzManagerExternalState::shouldUseRolesFromConnection(OperationContext* opCtx,
                                                              const UserName& userName) {
-    return txn && txn->getClient() && txn->getClient()->session() &&
-        txn->getClient()->session()->getX509PeerInfo().subjectName == userName.getUser() &&
-        userName.getDB() == "$external" &&
-        !txn->getClient()->session()->getX509PeerInfo().roles.empty();
+    if (!opCtx || !opCtx->getClient() || !opCtx->getClient()->session())
+        return false;
+    auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
+    return sslPeerInfo.subjectName == userName.getUser() && userName.getDB() == "$external" &&
+        !sslPeerInfo.roles.empty();
 }
 
 

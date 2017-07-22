@@ -36,6 +36,7 @@ namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
+class BSONObjBuilderValueStream;
 template <typename T>
 class StatusWith;
 
@@ -61,6 +62,11 @@ public:
     // yet joined the cluster, all in protocol version 1.
     static const long long kInitialTerm = 0;
 
+    /**
+     * Returns maximum OpTime value.
+     */
+    static OpTime max();
+
     // Default OpTime, also the smallest one.
     OpTime() : _timestamp(Timestamp(0, 0)), _term(kUninitializedTerm) {}
     OpTime(Timestamp ts, long long term) : _timestamp(std::move(ts)), _term(term) {}
@@ -85,6 +91,14 @@ public:
     BSONObj toBSON() const;
 
     static StatusWith<OpTime> parseFromOplogEntry(const BSONObj& obj);
+
+    /**
+     * Parses OpTime from a document in the form:
+     *     { ts: <timestamp>, t: <term> }
+     *
+     * Throws an exception on error.
+     */
+    static OpTime parse(const BSONObj& obj);
 
     std::string toString() const;
 
@@ -141,4 +155,11 @@ private:
 };
 
 }  // namespace repl
+
+/**
+ * Support BSONObjBuilder and BSONArrayBuilder "stream" API.
+ */
+BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const repl::OpTime& value);
+
+
 }  // namespace mongo

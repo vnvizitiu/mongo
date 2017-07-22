@@ -31,8 +31,10 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
 #include "mongo/db/matcher/expression_geo.h"
+
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/geo/geoparser.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -59,10 +61,10 @@ Status GeoExpression::parseQuery(const BSONObj& obj) {
                       str::stream() << "can't parse extra field: " << outerIt.next());
     }
 
-    BSONObj::MatchType matchType = static_cast<BSONObj::MatchType>(queryElt.getGtLtOp());
-    if (BSONObj::opGEO_INTERSECTS == matchType) {
+    auto keyword = MatchExpressionParser::parsePathAcceptingKeyword(queryElt);
+    if (PathAcceptingKeyword::GEO_INTERSECTS == keyword) {
         predicate = GeoExpression::INTERSECT;
-    } else if (BSONObj::opWITHIN == matchType) {
+    } else if (PathAcceptingKeyword::WITHIN == keyword) {
         predicate = GeoExpression::WITHIN;
     } else {
         // eoo() or unknown query predicate.
@@ -230,8 +232,8 @@ Status GeoNearExpression::parseNewQuery(const BSONObj& obj) {
     if (!e.isABSONObj()) {
         return Status(ErrorCodes::BadValue, "geo near query argument is not an object");
     }
-    BSONObj::MatchType matchType = static_cast<BSONObj::MatchType>(e.getGtLtOp());
-    if (BSONObj::opNEAR != matchType) {
+
+    if (PathAcceptingKeyword::GEO_NEAR != MatchExpressionParser::parsePathAcceptingKeyword(e)) {
         return Status(ErrorCodes::BadValue,
                       mongoutils::str::stream() << "invalid geo near query operator: "
                                                 << e.fieldName());
@@ -364,7 +366,11 @@ bool GeoMatchExpression::matchesSingleElement(const BSONElement& e) const {
 
 void GeoMatchExpression::debugString(StringBuilder& debug, int level) const {
     _debugAddSpace(debug, level);
-    debug << "GEO raw = " << _rawObj.toString();
+
+    BSONObjBuilder builder;
+    serialize(&builder);
+    debug << "GEO raw = " << builder.obj().toString();
+
     MatchExpression::TagData* td = getTag();
     if (NULL != td) {
         debug << " ";
@@ -374,7 +380,9 @@ void GeoMatchExpression::debugString(StringBuilder& debug, int level) const {
 }
 
 void GeoMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->appendElements(_rawObj);
+    BSONObjBuilder subobj(out->subobjStart(path()));
+    subobj.appendElements(_rawObj);
+    subobj.doneFast();
 }
 
 bool GeoMatchExpression::equivalent(const MatchExpression* other) const {
@@ -391,7 +399,7 @@ bool GeoMatchExpression::equivalent(const MatchExpression* other) const {
 
 std::unique_ptr<MatchExpression> GeoMatchExpression::shallowClone() const {
     std::unique_ptr<GeoMatchExpression> next = stdx::make_unique<GeoMatchExpression>();
-    next->init(path(), NULL, _rawObj);
+    next->init(path(), NULL, _rawObj).transitional_ignore();
     next->_query = _query;
     next->_canSkipValidation = _canSkipValidation;
     if (getTag()) {
@@ -431,7 +439,9 @@ void GeoNearMatchExpression::debugString(StringBuilder& debug, int level) const 
 }
 
 void GeoNearMatchExpression::serialize(BSONObjBuilder* out) const {
-    out->appendElements(_rawObj);
+    BSONObjBuilder subobj(out->subobjStart(path()));
+    subobj.appendElements(_rawObj);
+    subobj.doneFast();
 }
 
 bool GeoNearMatchExpression::equivalent(const MatchExpression* other) const {
@@ -448,7 +458,7 @@ bool GeoNearMatchExpression::equivalent(const MatchExpression* other) const {
 
 std::unique_ptr<MatchExpression> GeoNearMatchExpression::shallowClone() const {
     std::unique_ptr<GeoNearMatchExpression> next = stdx::make_unique<GeoNearMatchExpression>();
-    next->init(path(), NULL, _rawObj);
+    next->init(path(), NULL, _rawObj).transitional_ignore();
     next->_query = _query;
     if (getTag()) {
         next->setTag(getTag()->clone());

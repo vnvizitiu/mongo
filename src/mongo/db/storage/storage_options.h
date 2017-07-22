@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/platform/atomic_proxy.h"
+#include "mongo/platform/atomic_word.h"
 
 /*
  * This file defines the storage for options that come from the command line related to data file
@@ -81,11 +82,11 @@ struct StorageGlobalParams {
 
     // --journalCommitInterval
     static const int kMaxJournalCommitIntervalMs;
-    std::atomic<int> journalCommitIntervalMs;  // NOLINT
+    AtomicInt32 journalCommitIntervalMs;
 
     // --notablescan
     // no table scans allowed
-    std::atomic<bool> noTableScan{false};  // NOLINT
+    AtomicBool noTableScan{false};
 
     // --directoryperdb
     // Stores each database’s files in its own folder in the data directory.
@@ -98,9 +99,20 @@ struct StorageGlobalParams {
     // via an fsync operation.
     // Do not set this value on production systems.
     // In almost every situation, you should use the default setting.
+    static const double kMaxSyncdelaySecs;
     AtomicDouble syncdelay{60.0};  // seconds between fsyncs
 
+    // --queryableBackupMode
+    // Puts MongoD into "read-only" mode. MongoD will not write any data to the underlying
+    // filesystem. Note that read operations may require writes. For example, a sort on a large
+    // dataset may fail if it requires spilling to disk.
     bool readOnly = false;
+
+    // --groupCollections
+    // Dictate to the storage engine that it should attempt to create new MongoDB collections from
+    // an existing underlying MongoDB database level resource if possible. This can improve
+    // workloads that rely heavily on creating many collections within a database.
+    bool groupCollections = false;
 };
 
 extern StorageGlobalParams storageGlobalParams;

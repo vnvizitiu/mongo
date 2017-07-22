@@ -41,10 +41,10 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/group.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/server_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -58,9 +58,9 @@ namespace {
  * The group command is deprecated. Users should prefer the aggregation framework or mapReduce. See
  * http://dochub.mongodb.org/core/group-command-deprecation for more detail.
  */
-class GroupCommand : public Command {
+class GroupCommand : public BasicCommand {
 public:
-    GroupCommand() : Command("group") {}
+    GroupCommand() : BasicCommand("group") {}
 
 private:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -79,7 +79,7 @@ private:
         return true;
     }
 
-    bool supportsReadConcern() const final {
+    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -98,25 +98,31 @@ private:
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) {
-        std::string ns = parseNs(dbname, cmdObj);
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
-                NamespaceString(ns), ActionType::find)) {
+                nss, ActionType::find)) {
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
         return Status::OK();
     }
 
     virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-        const BSONObj& p = cmdObj.firstElement().embeddedObjectUserCheck();
-        uassert(17211, "ns has to be set", p["ns"].type() == String);
-        return dbname + "." + p["ns"].String();
+        const auto nsElt = cmdObj.firstElement().embeddedObjectUserCheck()["ns"];
+        uassert(ErrorCodes::InvalidNamespace,
+                "'ns' must be of type String",
+                nsElt.type() == BSONType::String);
+        const NamespaceString nss(dbname, nsElt.valueStringData());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace: " << nss.ns(),
+                nss.isValid());
+        return nss.ns();
     }
 
-    virtual Status explain(OperationContext* txn,
+    virtual Status explain(OperationContext* opCtx,
                            const std::string& dbname,
                            const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           const rpc::ServerSelectionMetadata&,
+                           ExplainOptions::Verbosity verbosity,
                            BSONObjBuilder* out) const {
         GroupRequest groupRequest;
         Status parseRequestStatus = _parseRequest(dbname, cmdObj, &groupRequest);
@@ -126,26 +132,24 @@ private:
 
         groupRequest.explain = true;
 
-        AutoGetCollectionForRead ctx(txn, groupRequest.ns);
+        AutoGetCollectionForReadCommand ctx(opCtx, groupRequest.ns);
         Collection* coll = ctx.getCollection();
 
         auto statusWithPlanExecutor =
-            getExecutorGroup(txn, coll, groupRequest, PlanExecutor::YIELD_AUTO);
+            getExecutorGroup(opCtx, coll, groupRequest, PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
 
-        unique_ptr<PlanExecutor> planExecutor = std::move(statusWithPlanExecutor.getValue());
+        auto planExecutor = std::move(statusWithPlanExecutor.getValue());
 
         Explain::explainStages(planExecutor.get(), coll, verbosity, out);
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         RARELY {
             warning() << "The group command is deprecated. See "
@@ -158,20 +162,20 @@ private:
             return appendCommandStatus(result, parseRequestStatus);
         }
 
-        AutoGetCollectionForRead ctx(txn, groupRequest.ns);
+        AutoGetCollectionForReadCommand ctx(opCtx, groupRequest.ns);
         Collection* coll = ctx.getCollection();
 
         auto statusWithPlanExecutor =
-            getExecutorGroup(txn, coll, groupRequest, PlanExecutor::YIELD_AUTO);
+            getExecutorGroup(opCtx, coll, groupRequest, PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
             return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
 
-        unique_ptr<PlanExecutor> planExecutor = std::move(statusWithPlanExecutor.getValue());
+        auto planExecutor = std::move(statusWithPlanExecutor.getValue());
 
-        auto curOp = CurOp::get(txn);
+        auto curOp = CurOp::get(opCtx);
         {
-            stdx::lock_guard<Client>(*txn->getClient());
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(Explain::getPlanSummary(planExecutor.get()));
         }
 
@@ -196,7 +200,7 @@ private:
         PlanSummaryStats summaryStats;
         Explain::getSummaryStats(*planExecutor, &summaryStats);
         if (coll) {
-            coll->infoCache()->notifyOfQuery(txn, summaryStats.indexesUsed);
+            coll->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
@@ -230,7 +234,7 @@ private:
     Status _parseRequest(const std::string& dbname,
                          const BSONObj& cmdObj,
                          GroupRequest* request) const {
-        request->ns = parseNs(dbname, cmdObj);
+        request->ns = NamespaceString(parseNs(dbname, cmdObj));
 
         // By default, group requests are regular group not explain of group.
         request->explain = false;
@@ -266,13 +270,6 @@ private:
         }
         if (collationEltStatus.isOK()) {
             request->collation = collationElt.embeddedObject().getOwned();
-        }
-        if (!request->collation.isEmpty() &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k32) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "The featureCompatibilityVersion must be 3.4 to use collation. See "
-                          "http://dochub.mongodb.org/core/3.4-feature-compatibility.");
         }
 
         BSONElement reduce = p["$reduce"];

@@ -36,10 +36,10 @@ namespace {
 
 using namespace mongo;
 
-static const Milliseconds minMaxStaleness = ReadPreferenceSetting::kMinimalMaxStalenessValue;
+static const Seconds kMinMaxStaleness = ReadPreferenceSetting::kMinimalMaxStalenessValue;
 
 void checkParse(const BSONObj& rpsObj, const ReadPreferenceSetting& expected) {
-    const auto swRps = ReadPreferenceSetting::fromBSON(rpsObj);
+    const auto swRps = ReadPreferenceSetting::fromInnerBSON(rpsObj);
     ASSERT_OK(swRps.getStatus());
     const auto rps = swRps.getValue();
     ASSERT_TRUE(rps.equals(expected));
@@ -68,36 +68,42 @@ TEST(ReadPreferenceSetting, ParseValid) {
                                                             << "ny")))));
     checkParse(BSON("mode"
                     << "secondary"
-                    << "maxStalenessMS"
-                    << minMaxStaleness.count()),
-               ReadPreferenceSetting(ReadPreference::SecondaryOnly, minMaxStaleness));
+                    << "maxStalenessSeconds"
+                    << kMinMaxStaleness.count()),
+               ReadPreferenceSetting(ReadPreference::SecondaryOnly, kMinMaxStaleness));
 
     checkParse(BSON("mode"
                     << "secondary"
-                    << "maxStalenessMS"
+                    << "maxStalenessSeconds"
                     << 0),
-               ReadPreferenceSetting(ReadPreference::SecondaryOnly, Milliseconds(0)));
+               ReadPreferenceSetting(ReadPreference::SecondaryOnly, Seconds(0)));
 
     checkParse(BSON("mode"
                     << "secondary"
                     << "tags"
                     << BSON_ARRAY(BSON("dc"
                                        << "ny"))
-                    << "maxStalenessMS"
-                    << minMaxStaleness.count()),
+                    << "maxStalenessSeconds"
+                    << kMinMaxStaleness.count()),
                ReadPreferenceSetting(ReadPreference::SecondaryOnly,
                                      TagSet(BSON_ARRAY(BSON("dc"
                                                             << "ny"))),
-                                     minMaxStaleness));
+                                     kMinMaxStaleness));
 }
 
 void checkParseFails(const BSONObj& rpsObj) {
-    auto swRps = ReadPreferenceSetting::fromBSON(rpsObj);
+    auto swRps = ReadPreferenceSetting::fromInnerBSON(rpsObj);
     ASSERT_NOT_OK(swRps.getStatus());
 }
 
 void checkParseFailsWithError(const BSONObj& rpsObj, ErrorCodes::Error error) {
-    auto swRps = ReadPreferenceSetting::fromBSON(rpsObj);
+    auto swRps = ReadPreferenceSetting::fromInnerBSON(rpsObj);
+    ASSERT_NOT_OK(swRps.getStatus());
+    ASSERT_EQUALS(swRps.getStatus().code(), error);
+}
+
+void checkParseContainerFailsWithError(const BSONObj& rpsObj, ErrorCodes::Error error) {
+    auto swRps = ReadPreferenceSetting::fromContainingBSON(rpsObj);
     ASSERT_NOT_OK(swRps.getStatus());
     ASSERT_EQUALS(swRps.getStatus().code(), error);
 }
@@ -107,14 +113,14 @@ TEST(ReadPreferenceSetting, NonEquality) {
                                          << "ca")
                                     << BSON("foo"
                                             << "bar")));
-    auto rps = ReadPreferenceSetting(ReadPreference::Nearest, tagSet, minMaxStaleness);
+    auto rps = ReadPreferenceSetting(ReadPreference::Nearest, tagSet, kMinMaxStaleness);
 
     auto unexpected1 =
-        ReadPreferenceSetting(ReadPreference::Nearest, TagSet::primaryOnly(), minMaxStaleness);
+        ReadPreferenceSetting(ReadPreference::Nearest, TagSet::primaryOnly(), kMinMaxStaleness);
     ASSERT_FALSE(rps.equals(unexpected1));
 
     auto unexpected2 = ReadPreferenceSetting(
-        ReadPreference::Nearest, tagSet, Milliseconds(minMaxStaleness.count() + 1));
+        ReadPreference::Nearest, tagSet, Seconds(kMinMaxStaleness.count() + 1));
     ASSERT_FALSE(rps.equals(unexpected2));
 }
 
@@ -139,40 +145,46 @@ TEST(ReadPreferenceSetting, ParseInvalid) {
                          << "tags"
                          << "bad"));
 
-    // maxStalenessMS is negative
+    // maxStalenessSeconds is negative
     checkParseFails(BSON("mode"
                          << "secondary"
-                         << "maxStalenessMS"
+                         << "maxStalenessSeconds"
                          << -1));
 
-    // maxStalenessMS is NaN
+    // maxStalenessSeconds is NaN
     checkParseFails(BSON("mode"
                          << "secondary"
-                         << "maxStalenessMS"
+                         << "maxStalenessSeconds"
                          << "ONE"));
 
-    // maxStalenessMS and primary
+    // maxStalenessSeconds and primary
     checkParseFails(BSON("mode"
                          << "primary"
-                         << "maxStalenessMS"
-                         << minMaxStaleness.count()));
+                         << "maxStalenessSeconds"
+                         << kMinMaxStaleness.count()));
 
-    // maxStalenessMS is less than min
+    // maxStalenessSeconds is less than min
     checkParseFailsWithError(BSON("mode"
                                   << "primary"
-                                  << "maxStalenessMS"
-                                  << Milliseconds(minMaxStaleness.count() - 1).count()),
+                                  << "maxStalenessSeconds"
+                                  << Seconds(kMinMaxStaleness.count() - 1).count()),
                              ErrorCodes::MaxStalenessOutOfRange);
 
-    // maxStalenessMS is greater than max
+    // maxStalenessSeconds is greater than max
     checkParseFails(BSON("mode"
                          << "secondary"
-                         << "maxStalenessMS"
-                         << Milliseconds::max().count()));
+                         << "maxStalenessSeconds"
+                         << Seconds::max().count()));
+
+    checkParseContainerFailsWithError(BSON("$query" << BSON("pang"
+                                                            << "pong")
+                                                    << "$readPreference"
+                                                    << 2),
+                                      ErrorCodes::TypeMismatch);
 }
 
 void checkRoundtrip(const ReadPreferenceSetting& rps) {
-    auto parsed = ReadPreferenceSetting::fromBSON(rps.toBSON());
+    auto parsed = ReadPreferenceSetting::fromInnerBSON(rps.toInnerBSON());
     ASSERT_OK(parsed.getStatus());
     ASSERT_TRUE(parsed.getValue().equals(rps));
 }
@@ -198,7 +210,7 @@ TEST(ReadPreferenceSetting, Roundtrip) {
                                                                 << "ca")
                                                            << BSON("foo"
                                                                    << "bar"))),
-                                         minMaxStaleness));
+                                         kMinMaxStaleness));
 }
 
 }  // namespace

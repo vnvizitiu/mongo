@@ -38,9 +38,9 @@
 namespace mongo {
 namespace {
 
-class FsyncCommand : public Command {
+class FsyncCommand : public ErrmsgCommandDeprecated {
 public:
-    FsyncCommand() : Command("fsync", false, "fsync") {}
+    FsyncCommand() : ErrmsgCommandDeprecated("fsync", "fsync") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -67,12 +67,11 @@ public:
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
         if (cmdObj["lock"].trueValue()) {
             errmsg = "can't do lock through mongos";
             return false;
@@ -87,14 +86,14 @@ public:
         grid.shardRegistry()->getAllShardIds(&shardIds);
 
         for (const ShardId& shardId : shardIds) {
-            auto shardStatus = grid.shardRegistry()->getShard(txn, shardId);
+            auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardId);
             if (!shardStatus.isOK()) {
                 continue;
             }
             const auto s = shardStatus.getValue();
 
             auto response = uassertStatusOK(s->runCommandWithFixedRetryAttempts(
-                txn,
+                opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 "admin",
                 BSON("fsync" << 1),

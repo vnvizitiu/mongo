@@ -72,6 +72,10 @@ if (typeof _threadInject != "undefined") {
         this._add("t.remove( " + tojson(obj) + " )");
     };
 
+    EventGenerator.prototype.addCurrentOp = function() {
+        this._add("db.currentOp()");
+    };
+
     EventGenerator.prototype.addUpdate = function(objOld, objNew) {
         this._add("t.update( " + tojson(objOld) + ", " + tojson(objNew) + " )");
     };
@@ -101,7 +105,11 @@ if (typeof _threadInject != "undefined") {
         var collectionName = args.shift();
         var host = args.shift();
         var m = new Mongo(host);
-        var t = m.getDB("test")[collectionName];
+
+        // We define 'db' and 't' as local variables so that calling eval() on the stringified
+        // JavaScript expression 'args[i][1]' can take advantage of using them.
+        var db = m.getDB("test");
+        var t = db[collectionName];
         for (var i in args) {
             sleep(args[i][0]);
             eval(args[i][1]);
@@ -161,10 +169,8 @@ if (typeof _threadInject != "undefined") {
             "indexh.js",
             "evald.js",
             "evalf.js",
-            "killop.js",
             "run_program1.js",
             "notablescan.js",
-            "drop2.js",
             "dropdb_race.js",
             "bench_test1.js",
             "padding.js",
@@ -173,7 +179,6 @@ if (typeof _threadInject != "undefined") {
             // this has a chance to see the message
             "connections_opened.js",  // counts connections, globally
             "opcounters_write_cmd.js",
-            "currentop.js",                   // SERVER-8673, plus rwlock yielding issues
             "set_param1.js",                  // changes global state
             "geo_update_btree2.js",           // SERVER-11132 test disables table scans
             "update_setOnInsert.js",          // SERVER-9982
@@ -186,21 +191,53 @@ if (typeof _threadInject != "undefined") {
 
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
+
+            // Views tests
+            "views/invalid_system_views.js",  // Creates invalid view definitions in system.views.
+            "views/views_all_commands.js",    // Drops test DB.
         ]);
+
+        // The following tests cannot run when shell readMode is legacy.
+        if (db.getMongo().readMode() === "legacy") {
+            var requires_find_command = [
+                "views/views_aggregation.js",
+                "views/views_change.js",
+                "views/views_drop.js",
+                "views/views_find.js"
+            ];
+            Object.assign(skipTests, makeKeys(requires_find_command));
+        }
+
+        // Get files, including files in subdirectories.
+        var getFilesRecursive = function(dir) {
+            var files = listFiles(dir);
+            var fileList = [];
+            files.forEach(file => {
+                if (file.isDirectory) {
+                    getFilesRecursive(file.name).forEach(subDirFile => fileList.push(subDirFile));
+                } else {
+                    fileList.push(file);
+                }
+            });
+            return fileList;
+        };
 
         var parallelFilesDir = "jstests/core";
 
         // some tests can't be run in parallel with each other
         var serialTestsArr = [
+            // These tests use fsyncLock.
             parallelFilesDir + "/fsync.js",
-            parallelFilesDir + "/auth1.js",
+            parallelFilesDir + "/currentop.js",
+            parallelFilesDir + "/killop_drop_collection.js",
 
             // These tests expect the profiler to be on or off at specific points. They should not
-            // be run in parallel with tests that peform fsyncLock. User operations skip writing to
+            // be run in parallel with tests that perform fsyncLock. User operations skip writing to
             // the system.profile collection while the server is fsyncLocked.
             //
-            // The profiler tests can be run in parallel with each other as they use test-specific
-            // databases.
+            // Most profiler tests can be run in parallel with each other as they use test-specific
+            // databases, with the exception of tests which modify slowms or the profiler's sampling
+            // rate, since those affect profile settings globally.
             parallelFilesDir + "/apitest_db.js",
             parallelFilesDir + "/evalb.js",
             parallelFilesDir + "/geo_s2cursorlimitskip.js",
@@ -217,16 +254,26 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_getmore.js",
             parallelFilesDir + "/profile_group.js",
             parallelFilesDir + "/profile_insert.js",
+            parallelFilesDir + "/profile_list_collections.js",
+            parallelFilesDir + "/profile_list_indexes.js",
             parallelFilesDir + "/profile_mapreduce.js",
             parallelFilesDir + "/profile_no_such_db.js",
-            parallelFilesDir + "/profile_update.js"
+            parallelFilesDir + "/profile_parallel_collection_scan.js",
+            parallelFilesDir + "/profile_repair_cursor.js",
+            parallelFilesDir + "/profile_sampling.js",
+            parallelFilesDir + "/profile_update.js",
+
+            // These tests use getLog to examine the slow query logs. Tests which examine the slow
+            // query logs can't be run concurrently with tests that affect the profile sampling
+            // rate, since that also impacts which operations get logged.
+            parallelFilesDir + "/getlog2.js",
         ];
         var serialTests = makeKeys(serialTestsArr);
 
         // prefix the first thread with the serialTests
         // (which we will exclude from the rest of the threads below)
         params[0] = serialTestsArr;
-        var files = listFiles(parallelFilesDir);
+        var files = getFilesRecursive(parallelFilesDir);
         files = Array.shuffle(files);
 
         var i = 0;
@@ -273,26 +320,32 @@ if (typeof _threadInject != "undefined") {
     // newScopes: if true, each thread starts in a fresh scope
     assert.parallelTests = function(params, msg, newScopes) {
         newScopes = newScopes || false;
-        var wrapper = function(fun, argv) {
-            eval("var z = function() {" + "TestData = " + tojson(TestData) + ";" +
-                 "var __parallelTests__fun = " + fun.toString() + ";" +
-                 "var __parallelTests__argv = " + tojson(argv) + ";" +
-                 "var __parallelTests__passed = false;" + "try {" +
-                 "__parallelTests__fun.apply( 0, __parallelTests__argv );" +
-                 "__parallelTests__passed = true;" + "} catch ( e ) {" + "print('');" +
-                 "print( '********** Parallel Test FAILED: ' + tojson(e) );" + "print('');" + "}" +
-                 "return __parallelTests__passed;" + "}");
-            return z;
-        };
+        function wrapper(fun, argv, globals) {
+            if (globals.hasOwnProperty("TestData")) {
+                TestData = globals.TestData;
+            }
+
+            try {
+                fun.apply(0, argv);
+                return {passed: true};
+            } catch (e) {
+                print("\n********** Parallel Test FAILED: " + tojson(e) + "\n");
+                return {
+                    passed: false,
+                    testName: tojson(e).match(/Error: error loading js file: (.*\.js)/)[1]
+                };
+            }
+        }
+
         var runners = new Array();
         for (var i in params) {
             var param = params[i];
             var test = param.shift();
             var t;
             if (newScopes)
-                t = new ScopedThread(wrapper(test, param));
+                t = new ScopedThread(wrapper, test, param, {TestData: TestData});
             else
-                t = new Thread(wrapper(test, param));
+                t = new Thread(wrapper, test, param, {TestData: TestData});
             runners.push(t);
         }
 
@@ -300,13 +353,16 @@ if (typeof _threadInject != "undefined") {
             x.start();
         });
         var nFailed = 0;
+        var failedTests = [];
         // SpiderMonkey doesn't like it if we exit before all threads are joined
         // (see SERVER-19615 for a similar issue).
         runners.forEach(function(x) {
-            if (!x.returnData()) {
+            if (!x.returnData().passed) {
                 ++nFailed;
+                failedTests.push(x.returnData().testName);
             }
         });
+        msg += ": " + tojsononeline(failedTests);
         assert.eq(0, nFailed, msg);
     };
 }

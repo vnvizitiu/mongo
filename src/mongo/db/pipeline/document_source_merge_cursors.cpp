@@ -57,7 +57,6 @@ intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx) {
     intrusive_ptr<DocumentSourceMergeCursors> source(
         new DocumentSourceMergeCursors(std::move(cursorDescriptors), pExpCtx));
-    source->injectExpressionContext(pExpCtx);
     return source;
 }
 
@@ -87,7 +86,8 @@ intrusive_ptr<DocumentSource> DocumentSourceMergeCursors::createFromBson(
     return new DocumentSourceMergeCursors(std::move(cursorDescriptors), pExpCtx);
 }
 
-Value DocumentSourceMergeCursors::serialize(bool explain) const {
+Value DocumentSourceMergeCursors::serialize(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
     vector<Value> cursors;
     for (size_t i = 0; i < _cursorDescriptors.size(); i++) {
         cursors.push_back(
@@ -174,7 +174,7 @@ DocumentSource::GetNextResult DocumentSourceMergeCursors::getNext() {
     return std::move(next);
 }
 
-void DocumentSourceMergeCursors::dispose() {
+void DocumentSourceMergeCursors::doDispose() {
     // Note it is an error to call done() on a connection before consuming the response from a
     // request. Therefore it is an error to call dispose() if there are any outstanding connections
     // which have not received a reply.

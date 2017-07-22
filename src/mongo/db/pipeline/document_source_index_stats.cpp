@@ -70,8 +70,7 @@ DocumentSource::GetNextResult DocumentSourceIndexStats::getNext() {
 }
 
 DocumentSourceIndexStats::DocumentSourceIndexStats(const intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSourceNeedsMongod(pExpCtx),
-      _processName(str::stream() << getHostNameCached() << ":" << serverGlobalParams.port) {}
+    : DocumentSourceNeedsMongod(pExpCtx), _processName(getHostNameCachedAndPort()) {}
 
 intrusive_ptr<DocumentSource> DocumentSourceIndexStats::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
@@ -81,7 +80,8 @@ intrusive_ptr<DocumentSource> DocumentSourceIndexStats::createFromBson(
     return new DocumentSourceIndexStats(pExpCtx);
 }
 
-Value DocumentSourceIndexStats::serialize(bool explain) const {
+Value DocumentSourceIndexStats::serialize(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(DOC(getSourceName() << Document()));
 }
 }

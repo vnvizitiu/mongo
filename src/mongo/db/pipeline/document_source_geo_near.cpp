@@ -97,7 +97,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGeoNear::getMergeSource() {
     return DocumentSourceSort::create(pExpCtx, BSON(distanceField->fullPath() << 1), limit);
 }
 
-Value DocumentSourceGeoNear::serialize(bool explain) const {
+Value DocumentSourceGeoNear::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     MutableDocument result;
 
     if (coordsIsArray) {
@@ -178,7 +178,6 @@ void DocumentSourceGeoNear::runCommand() {
 intrusive_ptr<DocumentSourceGeoNear> DocumentSourceGeoNear::create(
     const intrusive_ptr<ExpressionContext>& pCtx) {
     intrusive_ptr<DocumentSourceGeoNear> source(new DocumentSourceGeoNear(pCtx));
-    source->injectExpressionContext(pCtx);
     return source;
 }
 

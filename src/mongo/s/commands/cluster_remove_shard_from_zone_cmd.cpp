@@ -55,7 +55,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // kMajority implies JOURNAL if journaling is
                                                 // supported by mongod and
                                                 // writeConcernMajorityJournalDefault is set to true
-                                                // in the ReplicaSetConfig.
+                                                // in the ReplSetConfig.
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 Seconds(15));
 
@@ -65,9 +65,9 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  *   zone: <string zoneName>
  * }
  */
-class RemoveShardFromZoneCmd : public Command {
+class RemoveShardFromZoneCmd : public BasicCommand {
 public:
-    RemoveShardFromZoneCmd() : Command("removeShardFromZone", false, "removeshardfromzone") {}
+    RemoveShardFromZoneCmd() : BasicCommand("removeShardFromZone", "removeshardfromzone") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -103,11 +103,9 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         auto parsedRequest =
             uassertStatusOK(RemoveShardFromZoneRequest::parseFromMongosCommand(cmdObj));
@@ -116,9 +114,9 @@ public:
         parsedRequest.appendAsConfigCommand(&cmdBuilder);
         cmdBuilder.append("writeConcern", kMajorityWriteConcern.toBSON());
 
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           cmdBuilder.obj(),

@@ -44,7 +44,6 @@
 #include "mongo/rpc/command_request.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
@@ -59,7 +58,6 @@
 #include "mongo/util/net/message.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
-#include "mongo/util/static_observer.h"
 #include "mongo/util/text.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -68,7 +66,7 @@ namespace mongo {
 
 namespace {
 
-boost::optional<HostAndPort> extractHostInfo(const rpc::RequestInterface& request) {
+boost::optional<HostAndPort> extractHostInfo(const OpMsgRequest& request) {
     // The initial isMaster request made by mongod and mongos processes should contain a hostInfo
     // field that identifies the process by its host:port.
     StringData cmdName = request.getCommandName();
@@ -76,8 +74,7 @@ boost::optional<HostAndPort> extractHostInfo(const rpc::RequestInterface& reques
         return boost::none;
     }
 
-    BSONObj args = request.getCommandArgs();
-    if (auto hostInfoElem = args["hostInfo"]) {
+    if (auto hostInfoElem = request.body["hostInfo"]) {
         if (hostInfoElem.type() == String) {
             return HostAndPort{hostInfoElem.valueStringData()};
         }
@@ -139,6 +136,10 @@ public:
                     break;
                 }
 
+                uassert(ErrorCodes::IllegalOperation,
+                        str::stream() << "Unsupported network op " << request.operation(),
+                        isSupportedNetworkOp(request.operation()));
+
                 if (request.operation() == dbCompressed) {
                     auto swm = compressorManager.decompressMessage(request);
                     if (!swm.isOK()) {
@@ -149,17 +150,19 @@ public:
                     request = std::move(swm.getValue());
                 }
 
-                std::unique_ptr<rpc::RequestInterface> cmdRequest;
-                if (request.operation() == dbQuery || request.operation() == dbCommand) {
-                    cmdRequest = rpc::makeRequest(&request);
+                boost::optional<OpMsgRequest> cmdRequest;
+                if ((request.operation() == dbQuery &&
+                     NamespaceString(DbMessage(request).getns()).isCommand()) ||
+                    request.operation() == dbCommand || request.operation() == dbMsg) {
+                    cmdRequest = rpc::opMsgRequestFromAnyProtocol(request);
                     if (receivingFirstMessage) {
                         host = extractHostInfo(*cmdRequest);
                     }
 
                     std::string hostName = host ? (host->toString()) : "<unknown>";
                     LOG(1) << "Received \"" << cmdRequest->getCommandName()
-                           << "\" command with arguments " << cmdRequest->getCommandArgs()
-                           << " from " << hostName;
+                           << "\" command with arguments " << cmdRequest->body << " from "
+                           << hostName;
                 }
                 receivingFirstMessage = false;
 
@@ -168,16 +171,17 @@ public:
                 // Handle a message intended to configure the mongobridge and return a response.
                 // The 'request' is consumed by the mongobridge and does not get forwarded to
                 // 'dest'.
-                if (auto status = maybeProcessBridgeCommand(cmdRequest.get())) {
-                    auto replyBuilder = rpc::makeReplyBuilder(cmdRequest->getProtocol());
+                if (auto status = maybeProcessBridgeCommand(cmdRequest)) {
+                    auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(request));
                     BSONObj metadata;
                     BSONObj reply;
                     StatusWith<BSONObj> commandReply(reply);
                     if (!status->isOK()) {
                         commandReply = StatusWith<BSONObj>(*status);
                     }
-                    auto cmdResponse =
-                        replyBuilder->setCommandReply(commandReply).setMetadata(metadata).done();
+                    auto cmdResponse = replyBuilder->setCommandReply(std::move(commandReply))
+                                           .setMetadata(metadata)
+                                           .done();
                     _mp->say(cmdResponse, requestId);
                     continue;
                 }
@@ -204,10 +208,11 @@ public:
                             std::string hostName = host ? (host->toString()) : "<unknown>";
                             if (cmdRequest) {
                                 log() << "Discarding \"" << cmdRequest->getCommandName()
-                                      << "\" command with arguments "
-                                      << cmdRequest->getCommandArgs() << " from " << hostName;
+                                      << "\" command with arguments " << cmdRequest->body
+                                      << " from " << hostName;
                             } else {
-                                log() << "Discarding message " << request << " from " << hostName;
+                                log() << "Discarding " << networkOpToString(request.operation())
+                                      << " from " << hostName;
                             }
                             continue;
                         }
@@ -215,10 +220,11 @@ public:
                 }
 
                 // Send the message we received from '_mp' to 'dest'. 'dest' returns a response for
-                // OP_QUERY, OP_MSG, OP_GET_MORE, and OP_COMMAND messages that we respond back to
+                // OP_QUERY, OP_GET_MORE, and OP_COMMAND messages that we respond back to
                 // '_mp' with.
-                if (request.operation() == dbQuery || request.operation() == dbMsg ||
-                    request.operation() == dbGetMore || request.operation() == dbCommand) {
+                if (request.operation() == dbQuery || request.operation() == dbGetMore ||
+                    request.operation() == dbCommand || request.operation() == dbMsg) {
+                    // TODO dbMsg moreToCome
                     // Forward the message to 'dest' and receive its reply in 'response'.
                     response.reset();
                     dest.port().call(request, response);
@@ -293,23 +299,23 @@ public:
 
 private:
     Status runBridgeCommand(StringData cmdName, BSONObj cmdObj) {
-        auto status = Command::findCommand(cmdName);
+        auto status = BridgeCommand::findCommand(cmdName);
         if (!status.isOK()) {
             return status.getStatus();
         }
 
-        Command* command = status.getValue();
+        BridgeCommand* command = status.getValue();
         return command->run(cmdObj, _settingsMutex, _settings);
     }
 
-    boost::optional<Status> maybeProcessBridgeCommand(rpc::RequestInterface* cmdRequest) {
+    boost::optional<Status> maybeProcessBridgeCommand(boost::optional<OpMsgRequest> cmdRequest) {
         if (!cmdRequest) {
             return boost::none;
         }
 
-        if (auto forBridge = cmdRequest->getCommandArgs()["$forBridge"]) {
+        if (auto forBridge = cmdRequest->body["$forBridge"]) {
             if (forBridge.trueValue()) {
-                return runBridgeCommand(cmdRequest->getCommandName(), cmdRequest->getCommandArgs());
+                return runBridgeCommand(cmdRequest->getCommandName(), cmdRequest->body);
             }
             return boost::none;
         }
@@ -336,7 +342,8 @@ private:
 class BridgeListener final : public Listener {
 public:
     BridgeListener()
-        : Listener("bridge", "", mongoBridgeGlobalParams.port, getGlobalServiceContext(), false),
+        : Listener(
+              "bridge", "0.0.0.0", mongoBridgeGlobalParams.port, getGlobalServiceContext(), false),
           _seedSource(mongoBridgeGlobalParams.seed) {
         log() << "Setting random seed: " << mongoBridgeGlobalParams.seed;
     }
@@ -383,10 +390,7 @@ MONGO_INITIALIZER(SetGlobalEnvironment)(InitializerContext* context) {
 
 }  // namespace
 
-void logProcessDetailsForLogRotate() {}
-
 int bridgeMain(int argc, char** argv, char** envp) {
-    static StaticObserver staticObserver;
 
     registerShutdownTask([&] {
         // NOTE: This function may be called at any time. It must not
@@ -398,7 +402,7 @@ int bridgeMain(int argc, char** argv, char** envp) {
 
     setupSignalHandlers();
     runGlobalInitializersOrDie(argc, argv, envp);
-    startSignalProcessingThread();
+    startSignalProcessingThread(LogFileStatus::kNoLogFileToRotate);
 
     listener = stdx::make_unique<BridgeListener>();
     listener->setupSockets();

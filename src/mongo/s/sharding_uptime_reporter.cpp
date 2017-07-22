@@ -38,6 +38,7 @@
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_mongos.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -57,7 +58,9 @@ std::string constructInstanceIdString() {
  * Reports the uptime status of the current instance to the config.pings collection. This method
  * is best-effort and never throws.
  */
-void reportStatus(OperationContext* txn, const std::string& instanceId, const Timer& upTimeTimer) {
+void reportStatus(OperationContext* opCtx,
+                  const std::string& instanceId,
+                  const Timer& upTimeTimer) {
     MongosType mType;
     mType.setName(instanceId);
     mType.setPing(jsTime());
@@ -67,13 +70,15 @@ void reportStatus(OperationContext* txn, const std::string& instanceId, const Ti
     mType.setMongoVersion(VersionInfoInterface::instance().version().toString());
 
     try {
-        Grid::get(txn)->catalogClient(txn)->updateConfigDocument(
-            txn,
-            MongosType::ConfigNS,
-            BSON(MongosType::name(instanceId)),
-            BSON("$set" << mType.toBSON()),
-            true,
-            ShardingCatalogClient::kMajorityWriteConcern);
+        Grid::get(opCtx)
+            ->catalogClient()
+            ->updateConfigDocument(opCtx,
+                                   MongosType::ConfigNS,
+                                   BSON(MongosType::name(instanceId)),
+                                   BSON("$set" << mType.toBSON()),
+                                   true,
+                                   ShardingCatalogClient::kMajorityWriteConcern)
+            .status_with_transitional_ignore();
     } catch (const std::exception& e) {
         log() << "Caught exception while reporting uptime: " << e.what();
     }
@@ -97,18 +102,20 @@ void ShardingUptimeReporter::startPeriodicThread() {
         const std::string instanceId(constructInstanceIdString());
         const Timer upTimeTimer;
 
-        while (!inShutdown()) {
+        while (!globalInShutdownDeprecated()) {
             {
-                auto txn = cc().makeOperationContext();
-                reportStatus(txn.get(), instanceId, upTimeTimer);
+                auto opCtx = cc().makeOperationContext();
+                reportStatus(opCtx.get(), instanceId, upTimeTimer);
 
-                auto status =
-                    Grid::get(txn.get())->getBalancerConfiguration()->refreshAndCheck(txn.get());
+                auto status = Grid::get(opCtx.get())
+                                  ->getBalancerConfiguration()
+                                  ->refreshAndCheck(opCtx.get());
                 if (!status.isOK()) {
                     warning() << "failed to refresh mongos settings" << causedBy(status);
                 }
             }
 
+            MONGO_IDLE_THREAD_BLOCK;
             sleepFor(kUptimeReportInterval);
         }
     });

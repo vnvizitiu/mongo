@@ -34,7 +34,6 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
@@ -43,7 +42,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -115,6 +113,8 @@ public:
             BSONObj expectedCmd(fromjson(R"({
                 delete: "chunks",
                 deletes: [{ q: { ns: "test.user" }, limit: 0 }],
+                bypassDocumentValidation: false,
+                ordered: true,
                 writeConcern: { w: "majority", wtimeout: 15000 },
                 maxTimeMS: 30000
             })"));
@@ -130,7 +130,7 @@ public:
         coll.setEpoch(ChunkVersion::DROPPED().epoch());
         coll.setUpdatedAt(network()->now());
 
-        expectUpdateCollection(configHost(), coll);
+        expectUpdateCollection(configHost(), coll, false);
     }
 
     void expectSetShardVersionZero(const ShardType& shard) {

@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/op_observer_noop.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
@@ -81,14 +82,15 @@ int runDbTests(int argc, char** argv) {
 
     // DBTests run as if in the database, so allow them to create direct clients.
     DBDirectClientFactory::get(globalServiceContext)
-        .registerImplementation([](OperationContext* txn) {
-            return std::unique_ptr<DBClientBase>(new DBDirectClient(txn));
+        .registerImplementation([](OperationContext* opCtx) {
+            return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
         });
 
     srand((unsigned)frameworkGlobalParams.seed);
 
     checked_cast<ServiceContextMongoD*>(globalServiceContext)->createLockFile();
     globalServiceContext->initializeGlobalStorageEngine();
+    globalServiceContext->setOpObserver(stdx::make_unique<OpObserverNoop>());
 
     int ret = unittest::Suite::run(frameworkGlobalParams.suites,
                                    frameworkGlobalParams.filter,

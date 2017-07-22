@@ -210,6 +210,20 @@ Status OperationContext::checkForInterruptNoAssert() {
     return Status::OK();
 }
 
+void OperationContext::sleepUntil(Date_t deadline) {
+    stdx::mutex m;
+    stdx::condition_variable cv;
+    stdx::unique_lock<stdx::mutex> lk(m);
+    invariant(!waitForConditionOrInterruptUntil(cv, lk, deadline, [] { return false; }));
+}
+
+void OperationContext::sleepFor(Milliseconds duration) {
+    stdx::mutex m;
+    stdx::condition_variable cv;
+    stdx::unique_lock<stdx::mutex> lk(m);
+    invariant(!waitForConditionOrInterruptFor(cv, lk, duration, [] { return false; }));
+}
+
 void OperationContext::waitForConditionOrInterrupt(stdx::condition_variable& cv,
                                                    stdx::unique_lock<stdx::mutex>& m) {
     uassertStatusOK(waitForConditionOrInterruptNoAssert(cv, m));
@@ -229,53 +243,6 @@ stdx::cv_status OperationContext::waitForConditionOrInterruptUntil(
     stdx::condition_variable& cv, stdx::unique_lock<stdx::mutex>& m, Date_t deadline) {
 
     return uassertStatusOK(waitForConditionOrInterruptNoAssertUntil(cv, m, deadline));
-}
-
-static NOINLINE_DECL stdx::cv_status cvWaitUntilWithClockSource(ClockSource* clockSource,
-                                                                stdx::condition_variable& cv,
-                                                                stdx::unique_lock<stdx::mutex>& m,
-                                                                Date_t deadline) {
-    if (deadline <= clockSource->now()) {
-        return stdx::cv_status::timeout;
-    }
-
-    struct AlarmInfo {
-        stdx::mutex controlMutex;
-        stdx::mutex* waitMutex;
-        stdx::condition_variable* waitCV;
-        stdx::cv_status cvWaitResult = stdx::cv_status::no_timeout;
-    };
-    auto alarmInfo = std::make_shared<AlarmInfo>();
-    alarmInfo->waitCV = &cv;
-    alarmInfo->waitMutex = m.mutex();
-    const auto waiterThreadId = stdx::this_thread::get_id();
-    bool invokedAlarmInline = false;
-    invariantOK(clockSource->setAlarm(deadline, [alarmInfo, waiterThreadId, &invokedAlarmInline] {
-        stdx::lock_guard<stdx::mutex> controlLk(alarmInfo->controlMutex);
-        alarmInfo->cvWaitResult = stdx::cv_status::timeout;
-        if (!alarmInfo->waitMutex) {
-            return;
-        }
-        if (stdx::this_thread::get_id() == waiterThreadId) {
-            // In NetworkInterfaceMock, setAlarm may invoke its callback immediately if the deadline
-            // has expired, so we detect that case and avoid self-deadlock by returning early, here.
-            // It is safe to set invokedAlarmInline without synchronization in this case, because it
-            // is exactly the case where the same thread is writing and consulting the value.
-            invokedAlarmInline = true;
-            return;
-        }
-        stdx::lock_guard<stdx::mutex> waitLk(*alarmInfo->waitMutex);
-        alarmInfo->waitCV->notify_all();
-    }));
-    if (!invokedAlarmInline) {
-        cv.wait(m);
-    }
-    m.unlock();
-    stdx::lock_guard<stdx::mutex> controlLk(alarmInfo->controlMutex);
-    m.lock();
-    alarmInfo->waitMutex = nullptr;
-    alarmInfo->waitCV = nullptr;
-    return alarmInfo->cvWaitResult;
 }
 
 // Theory of operation for waitForConditionOrInterruptNoAssertUntil and markKilled:
@@ -321,7 +288,17 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         _waitCV = &cv;
     }
 
-    if (hasDeadline()) {
+    // If the maxTimeNeverTimeOut failpoint is set, behave as though the operation's deadline does
+    // not exist. Under normal circumstances, if the op has an existing deadline which is sooner
+    // than the deadline passed into this method, we replace our deadline with the op's. This means
+    // that we expect to time out at the same time as the existing deadline expires. If, when we
+    // time out, we find that the op's deadline has not expired (as will always be the case if
+    // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
+    // and return ExceededTimeLimit regardless. To prevent this behaviour, only consider the op's
+    // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
+    bool opHasDeadline = (hasDeadline() && !MONGO_FAIL_POINT(maxTimeNeverTimeOut));
+
+    if (opHasDeadline) {
         deadline = std::min(deadline, getDeadline());
     }
 
@@ -330,14 +307,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
             cv.wait(m);
             return stdx::cv_status::no_timeout;
         }
-        const auto clockSource = getServiceContext()->getPreciseClockSource();
-        if (clockSource->tracksSystemClock()) {
-            return cv.wait_until(m, deadline.toSystemTimePoint());
-        }
-
-        // The following cases only occur during testing, when the precise clock source is
-        // virtualized and does not track the system clock.
-        return cvWaitUntilWithClockSource(clockSource, cv, m, deadline);
+        return getServiceContext()->getPreciseClockSource()->waitForConditionUntil(cv, m, deadline);
     }();
 
     // Continue waiting on cv until no other thread is attempting to kill this one.
@@ -355,7 +325,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     if (!status.isOK()) {
         return status;
     }
-    if (hasDeadline() && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
+    if (opHasDeadline && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
         // It's possible that the system clock used in stdx::condition_variable::wait_until
         // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
         // we treat the operation as though it has exceeded its time limit, just as if the
@@ -385,6 +355,17 @@ void OperationContext::markKilled(ErrorCodes::Error killCode) {
     }
 }
 
+void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
+    invariant(!_lsid);
+    _lsid = std::move(lsid);
+}
+
+void OperationContext::setTxnNumber(TxnNumber txnNumber) {
+    invariant(_lsid);
+    invariant(!_txnNumber);
+    _txnNumber = txnNumber;
+}
+
 RecoveryUnit* OperationContext::releaseRecoveryUnit() {
     return _recoveryUnit.release();
 }
@@ -406,6 +387,31 @@ void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
     dassert(!_locker);
     dassert(locker);
     _locker = std::move(locker);
+}
+
+Date_t OperationContext::getExpirationDateForWaitForValue(Milliseconds waitFor) {
+    return getServiceContext()->getPreciseClockSource()->now() + waitFor;
+}
+
+void initializeOperationSessionInfo(OperationContext* opCtx, const BSONObj& requestBody) {
+    auto osi =
+        OperationSessionInfo::parse(IDLParserErrorContext("OperationSessionInfo"), requestBody);
+
+    if (osi.getSessionId()) {
+        auto lsid = *osi.getSessionId();
+        opCtx->setLogicalSessionId(LogicalSessionId(std::move(lsid)));
+    }
+
+    if (osi.getTxnNumber()) {
+        uassert(ErrorCodes::IllegalOperation,
+                "Transaction number requires a sessionId to be specified",
+                opCtx->getLogicalSessionId());
+        uassert(ErrorCodes::BadValue,
+                "Transaction number cannot be negative",
+                *osi.getTxnNumber() >= 0);
+
+        opCtx->setTxnNumber(*osi.getTxnNumber());
+    }
 }
 
 }  // namespace mongo

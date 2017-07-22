@@ -47,9 +47,9 @@ namespace {
 using std::string;
 using str::stream;
 
-class ConfigSvrMoveChunkCommand : public Command {
+class ConfigSvrMoveChunkCommand : public BasicCommand {
 public:
-    ConfigSvrMoveChunkCommand() : Command("_configsvrMoveChunk") {}
+    ConfigSvrMoveChunkCommand() : BasicCommand("_configsvrMoveChunk") {}
 
     void help(std::stringstream& help) const override {
         help << "Internal command, which is exported by the sharding config server. Do not call "
@@ -78,23 +78,21 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& unusedDbName,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto request = uassertStatusOK(BalanceChunkRequest::parseFromConfigCommand(cmdObj));
 
         if (request.hasToShardId()) {
-            uassertStatusOK(Balancer::get(txn)->moveSingleChunk(txn,
-                                                                request.getChunk(),
-                                                                request.getToShardId(),
-                                                                request.getMaxChunkSizeBytes(),
-                                                                request.getSecondaryThrottle(),
-                                                                request.getWaitForDelete()));
+            uassertStatusOK(Balancer::get(opCtx)->moveSingleChunk(opCtx,
+                                                                  request.getChunk(),
+                                                                  request.getToShardId(),
+                                                                  request.getMaxChunkSizeBytes(),
+                                                                  request.getSecondaryThrottle(),
+                                                                  request.getWaitForDelete()));
         } else {
-            uassertStatusOK(Balancer::get(txn)->rebalanceSingleChunk(txn, request.getChunk()));
+            uassertStatusOK(Balancer::get(opCtx)->rebalanceSingleChunk(opCtx, request.getChunk()));
         }
 
         return true;

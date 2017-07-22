@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <vector>
+
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/list.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -40,7 +43,9 @@
 namespace mongo {
 
 class AbstractMessagingPort;
+class ServiceContext;
 class ServiceEntryPoint;
+struct ServerGlobalParams;
 
 namespace transport {
 
@@ -53,17 +58,18 @@ class TransportLayerLegacy final : public TransportLayer {
 
 public:
     struct Options {
+        Options(const ServerGlobalParams* params);
+        Options() : port(0), ipList("") {}
+
         int port;            // port to bind to
         std::string ipList;  // addresses to bind to
-
-        Options() : port(0), ipList("") {}
     };
 
     TransportLayerLegacy(const Options& opts, ServiceEntryPoint* sep);
 
     ~TransportLayerLegacy();
 
-    Status setup();
+    Status setup() override;
     Status start() override;
 
     Ticket sourceMessage(const SessionHandle& session,
@@ -77,12 +83,9 @@ public:
     Status wait(Ticket&& ticket) override;
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
-    SSLPeerInfo getX509PeerInfo(const ConstSessionHandle& session) const override;
-
     Stats sessionStats() override;
 
     void end(const SessionHandle& session) override;
-    void endAllSessions(transport::Session::TagMask tags) override;
 
     void shutdown() override;
 
@@ -90,7 +93,6 @@ private:
     class LegacySession;
     using LegacySessionHandle = std::shared_ptr<LegacySession>;
     using ConstLegacySessionHandle = std::shared_ptr<const LegacySession>;
-    using SessionEntry = std::list<std::weak_ptr<LegacySession>>::iterator;
 
     void _destroy(LegacySession& session);
 
@@ -110,6 +112,8 @@ private:
         Connection(std::unique_ptr<AbstractMessagingPort> port)
             : amp(std::move(port)), connectionId(amp->connectionId()) {}
 
+        stdx::mutex closeMutex;
+
         std::unique_ptr<AbstractMessagingPort> amp;
 
         const long long connectionId;
@@ -127,8 +131,8 @@ private:
     public:
         ~LegacySession();
 
-        static std::shared_ptr<LegacySession> create(std::unique_ptr<AbstractMessagingPort> amp,
-                                                     TransportLayerLegacy* tl);
+        static LegacySessionHandle create(std::unique_ptr<AbstractMessagingPort> amp,
+                                          TransportLayerLegacy* tl);
 
         TransportLayer* getTransportLayer() const override {
             return _tl;
@@ -146,14 +150,6 @@ private:
             return _connection.get();
         }
 
-        void setIter(SessionEntry it) {
-            _entry = std::move(it);
-        }
-
-        SessionEntry getIter() const {
-            return _entry;
-        }
-
     private:
         explicit LegacySession(std::unique_ptr<AbstractMessagingPort> amp,
                                TransportLayerLegacy* tl);
@@ -165,12 +161,7 @@ private:
 
         TagMask _tags;
 
-        MessageCompressorManager _messageCompressorManager;
-
         std::unique_ptr<Connection> _connection;
-
-        // A handle to this session's entry in the TL's session list
-        SessionEntry _entry;
     };
 
     /**
@@ -233,11 +224,8 @@ private:
     std::unique_ptr<Listener> _listener;
     stdx::thread _listenerThread;
 
-    // TransportLayerLegacy holds non-owning pointers to all of its sessions.
-    mutable stdx::mutex _sessionsMutex;
-    stdx::list<std::weak_ptr<LegacySession>> _sessions;
-
     AtomicWord<bool> _running;
+    AtomicWord<size_t> _currentConnections{0};
 
     Options _options;
 };

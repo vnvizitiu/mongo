@@ -10,7 +10,6 @@ var st = new ShardingTest({shards: 1});
 
 var mongos = st.s0;
 var admin = mongos.getDB("admin");
-var shards = mongos.getCollection("config.shards").find().toArray();
 var coll = mongos.getCollection("foo.bar");
 
 //
@@ -18,7 +17,7 @@ var coll = mongos.getCollection("foo.bar");
 // Tests with _id : 1 shard key
 
 assert(admin.runCommand({enableSharding: coll.getDB() + ""}).ok);
-printjson(admin.runCommand({movePrimary: coll.getDB() + "", to: shards[0]._id}));
+printjson(admin.runCommand({movePrimary: coll.getDB() + "", to: st.shard0.shardName}));
 assert(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}).ok);
 st.printShardingStatus();
 
@@ -130,12 +129,12 @@ assert.eq(
     coll.find({c: true}, {_id: 0, 'a.b': 1, c: 1}).explain(true).executionStats.totalDocsExamined);
 
 //
-// Index with shard key query - nested query not covered even when projecting
+// Index with shard key query - can be covered given the appropriate projection.
 assert.commandWorked(coll.dropIndex({c: 1}));
 assert.commandWorked(coll.ensureIndex({c: 1, 'a.b': 1}));
 assert.eq(1, coll.find({c: true}).explain(true).executionStats.totalDocsExamined);
 assert.eq(
-    1,
+    0,
     coll.find({c: true}, {_id: 0, 'a.b': 1, c: 1}).explain(true).executionStats.totalDocsExamined);
 
 //

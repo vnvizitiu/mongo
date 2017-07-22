@@ -101,7 +101,7 @@ bool SortStage::isEOF() {
 }
 
 PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
-    const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+    const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes.load());
     if (_memUsage > maxBytes) {
         mongoutils::str::stream ss;
         ss << "Sort operation used more than the maximum " << maxBytes
@@ -193,7 +193,7 @@ PlanStage::StageState SortStage::doWork(WorkingSetID* out) {
     return PlanStage::ADVANCED;
 }
 
-void SortStage::doInvalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
+void SortStage::doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) {
     // If we have a deletion, we can fetch and carry on.
     // If we have a mutation, it's easier to fetch and use the previous document.
     // So, no matter what, fetch and keep the doc in play.
@@ -209,7 +209,7 @@ void SortStage::doInvalidate(OperationContext* txn, const RecordId& dl, Invalida
         WorkingSetMember* member = _ws->get(it->second);
         verify(member->recordId == dl);
 
-        WorkingSetCommon::fetchAndInvalidateRecordId(txn, member, _collection);
+        WorkingSetCommon::fetchAndInvalidateRecordId(opCtx, member, _collection);
 
         // Remove the RecordId from our set of active DLs.
         _wsidByRecordId.erase(it);
@@ -219,7 +219,7 @@ void SortStage::doInvalidate(OperationContext* txn, const RecordId& dl, Invalida
 
 unique_ptr<PlanStageStats> SortStage::getStats() {
     _commonStats.isEOF = isEOF();
-    const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+    const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes.load());
     _specificStats.memLimit = maxBytes;
     _specificStats.memUsage = _memUsage;
     _specificStats.limit = _limit;

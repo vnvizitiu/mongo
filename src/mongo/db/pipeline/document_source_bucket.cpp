@@ -43,9 +43,11 @@ REGISTER_MULTI_STAGE_ALIAS(bucket,
                            DocumentSourceBucket::createFromBson);
 
 namespace {
-intrusive_ptr<ExpressionConstant> getExpressionConstant(BSONElement expressionElem,
-                                                        VariablesParseState vps) {
-    auto expr = Expression::parseOperand(expressionElem, vps)->optimize();
+intrusive_ptr<ExpressionConstant> getExpressionConstant(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expressionElem,
+    const VariablesParseState& vps) {
+    auto expr = Expression::parseOperand(expCtx, expressionElem, vps)->optimize();
     return dynamic_cast<ExpressionConstant*>(expr.get());
 }
 }  // namespace
@@ -62,8 +64,7 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
     BSONObjBuilder groupObjBuilder;
     BSONObjBuilder switchObjBuilder;
 
-    VariablesIdGenerator idGenerator;
-    VariablesParseState vps(&idGenerator);
+    VariablesParseState vps = pExpCtx->variablesParseState;
 
     vector<Value> boundaryValues;
     BSONElement groupByField;
@@ -95,7 +96,7 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
                 argument.type() == BSONType::Array);
 
             for (auto&& boundaryElem : argument.embeddedObject()) {
-                auto exprConst = getExpressionConstant(boundaryElem, vps);
+                auto exprConst = getExpressionConstant(pExpCtx, boundaryElem, vps);
                 uassert(40191,
                         str::stream() << "The $bucket 'boundaries' field must be an array of "
                                          "constant values, but found value: "
@@ -144,7 +145,7 @@ vector<intrusive_ptr<DocumentSource>> DocumentSourceBucket::createFromBson(
         } else if ("default" == argName) {
             // If there is a default, make sure that it parses to a constant expression then add
             // default to switch.
-            auto exprConst = getExpressionConstant(argument, vps);
+            auto exprConst = getExpressionConstant(pExpCtx, argument, vps);
             uassert(40195,
                     str::stream()
                         << "The $bucket 'default' field must be a constant expression, but found: "

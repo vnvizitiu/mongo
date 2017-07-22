@@ -31,6 +31,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
 
@@ -47,9 +48,9 @@ extern bool internalValidateFeaturesAsMaster;
 
 class FeatureCompatibilityVersion {
 public:
-    static constexpr StringData k32IncompatibleIndexName = "incompatible_with_version_32"_sd;
     static constexpr StringData kCollection = "admin.system.version"_sd;
     static constexpr StringData kCommandName = "setFeatureCompatibilityVersion"_sd;
+    static constexpr StringData kDatabase = "admin"_sd;
     static constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
     static constexpr StringData kVersionField = "version"_sd;
 
@@ -60,18 +61,30 @@ public:
     static StatusWith<ServerGlobalParams::FeatureCompatibility::Version> parse(
         const BSONObj& featureCompatibilityVersionDoc);
 
+    static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
+        switch (version) {
+            case ServerGlobalParams::FeatureCompatibility::Version::k36:
+                return FeatureCompatibilityVersionCommandParser::kVersion36;
+            case ServerGlobalParams::FeatureCompatibility::Version::k34:
+                return FeatureCompatibilityVersionCommandParser::kVersion34;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
     /**
      * Sets the minimum allowed version in the cluster, which determines what features are
      * available.
-     * 'version' should be '3.4' or '3.2'.
+     * 'version' should be '3.4' or '3.6'.
      */
-    static void set(OperationContext* txn, StringData version);
+    static void set(OperationContext* opCtx, StringData version);
 
     /**
      * If there are no non-local databases and we are not running with --shardsvr, set
-     * featureCompatibilityVersion to 3.4.
+     * featureCompatibilityVersion to the latest value.
      */
-    static void setIfCleanStartup(OperationContext* txn, repl::StorageInterface* storageInterface);
+    static void setIfCleanStartup(OperationContext* opCtx,
+                                  repl::StorageInterface* storageInterface);
 
     /**
      * Examines a document inserted or updated in admin.system.version. If it is the
@@ -82,9 +95,14 @@ public:
 
     /**
      * Examines the _id of a document removed from admin.system.version. If it is the
-     * featureCompatibilityVersion document, resets the server parameter to its default value (3.2).
+     * featureCompatibilityVersion document, resets the server parameter to its default value.
      */
     static void onDelete(const BSONObj& doc);
+
+    /**
+     * Resets the server parameter to its default value.
+     */
+    static void onDropCollection();
 };
 
 }  // namespace mongo

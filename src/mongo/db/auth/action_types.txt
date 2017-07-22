@@ -5,6 +5,7 @@
 # This means that the integer value assigned to each ActionType and used internally in ActionSet
 # also may change between versions.
 ["addShard",
+"advanceLogicalTime",
 "anyAction", # Special ActionType that represents *all* actions
 "appendOplogNote",
 "applicationMessage",
@@ -86,6 +87,7 @@
 "replSetGetStatus",
 "replSetHeartbeat",
 "replSetReconfig",  # Not used for permissions checks, but to id the event in logs.
+"replSetResizeOplog",
 "replSetStateChange",
 "resync",
 "revokeRole",
@@ -99,6 +101,7 @@
 "shutdown",
 "splitChunk",
 "splitVector",
+"startSession",
 "storageDetails",
 "top",
 "touch",

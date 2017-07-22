@@ -34,6 +34,9 @@
 
 #include <memory.h>
 
+#include <memory>
+#include <vector>
+
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/operation_context.h"
@@ -53,8 +56,6 @@ public:
     WiredTigerRecoveryUnit(WiredTigerSessionCache* sc);
 
     virtual ~WiredTigerRecoveryUnit();
-
-    virtual void reportState(BSONObjBuilder* b) const;
 
     void beginUnitOfWork(OperationContext* opCtx) final;
     void commitUnitOfWork() final;
@@ -98,17 +99,13 @@ public:
     }
     void assertInActiveTxn() const;
 
-    bool everStartedWrite() const {
-        return _everStartedWrite;
-    }
-
     void setOplogReadTill(const RecordId& id);
     RecordId getOplogReadTill() const {
         return _oplogReadTill;
     }
 
-    static WiredTigerRecoveryUnit* get(OperationContext* txn) {
-        return checked_cast<WiredTigerRecoveryUnit*>(txn->recoveryUnit());
+    static WiredTigerRecoveryUnit* get(OperationContext* opCtx) {
+        return checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
     }
 
     static void appendGlobalStats(BSONObjBuilder& b);
@@ -135,13 +132,12 @@ private:
     bool _inUnitOfWork;
     bool _active;
     uint64_t _mySnapshotId;
-    bool _everStartedWrite;
-    Timer _timer;
     RecordId _oplogReadTill;
     bool _readFromMajorityCommittedSnapshot = false;
     SnapshotName _majorityCommittedSnapshot = SnapshotName::min();
+    std::unique_ptr<Timer> _timer;
 
-    typedef OwnedPointerVector<Change> Changes;
+    typedef std::vector<std::unique_ptr<Change>> Changes;
     Changes _changes;
 };
 
@@ -153,7 +149,7 @@ public:
     WiredTigerCursor(const std::string& uri,
                      uint64_t tableID,
                      bool forRecordStore,
-                     OperationContext* txn);
+                     OperationContext* opCtx);
 
     ~WiredTigerCursor();
 
@@ -170,7 +166,6 @@ public:
     WiredTigerSession* getSession() {
         return _session;
     }
-    WT_SESSION* getWTSession();
 
     void reset();
 

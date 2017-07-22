@@ -40,7 +40,6 @@
 #include "mongo/rpc/command_reply_builder.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/legacy_reply_builder.h"
-#include "mongo/rpc/request_interface.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -209,7 +208,7 @@ void AsyncMockStreamFactory::MockStream::read(asio::mutable_buffer buf,
 
 void AsyncMockStreamFactory::MockStream::pushRead(std::vector<uint8_t> toRead) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    invariant(_state != kRunning && _state != kCanceled);
+    invariant(_state != kRunning);
     _readQueue.emplace(std::move(toRead));
 }
 
@@ -219,7 +218,7 @@ void AsyncMockStreamFactory::MockStream::setError(std::error_code ec) {
 
 std::vector<uint8_t> AsyncMockStreamFactory::MockStream::popWrite() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    invariant(_state != kRunning && _state != kCanceled);
+    invariant(_state != kRunning);
     auto nextWrite = std::move(_writeQueue.front());
     _writeQueue.pop();
     return nextWrite;
@@ -283,10 +282,10 @@ void AsyncMockStreamFactory::MockStream::simulateServer(
         Message msg(SharedBuffer::allocate(messageData.size()));
         memcpy(msg.buf(), messageData.data(), messageData.size());
 
-        auto parsedRequest = rpc::makeRequest(&msg);
-        ASSERT(parsedRequest->getProtocol() == proto);
+        auto request = rpc::opMsgRequestFromAnyProtocol(msg);
+        ASSERT(rpc::protocolForMessage(msg) == proto);
 
-        RemoteCommandRequest rcr(target(), *parsedRequest, nullptr);
+        RemoteCommandRequest rcr(target(), request.getDatabase().toString(), request.body, nullptr);
 
         messageId = msg.header().getId();
 

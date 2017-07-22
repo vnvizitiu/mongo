@@ -137,11 +137,6 @@ public:
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) = 0;
 
     /**
-     * Requests cancelation of incomplete network activity.
-     */
-    virtual void cancelAllCommands() = 0;
-
-    /**
      * Sets an alarm, which schedules "action" to run no sooner than "when".
      *
      * Returns ErrorCodes::ShutdownInProgress if NetworkInterface::shutdown has already started
@@ -165,6 +160,11 @@ public:
      * In the absence of any actual networking thread, always return true.
      */
     virtual bool onNetworkThread() = 0;
+
+    /**
+     * Drops all connections to the given host in the connection pool.
+     */
+    virtual void dropConnections(const HostAndPort& hostAndPort) = 0;
 
 protected:
     NetworkInterface();

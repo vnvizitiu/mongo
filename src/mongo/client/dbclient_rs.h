@@ -133,8 +133,8 @@ public:
 
     virtual void say(Message& toSend, bool isRetry = false, std::string* actualServer = 0);
     virtual bool recv(Message& toRecv);
-    virtual void checkResponse(const char* data,
-                               int nReturned,
+    virtual void checkResponse(const std::vector<BSONObj>& batch,
+                               bool networkError,
                                bool* retry = NULL,
                                std::string* targetHost = NULL);
 
@@ -186,16 +186,9 @@ public:
         return true;
     }
 
-    rpc::UniqueReply runCommandWithMetadata(StringData database,
-                                            StringData command,
-                                            const BSONObj& metadata,
-                                            const BSONObj& commandArgs) final;
-
-    std::tuple<rpc::UniqueReply, DBClientWithCommands*> runCommandWithMetadataAndTarget(
-        StringData database,
-        StringData command,
-        const BSONObj& metadata,
-        const BSONObj& commandArgs) final;
+    using DBClientWithCommands::runCommandWithTarget;
+    std::pair<rpc::UniqueReply, DBClientWithCommands*> runCommandWithTarget(
+        OpMsgRequest request) final;
 
     void setRequestMetadataWriter(rpc::RequestMetadataWriter writer) final;
 

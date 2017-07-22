@@ -42,6 +42,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/file.h"
 #include "mongo/util/log.h"
 #include "mongo/util/text.h"
@@ -55,7 +56,10 @@ using std::unique_ptr;
 
 AtomicInt64 Scope::_lastVersion(1);
 
+
 namespace {
+
+MONGO_FP_DECLARE(mr_killop_test_fp);
 // 2 GB is the largest support Javascript file size.
 const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
 
@@ -192,8 +196,8 @@ public:
     void rollback() {}
 };
 
-void Scope::storedFuncMod(OperationContext* txn) {
-    txn->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
+void Scope::storedFuncMod(OperationContext* opCtx) {
+    opCtx->recoveryUnit()->registerChange(new StoredFuncModLogOpHandler());
 }
 
 void Scope::validateObjectIdString(const string& str) {
@@ -202,7 +206,7 @@ void Scope::validateObjectIdString(const string& str) {
         uassert(10430, "invalid object id: not hex", std::isxdigit(str.at(i)));
 }
 
-void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
+void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
     if (_localDBName.size() == 0) {
         if (ignoreNotConnected)
             return;
@@ -216,7 +220,7 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
     _loadedVersion = lastVersion;
     string coll = _localDBName + ".system.js";
 
-    auto directDBClient = DBDirectClientFactory::get(txn).create(txn);
+    auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
 
     unique_ptr<DBClientCursor> c =
         directDBClient->query(coll, Query(), 0, 0, NULL, QueryOption_SlaveOk, 0);
@@ -230,6 +234,15 @@ void Scope::loadStored(OperationContext* txn, bool ignoreNotConnected) {
 
         uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
         uassert(10210, "value has to be set", v.type() != EOO);
+
+        if (MONGO_FAIL_POINT(mr_killop_test_fp)) {
+
+            /* This thread sleep makes the interrupts in the test come in at a time
+            *  where the js misses the interrupt and throw an exception instead of
+            *  being interrupted
+            */
+            stdx::this_thread::sleep_for(stdx::chrono::seconds(1));
+        }
 
         try {
             setElement(n.valuestr(), v, o);
@@ -272,13 +285,11 @@ ScriptingFunction Scope::createFunction(const char* code) {
     FunctionCacheMap::iterator i = _cachedFunctions.find(code);
     if (i != _cachedFunctions.end())
         return i->second;
-    // NB: we calculate the function number for v8 so the cache can be utilized to
-    //     lookup the source on an exception, but SpiderMonkey uses the value
-    //     returned by JS_CompileFunction.
-    ScriptingFunction defaultFunctionNumber = getFunctionCache().size() + 1;
-    ScriptingFunction actualFunctionNumber = _createFunction(code, defaultFunctionNumber);
-    _cachedFunctions[code] = actualFunctionNumber;
-    return actualFunctionNumber;
+
+    // Get a function number, so the cache can be utilized to lookup the source on an exception
+    ScriptingFunction functionNumber = _createFunction(code);
+    _cachedFunctions[code] = functionNumber;
+    return functionNumber;
 }
 
 namespace JSFiles {
@@ -290,7 +301,6 @@ extern const JSFile explainable;
 extern const JSFile mongo;
 extern const JSFile mr;
 extern const JSFile query;
-extern const JSFile upgrade_check;
 extern const JSFile utils;
 extern const JSFile utils_sh;
 extern const JSFile utils_auth;
@@ -312,7 +322,6 @@ void Scope::execCoreFiles() {
     execSetup(JSFiles::crud_api);
     execSetup(JSFiles::explain_query);
     execSetup(JSFiles::explainable);
-    execSetup(JSFiles::upgrade_check);
 }
 
 namespace {
@@ -344,7 +353,7 @@ public:
         _pools.push_front(toStore);
     }
 
-    std::shared_ptr<Scope> tryAcquire(OperationContext* txn, const string& poolName) {
+    std::shared_ptr<Scope> tryAcquire(OperationContext* opCtx, const string& poolName) {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         for (Pools::iterator it = _pools.begin(); it != _pools.end(); ++it) {
@@ -353,7 +362,7 @@ public:
                 _pools.erase(it);
                 scope->incTimesUsed();
                 scope->reset();
-                scope->registerOperation(txn);
+                scope->registerOperation(opCtx);
                 return scope;
             }
         }
@@ -402,8 +411,8 @@ public:
     void reset() {
         _real->reset();
     }
-    void registerOperation(OperationContext* txn) {
-        _real->registerOperation(txn);
+    void registerOperation(OperationContext* opCtx) {
+        _real->registerOperation(opCtx);
     }
     void unregisterOperation() {
         _real->unregisterOperation();
@@ -411,14 +420,14 @@ public:
     void init(const BSONObj* data) {
         _real->init(data);
     }
-    void localConnectForDbEval(OperationContext* txn, const char* dbName) {
+    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) {
         invariant(!"localConnectForDbEval should only be called from dbEval");
     }
     void setLocalDB(const string& dbName) {
         _real->setLocalDB(dbName);
     }
-    void loadStored(OperationContext* txn, bool ignoreNotConnected = false) {
-        _real->loadStored(txn, ignoreNotConnected);
+    void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false) {
+        _real->loadStored(opCtx, ignoreNotConnected);
     }
     void externalSetup() {
         _real->externalSetup();
@@ -518,12 +527,8 @@ public:
     }
 
 protected:
-    FunctionCacheMap& getFunctionCache() {
-        return _real->getFunctionCache();
-    }
-
-    ScriptingFunction _createFunction(const char* code, ScriptingFunction functionNumber = 0) {
-        return _real->_createFunction(code, functionNumber);
+    ScriptingFunction _createFunction(const char* code) {
+        return _real->_createFunction(code);
     }
 
 private:
@@ -532,20 +537,20 @@ private:
 };
 
 /** Get a scope from the pool of scopes matching the supplied pool name */
-unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* txn,
+unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
                                                const string& db,
                                                const string& scopeType) {
     const string fullPoolName = db + scopeType;
-    std::shared_ptr<Scope> s = scopeCache.tryAcquire(txn, fullPoolName);
+    std::shared_ptr<Scope> s = scopeCache.tryAcquire(opCtx, fullPoolName);
     if (!s) {
         s.reset(newScope());
-        s->registerOperation(txn);
+        s->registerOperation(opCtx);
     }
 
     unique_ptr<Scope> p;
     p.reset(new PooledScope(fullPoolName, s));
     p->setLocalDB(db);
-    p->loadStored(txn, true);
+    p->loadStored(opCtx, true);
     return p;
 }
 

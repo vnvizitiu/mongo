@@ -11,11 +11,7 @@
 
 (function() {
     "use strict";
-    var parameters = TestData.setParameters;
-    if (parameters && parameters.indexOf("use3dot2InitialSync=true") != -1) {
-        jsTest.log("Skipping this test because use3dot2InitialSync was provided.");
-        return;
-    }
+    load("jstests/libs/check_log.js");
 
     var name = 'initial_sync_applier_error';
     var replSet = new ReplSetTest({
@@ -40,26 +36,16 @@
     replSet.reInitiate();
 
     // Wait for fail point message to be logged.
-    var checkLog = function(node, msg) {
-        assert.soon(function() {
-            var logMessages = assert.commandWorked(node.adminCommand({getLog: 'global'})).log;
-            for (var i = 0; i < logMessages.length; i++) {
-                if (logMessages[i].indexOf(msg) != -1) {
-                    return true;
-                }
-            }
-            return false;
-        }, 'Did not see a log entry containing the following message: ' + msg, 60000, 1000);
-    };
-    checkLog(secondary, 'initial sync - initialSyncHangBeforeCopyingDatabases fail point enabled');
+    checkLog.contains(secondary,
+                      'initial sync - initialSyncHangBeforeCopyingDatabases fail point enabled');
 
     var newCollName = name + '_2';
     assert.commandWorked(coll.renameCollection(newCollName, true));
     assert.commandWorked(secondary.getDB('admin').runCommand(
         {configureFailPoint: 'initialSyncHangBeforeCopyingDatabases', mode: 'off'}));
 
-    checkLog(secondary, 'Applying renameCollection not supported');
-    checkLog(secondary, 'initial sync done');
+    checkLog.contains(secondary, 'Applying renameCollection not supported');
+    checkLog.contains(secondary, 'initial sync done');
 
     replSet.awaitReplication();
     replSet.awaitSecondaryNodes();

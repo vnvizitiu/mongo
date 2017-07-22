@@ -46,10 +46,10 @@ public:
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
-    bool isValidInitialSource() const final {
-        return true;
+    InitialSourceType getInitialSourceType() const final {
+        return InitialSourceType::kInitialSource;
     }
-    Value serialize(bool explain = false) const final;
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     BSONObjSet getOutputSorts() final {
         return SimpleBSONObjComparator::kInstance.makeBSONObjSet(
             {BSON(distanceField->fullPath() << -1)});

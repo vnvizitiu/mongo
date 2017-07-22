@@ -35,7 +35,10 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/ops/log_builder.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/service_context_noop.h"
+#include "mongo/db/update/log_builder.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
@@ -51,6 +54,29 @@ using mongo::fromjson;
 using mongo::mutablebson::ConstElement;
 using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
+
+class ModifierCurrentDateTest : public mongo::unittest::Test {
+public:
+    ~ModifierCurrentDateTest() override = default;
+
+protected:
+    /**
+     * Sets up this fixture with a context and a LogicalClock.
+     */
+    void setUp() override {
+        auto service = mongo::getGlobalServiceContext();
+
+        auto logicalClock = mongo::stdx::make_unique<mongo::LogicalClock>(service);
+        mongo::LogicalClock::set(service, std::move(logicalClock));
+    }
+    void tearDown() override{};
+};
+
+using Init = ModifierCurrentDateTest;
+using BoolInput = ModifierCurrentDateTest;
+using DateInput = ModifierCurrentDateTest;
+using TimestampInput = ModifierCurrentDateTest;
+using DottedTimestampInput = ModifierCurrentDateTest;
 
 /**
  * Helper to validate oplog entries in the tests below.
@@ -99,7 +125,7 @@ private:
     ModifierCurrentDate _mod;
 };
 
-TEST(Init, ValidValues) {
+TEST_F(Init, ValidValues) {
     BSONObj modObj;
     ModifierCurrentDate mod;
 
@@ -116,7 +142,7 @@ TEST(Init, ValidValues) {
                        ModifierInterface::Options::normal()));
 }
 
-TEST(Init, FailToInitWithInvalidValue) {
+TEST_F(Init, FailToInitWithInvalidValue) {
     BSONObj modObj;
     ModifierCurrentDate mod;
 
@@ -166,7 +192,7 @@ TEST(Init, FailToInitWithInvalidValue) {
                            ModifierInterface::Options::normal()));
 }
 
-TEST(BoolInput, EmptyStartDoc) {
+TEST_F(BoolInput, EmptyStartDoc) {
     Document doc(fromjson("{ }"));
     Mod mod(fromjson("{ $currentDate : { a : true } }"));
 
@@ -187,7 +213,7 @@ TEST(BoolInput, EmptyStartDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(DateInput, EmptyStartDoc) {
+TEST_F(DateInput, EmptyStartDoc) {
     Document doc(fromjson("{ }"));
     Mod mod(fromjson("{ $currentDate : { a : {$type: 'date' } } }"));
 
@@ -208,7 +234,7 @@ TEST(DateInput, EmptyStartDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(TimestampInput, EmptyStartDoc) {
+TEST_F(TimestampInput, EmptyStartDoc) {
     Document doc(fromjson("{ }"));
     Mod mod(fromjson("{ $currentDate : { a : {$type : 'timestamp' } } }"));
 
@@ -230,7 +256,7 @@ TEST(TimestampInput, EmptyStartDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(BoolInput, ExistingStringDoc) {
+TEST_F(BoolInput, ExistingStringDoc) {
     Document doc(fromjson("{ a: 'a' }"));
     Mod mod(fromjson("{ $currentDate : { a : true } }"));
 
@@ -251,7 +277,7 @@ TEST(BoolInput, ExistingStringDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(BoolInput, ExistingDateDoc) {
+TEST_F(BoolInput, ExistingDateDoc) {
     Document doc(fromjson("{ a: {$date: 0 } }"));
     Mod mod(fromjson("{ $currentDate : { a : true } }"));
 
@@ -272,7 +298,7 @@ TEST(BoolInput, ExistingDateDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(DateInput, ExistingDateDoc) {
+TEST_F(DateInput, ExistingDateDoc) {
     Document doc(fromjson("{ a: {$date: 0 } }"));
     Mod mod(fromjson("{ $currentDate : { a : {$type: 'date' } } }"));
 
@@ -293,7 +319,7 @@ TEST(DateInput, ExistingDateDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(TimestampInput, ExistingDateDoc) {
+TEST_F(TimestampInput, ExistingDateDoc) {
     Document doc(fromjson("{ a: {$date: 0 } }"));
     Mod mod(fromjson("{ $currentDate : { a : {$type : 'timestamp' } } }"));
 
@@ -315,7 +341,7 @@ TEST(TimestampInput, ExistingDateDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(TimestampInput, ExistingEmbeddedDateDoc) {
+TEST_F(TimestampInput, ExistingEmbeddedDateDoc) {
     Document doc(fromjson("{ a: {b: {$date: 0 } } }"));
     Mod mod(fromjson("{ $currentDate : { 'a.b' : {$type : 'timestamp' } } }"));
 
@@ -337,7 +363,7 @@ TEST(TimestampInput, ExistingEmbeddedDateDoc) {
     validateOplogEntry(oplogFormat, logDoc);
 }
 
-TEST(DottedTimestampInput, EmptyStartDoc) {
+TEST_F(DottedTimestampInput, EmptyStartDoc) {
     Document doc(fromjson("{ }"));
     Mod mod(fromjson("{ $currentDate : { 'a.b' : {$type : 'timestamp' } } }"));
 

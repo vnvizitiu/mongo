@@ -68,7 +68,7 @@ public:
     void startup() override;
     void shutdown() override;
     void join() override;
-    std::string getDiagnosticString() const override;
+    void appendDiagnosticBSON(BSONObjBuilder* b) const;
     Date_t now() override;
     StatusWith<EventHandle> makeEvent() override;
     void signalEvent(const EventHandle& event) override;
@@ -84,15 +84,34 @@ public:
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
 
     /**
-     * Cancels all commands on the network interface.
+     * Drops all connections to the given host on the network interface.
      */
-    void cancelAllCommands();
+    void dropConnections(const HostAndPort& hostAndPort);
 
 private:
     class CallbackState;
     class EventState;
     using WorkQueue = stdx::list<std::shared_ptr<CallbackState>>;
     using EventList = stdx::list<std::shared_ptr<EventState>>;
+
+    /**
+     * Representation of the stage of life of a thread pool.
+     *
+     * A pool starts out in the preStart state, and ends life in the shutdownComplete state.  Work
+     * may only be scheduled in the preStart and running states. Threads may only be started in the
+     * running state. In shutdownComplete, there are no remaining threads or pending tasks to
+     * execute.
+     *
+     * Diagram of legal transitions:
+     *
+     * preStart -> running -> joinRequired -> joining -> shutdownComplete
+     *        \               ^
+     *         \_____________/
+     *
+     * NOTE: The enumeration values below are compared using operator<, etc, with the expectation
+     * that a -> b in the diagram above implies that a < b in the enum below.
+     */
+    enum State { preStart, running, joinRequired, joining, shutdownComplete };
 
     /**
      * Returns an EventList containing one unsignaled EventState. This is a helper function for
@@ -147,10 +166,9 @@ private:
      */
     void runCallback(std::shared_ptr<CallbackState> cbState);
 
-    /**
-     * Returns bson for diagnostics
-     */
-    BSONObj _getDiagnosticBSON() const;
+    bool _inShutdown_inlock() const;
+    void _setState_inlock(State newState);
+    stdx::unique_lock<stdx::mutex> _join(stdx::unique_lock<stdx::mutex> lk);
 
     // The network interface used for remote command execution and waiting.
     std::unique_ptr<NetworkInterface> _net;
@@ -173,8 +191,9 @@ private:
     // List of all events that have yet to be signaled.
     EventList _unsignaledEvents;
 
-    // Indicates whether or not the executor is shutting down.
-    bool _inShutdown = false;
+    // Lifecycle state of this executor.
+    stdx::condition_variable _stateChange;
+    State _state = preStart;
 };
 
 }  // namespace executor

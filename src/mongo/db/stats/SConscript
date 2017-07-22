@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
     target='timer_stats',
     source=[
@@ -66,23 +68,38 @@ env.Library(
 )
 
 env.Library(
+    target='fill_locker_info',
+    source=[
+        'fill_locker_info.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager'
+    ],
+)
+
+env.CppUnitTest(
+    target='fill_locker_info_test',
+    source=[
+        'fill_locker_info_test.cpp',
+    ],
+    LIBDEPS=[
+        'fill_locker_info',
+    ],
+)
+
+env.Library(
     target='serveronly',
     source=[
-        "fill_locker_info.cpp",
         "latency_server_status_section.cpp",
         "lock_server_status_section.cpp",
-        "range_deleter_server_status.cpp",
-        "snapshots.cpp",
         'storage_stats.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands/core',
-        '$BUILD_DIR/mongo/db/range_deleter',
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/index/index_access_methods',
+        'fill_locker_info',
         'top',
-    ],
-    LIBDEPS_TAGS=[
-        # Depends on mongo::getDeleter from db/serveronly
-        'incomplete',
     ],
 )

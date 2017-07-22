@@ -47,7 +47,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
             {"_id": 2, "host": nodes[2], arbiterOnly: true}
         ]
     };
-    updateConfigIfNotDurable(config);
+
     replTest.initiate(config);
 
     // Get connections and collection.
@@ -63,8 +63,7 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     function saveDoc(state) {
         log("saving doc.");
-        var res = dbPrimary.runCommandWithMetadata(
-            'update',
+        var res = dbPrimary.runCommandWithMetadata(  //
             {
               update: name,
               writeConcern: {w: 2, wtimeout: 60 * 1000},
@@ -79,8 +78,10 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     function doDirtyRead(lastOp) {
         log("doing dirty read for lastOp:" + tojson(lastOp));
-        var res = collSecondary.runCommand(
-            'find', {"readConcern": {"level": "local", "afterOpTime": lastOp}, "maxTimeMS": 3000});
+        var res = collSecondary.runCommand('find', {
+            "readConcern": {"level": "local", "afterOpTime": lastOp},
+            "maxTimeMS": replTest.kDefaultTimeoutMS
+        });
         assert.commandWorked(res);
         log("done doing dirty read.");
         return new DBCommandCursor(secondary, res).toArray()[0].state;
@@ -88,9 +89,10 @@ load("jstests/replsets/rslib.js");  // For startSetIfSupportsReadMajority.
 
     function doCommittedRead(lastOp) {
         log("doing committed read for optime: " + tojson(lastOp));
-        var res = collSecondary.runCommand(
-            'find',
-            {"readConcern": {"level": "majority", "afterOpTime": lastOp}, "maxTimeMS": 3000});
+        var res = collSecondary.runCommand('find', {
+            "readConcern": {"level": "majority", "afterOpTime": lastOp},
+            "maxTimeMS": replTest.kDefaultTimeoutMS
+        });
         assert.commandWorked(res);
         log("done doing committed read.");
         return new DBCommandCursor(secondary, res).toArray()[0].state;

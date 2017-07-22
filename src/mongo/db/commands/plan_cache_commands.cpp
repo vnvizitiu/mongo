@@ -43,6 +43,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/util/log.h"
@@ -57,7 +58,7 @@ using namespace mongo;
 /**
  * Retrieves a collection's plan cache from the database.
  */
-static Status getPlanCache(OperationContext* txn,
+static Status getPlanCache(OperationContext* opCtx,
                            Collection* collection,
                            const string& ns,
                            PlanCache** planCacheOut) {
@@ -107,16 +108,14 @@ using std::unique_ptr;
 PlanCacheCommand::PlanCacheCommand(const string& name,
                                    const string& helpText,
                                    ActionType actionType)
-    : Command(name), helpText(helpText), actionType(actionType) {}
+    : BasicCommand(name), helpText(helpText), actionType(actionType) {}
 
-bool PlanCacheCommand::run(OperationContext* txn,
+bool PlanCacheCommand::run(OperationContext* opCtx,
                            const string& dbname,
-                           BSONObj& cmdObj,
-                           int options,
-                           string& errmsg,
+                           const BSONObj& cmdObj,
                            BSONObjBuilder& result) {
-    string ns = parseNs(dbname, cmdObj);
-    Status status = runPlanCacheCommand(txn, ns, cmdObj, &result);
+    const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+    Status status = runPlanCacheCommand(opCtx, nss.ns(), cmdObj, &result);
     return appendCommandStatus(result, status);
 }
 
@@ -151,7 +150,7 @@ Status PlanCacheCommand::checkAuthForCommand(Client* client,
 }
 
 // static
-StatusWith<unique_ptr<CanonicalQuery>> PlanCacheCommand::canonicalize(OperationContext* txn,
+StatusWith<unique_ptr<CanonicalQuery>> PlanCacheCommand::canonicalize(OperationContext* opCtx,
                                                                       const string& ns,
                                                                       const BSONObj& cmdObj) {
     // query - required
@@ -207,8 +206,8 @@ StatusWith<unique_ptr<CanonicalQuery>> PlanCacheCommand::canonicalize(OperationC
     qr->setSort(sortObj);
     qr->setProj(projObj);
     qr->setCollation(collationObj);
-    const ExtensionsCallbackReal extensionsCallback(txn, &nss);
-    auto statusWithCQ = CanonicalQuery::canonicalize(txn, std::move(qr), extensionsCallback);
+    const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -221,15 +220,15 @@ PlanCacheListQueryShapes::PlanCacheListQueryShapes()
                        "Displays all query shapes in a collection.",
                        ActionType::planCacheRead) {}
 
-Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* txn,
+Status PlanCacheListQueryShapes::runPlanCacheCommand(OperationContext* opCtx,
                                                      const string& ns,
-                                                     BSONObj& cmdObj,
+                                                     const BSONObj& cmdObj,
                                                      BSONObjBuilder* bob) {
     // This is a read lock. The query cache is owned by the collection.
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
-    Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
+    Status status = getPlanCache(opCtx, ctx.getCollection(), ns, &planCache);
     if (!status.isOK()) {
         // No collection - return results with empty shapes array.
         BSONArrayBuilder arrayBuilder(bob->subarrayStart("shapes"));
@@ -273,24 +272,24 @@ PlanCacheClear::PlanCacheClear()
                        "Drops one or all cached queries in a collection.",
                        ActionType::planCacheWrite) {}
 
-Status PlanCacheClear::runPlanCacheCommand(OperationContext* txn,
+Status PlanCacheClear::runPlanCacheCommand(OperationContext* opCtx,
                                            const std::string& ns,
-                                           BSONObj& cmdObj,
+                                           const BSONObj& cmdObj,
                                            BSONObjBuilder* bob) {
     // This is a read lock. The query cache is owned by the collection.
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
-    Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
+    Status status = getPlanCache(opCtx, ctx.getCollection(), ns, &planCache);
     if (!status.isOK()) {
         // No collection - nothing to do. Return OK status.
         return Status::OK();
     }
-    return clear(txn, planCache, ns, cmdObj);
+    return clear(opCtx, planCache, ns, cmdObj);
 }
 
 // static
-Status PlanCacheClear::clear(OperationContext* txn,
+Status PlanCacheClear::clear(OperationContext* opCtx,
                              PlanCache* planCache,
                              const string& ns,
                              const BSONObj& cmdObj) {
@@ -301,7 +300,7 @@ Status PlanCacheClear::clear(OperationContext* txn,
     // - clear plans for single query shape when a query shape is described in the
     //   command arguments.
     if (cmdObj.hasField("query")) {
-        auto statusWithCQ = PlanCacheCommand::canonicalize(txn, ns, cmdObj);
+        auto statusWithCQ = PlanCacheCommand::canonicalize(opCtx, ns, cmdObj);
         if (!statusWithCQ.isOK()) {
             return statusWithCQ.getStatus();
         }
@@ -350,30 +349,30 @@ PlanCacheListPlans::PlanCacheListPlans()
                        "Displays the cached plans for a query shape.",
                        ActionType::planCacheRead) {}
 
-Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* txn,
+Status PlanCacheListPlans::runPlanCacheCommand(OperationContext* opCtx,
                                                const std::string& ns,
-                                               BSONObj& cmdObj,
+                                               const BSONObj& cmdObj,
                                                BSONObjBuilder* bob) {
-    AutoGetCollectionForRead ctx(txn, ns);
+    AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
 
     PlanCache* planCache;
-    Status status = getPlanCache(txn, ctx.getCollection(), ns, &planCache);
+    Status status = getPlanCache(opCtx, ctx.getCollection(), ns, &planCache);
     if (!status.isOK()) {
         // No collection - return empty plans array.
         BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
         plansBuilder.doneFast();
         return Status::OK();
     }
-    return list(txn, *planCache, ns, cmdObj, bob);
+    return list(opCtx, *planCache, ns, cmdObj, bob);
 }
 
 // static
-Status PlanCacheListPlans::list(OperationContext* txn,
+Status PlanCacheListPlans::list(OperationContext* opCtx,
                                 const PlanCache& planCache,
                                 const std::string& ns,
                                 const BSONObj& cmdObj,
                                 BSONObjBuilder* bob) {
-    auto statusWithCQ = canonicalize(txn, ns, cmdObj);
+    auto statusWithCQ = canonicalize(opCtx, ns, cmdObj);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -415,7 +414,7 @@ Status PlanCacheListPlans::list(OperationContext* txn,
         BSONObjBuilder reasonBob(planBob.subobjStart("reason"));
         reasonBob.append("score", entry->decision->scores[i]);
         BSONObjBuilder statsBob(reasonBob.subobjStart("stats"));
-        PlanStageStats* stats = entry->decision->stats.vector()[i];
+        PlanStageStats* stats = entry->decision->stats[i].get();
         if (stats) {
             Explain::statsToBSON(*stats, &statsBob);
         }

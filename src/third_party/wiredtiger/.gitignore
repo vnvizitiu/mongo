@@ -16,11 +16,12 @@
 *.obj
 *.pdb
 *.pyc
+.dirstamp
 .sconf_temp
 .sconsign.dblite
-.dirstamp
 /Makefile.am
 /aclocal.m4
+/autom4te.cache/
 /build_posix/aclocal/libtool.m4
 /build_posix/aclocal/ltoptions.m4
 /build_posix/aclocal/ltsugar.m4
@@ -32,7 +33,7 @@
 /config.status
 /configure
 /configure.ac
-/libtool/
+/libtool
 /stamp-h1
 /wiredtiger.h
 /wiredtiger.pc
@@ -61,11 +62,16 @@ tags
 WT_HOME/
 WT_TEST/
 
+# Bench/workgen
+/bench/workgen/_workgen.so
+/bench/workgen/workgen/workgen.py
+/bench/workgen/workgen_wrap.cxx
+
 # Python
 /lang/python/_wiredtiger.so
+/lang/python/wiredtiger.py
 /lang/python/wiredtiger/__init__.py
 /lang/python/wiredtiger/_wiredtiger.pyd
-/lang/python/wiredtiger.py
 /lang/python/wiredtiger_wrap.c
 _wiredtiger.pyd
 
@@ -89,12 +95,14 @@ _wiredtiger.pyd
 **/examples/c/ex_pack
 **/examples/c/ex_process
 **/examples/c/ex_schema
-**/examples/c/ex_scope
+**/examples/c/ex_smoke
 **/examples/c/ex_stat
 **/examples/c/ex_sync
 **/examples/c/ex_thread
 **/test/bloom/t
 **/test/checkpoint/t
+**/test/csuite/test_rwlock
+**/test/csuite/test_scope
 **/test/csuite/test_wt1965_col_efficiency
 **/test/csuite/test_wt2246_col_append
 **/test/csuite/test_wt2323_join_visibility
@@ -106,6 +114,12 @@ _wiredtiger.pyd
 **/test/csuite/test_wt2719_reconfig
 **/test/csuite/test_wt2834_join_bloom_fix
 **/test/csuite/test_wt2853_perf
+**/test/csuite/test_wt2909_checkpoint_integrity
+**/test/csuite/test_wt2999_join_extractor
+**/test/csuite/test_wt3120_filesys
+**/test/csuite/test_wt3135_search_near_collator
+**/test/csuite/test_wt3184_dup_index_collator
+**/test/csuite/test_wt3363_checkpoint_op_races
 **/test/cursor_order/cursor_order
 **/test/fops/t
 **/test/format/s_dumpcmp
@@ -120,4 +134,5 @@ _wiredtiger.pyd
 **/test/recovery/random-abort
 **/test/recovery/truncated-log
 **/test/salvage/t
+**/test/syscall/test_wt2336_base
 **/test/thread/t

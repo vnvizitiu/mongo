@@ -42,6 +42,7 @@
 #include "mongo/executor/test_network_connection_hook.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
@@ -781,7 +782,7 @@ TEST_F(NetworkInterfaceASIOConnectionHookTest, MakeRequestReturnsNone) {
     // Simulate user command.
     stream->simulateServer(rpc::Protocol::kOpCommandV1,
                            [&](RemoteCommandRequest request) -> RemoteCommandResponse {
-                               ASSERT_BSONOBJ_EQ(commandRequest, request.cmdObj);
+                               ASSERT_BSONOBJ_EQ(commandRequest, request.cmdObj.removeField("$db"));
 
                                RemoteCommandResponse response;
                                response.data = commandReply;
@@ -813,6 +814,13 @@ TEST_F(NetworkInterfaceASIOConnectionHookTest, HandleReplyReturnsError) {
                                     << "blah"
                                     << "ok"
                                     << 1.0);
+    BSONObj hookUnifiedRequest = ([&] {
+        BSONObjBuilder bob;
+        bob.appendElements(hookCommandRequest);
+        bob.appendElements(hookRequestMetadata);
+        bob.append("$db", "foo");
+        return bob.obj();
+    }());
     BSONObj hookReplyMetadata = BSON("1111" << 2222);
 
     Status handleReplyError{ErrorCodes::AuthSchemaIncompatible, "daowdjkpowkdjpow"};
@@ -852,8 +860,8 @@ TEST_F(NetworkInterfaceASIOConnectionHookTest, HandleReplyReturnsError) {
     // Simulate hook reply
     stream->simulateServer(rpc::Protocol::kOpCommandV1,
                            [&](RemoteCommandRequest request) -> RemoteCommandResponse {
-                               ASSERT_BSONOBJ_EQ(request.cmdObj, hookCommandRequest);
-                               ASSERT_BSONOBJ_EQ(request.metadata, hookRequestMetadata);
+                               ASSERT_BSONOBJ_EQ(request.cmdObj, hookUnifiedRequest);
+                               ASSERT_BSONOBJ_EQ(request.metadata, BSONObj());
 
                                RemoteCommandResponse response;
                                response.data = hookCommandReply;
@@ -987,15 +995,15 @@ public:
     TestMetadataHook(bool* wroteRequestMetadata, bool* gotReplyMetadata)
         : _wroteRequestMetadata(wroteRequestMetadata), _gotReplyMetadata(gotReplyMetadata) {}
 
-    Status writeRequestMetadata(OperationContext* txn,
-                                const HostAndPort& requestDestination,
-                                BSONObjBuilder* metadataBob) override {
+    Status writeRequestMetadata(OperationContext* opCtx, BSONObjBuilder* metadataBob) override {
         metadataBob->append("foo", "bar");
         *_wroteRequestMetadata = true;
         return Status::OK();
     }
 
-    Status readReplyMetadata(const HostAndPort& replySource, const BSONObj& metadataObj) override {
+    Status readReplyMetadata(OperationContext* opCtx,
+                             StringData replySource,
+                             const BSONObj& metadataObj) override {
         *_gotReplyMetadata = (metadataObj["baz"].str() == "garply");
         return Status::OK();
     }
@@ -1008,7 +1016,10 @@ private:
 TEST_F(NetworkInterfaceASIOMetadataTest, Metadata) {
     bool wroteRequestMetadata = false;
     bool gotReplyMetadata = false;
-    start(stdx::make_unique<TestMetadataHook>(&wroteRequestMetadata, &gotReplyMetadata));
+    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(
+        stdx::make_unique<TestMetadataHook>(&wroteRequestMetadata, &gotReplyMetadata));
+    start(std::move(hookList));
 
     RemoteCommandRequest request{testHost, "blah", BSON("ping" << 1), nullptr};
     auto deferred = startCommand(makeCallbackHandle(), request);
@@ -1025,7 +1036,7 @@ TEST_F(NetworkInterfaceASIOMetadataTest, Metadata) {
     // Simulate hook reply
     stream->simulateServer(rpc::Protocol::kOpCommandV1,
                            [&](RemoteCommandRequest request) -> RemoteCommandResponse {
-                               ASSERT_EQ("bar", request.metadata["foo"].str());
+                               ASSERT_EQ("bar", request.cmdObj["foo"].str());
                                RemoteCommandResponse response;
                                response.data = BSON("ok" << 1);
                                response.metadata = BSON("baz"

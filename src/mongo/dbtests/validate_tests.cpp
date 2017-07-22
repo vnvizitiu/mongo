@@ -36,7 +36,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
@@ -59,7 +58,7 @@ static const char* const _ns = "unittests.validate_tests";
  */
 class ValidateBase {
 public:
-    explicit ValidateBase(bool full) : _ctx(&_txn, _ns), _client(&_txn), _full(full) {
+    explicit ValidateBase(bool full) : _ctx(&_opCtx, _ns), _client(&_opCtx), _full(full) {
         _client.createCollection(_ns);
     }
     ~ValidateBase() {
@@ -75,7 +74,7 @@ protected:
         ValidateResults results;
         BSONObjBuilder output;
         ASSERT_OK(collection()->validate(
-            &_txn, _full ? kValidateFull : kValidateIndex, &results, &output));
+            &_opCtx, _full ? kValidateFull : kValidateIndex, &results, &output));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.valid, results.errors.empty());
@@ -94,7 +93,7 @@ protected:
     }
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
-    OperationContext& _txn = *_txnPtr;
+    OperationContext& _opCtx = *_txnPtr;
     OldClientWriteContext _ctx;
     DBDirectClient _client;
     bool _full;
@@ -112,13 +111,15 @@ public:
         RecordId id1;
         {
             OpDebug* const nullOpDebug = nullptr;
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2)), nullOpDebug, true));
             wunit.commit();
         }
 
@@ -128,8 +129,8 @@ public:
 
         // Remove {_id: 1} from the record store, so we get more _id entries than records.
         {
-            WriteUnitOfWork wunit(&_txn);
-            rs->deleteRecord(&_txn, id1);
+            WriteUnitOfWork wunit(&_opCtx);
+            rs->deleteRecord(&_opCtx, id1);
             wunit.commit();
         }
 
@@ -138,11 +139,11 @@ public:
         // Insert records {_id: 0} and {_id: 1} , so we get too few _id entries, and verify
         // validate fails.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             for (int j = 0; j < 2; j++) {
                 auto doc = BSON("_id" << j);
-                ASSERT_OK(
-                    rs->insertRecord(&_txn, doc.objdata(), doc.objsize(), /*enforceQuota*/ false));
+                ASSERT_OK(rs->insertRecord(
+                    &_opCtx, doc.objdata(), doc.objsize(), /*enforceQuota*/ false));
             }
             wunit.commit();
         }
@@ -162,16 +163,18 @@ public:
         RecordId id1;
         {
             OpDebug* const nullOpDebug = nullptr;
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
             wunit.commit();
         }
 
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "a"
@@ -191,8 +194,8 @@ public:
 
         // Remove a record, so we get more _id entries than records, and verify validate fails.
         {
-            WriteUnitOfWork wunit(&_txn);
-            rs->deleteRecord(&_txn, id1);
+            WriteUnitOfWork wunit(&_opCtx);
+            rs->deleteRecord(&_opCtx, id1);
             wunit.commit();
         }
 
@@ -201,11 +204,11 @@ public:
         // Insert two more records, so we get too few entries for a non-sparse index, and
         // verify validate fails.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             for (int j = 0; j < 2; j++) {
                 auto doc = BSON("_id" << j);
-                ASSERT_OK(
-                    rs->insertRecord(&_txn, doc.objdata(), doc.objsize(), /*enforceQuota*/ false));
+                ASSERT_OK(rs->insertRecord(
+                    &_opCtx, doc.objdata(), doc.objsize(), /*enforceQuota*/ false));
             }
             wunit.commit();
         }
@@ -224,17 +227,20 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 3 << "b" << 3), nullOpDebug, true));
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "b" << 3)), nullOpDebug, true));
             wunit.commit();
         }
 
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "a"
@@ -255,10 +261,10 @@ public:
         // Update {a: 1} to {a: 9} without updating the index, so we get inconsistent values
         // between the index and the document. Verify validate fails.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1 << "a" << 9);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
 
             ASSERT_OK(updateStatus);
             wunit.commit();
@@ -279,13 +285,15 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2)), nullOpDebug, true));
             wunit.commit();
         }
 
@@ -296,10 +304,10 @@ public:
         // Update {_id: 1} to {_id: 9} without updating the index, so we get inconsistent values
         // between the index and the document. Verify validate fails.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 9);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -308,10 +316,10 @@ public:
 
         // Revert {_id: 9} to {_id: 1} and verify that validate succeeds.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -322,11 +330,12 @@ public:
         // will still be the same number of index entries and documents, but one document will not
         // have an index entry.
         {
-            WriteUnitOfWork wunit(&_txn);
-            rs->deleteRecord(&_txn, id1);
+            WriteUnitOfWork wunit(&_opCtx);
+            rs->deleteRecord(&_opCtx, id1);
             auto doc = BSON("_id" << 3);
-            ASSERT_OK(rs->insertRecord(&_txn, doc.objdata(), doc.objsize(), /*enforceQuota*/ false)
-                          .getStatus());
+            ASSERT_OK(
+                rs->insertRecord(&_opCtx, doc.objdata(), doc.objsize(), /*enforceQuota*/ false)
+                    .getStatus());
             wunit.commit();
         }
 
@@ -354,22 +363,22 @@ public:
         // {a: [c: 1]}
         auto doc3 = BSON("_id" << 3 << "a" << BSON_ARRAY(BSON("c" << 1)));
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
 
-            ASSERT_OK(coll->insertDocument(&_txn, doc1, nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, doc2, nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, doc3, nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(&_opCtx, InsertStatement(doc1), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(&_opCtx, InsertStatement(doc2), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(&_opCtx, InsertStatement(doc3), nullOpDebug, true));
             wunit.commit();
         }
 
         ASSERT_TRUE(checkValid());
 
         // Create multi-key index.
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "multikey_index"
@@ -389,9 +398,9 @@ public:
 
         // Update a document's indexed field without updating the index.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc1_b.objdata(), doc1_b.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc1_b.objdata(), doc1_b.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -401,9 +410,9 @@ public:
         // Update a document's non-indexed field without updating the index.
         // Index validation should still be valid.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc1_c.objdata(), doc1_c.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc1_c.objdata(), doc1_c.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -423,19 +432,22 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 3 << "b" << 1), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "b" << 1)), nullOpDebug, true));
             wunit.commit();
         }
 
         // Create a sparse index.
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "sparse_index"
@@ -457,10 +469,10 @@ public:
 
         // Update a document's indexed field without updating the index.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 2 << "a" << 3);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -480,22 +492,27 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
             // Explicitly test that multi-key partial indexes containing documents that
             // don't match the filter expression are handled correctly.
             ASSERT_OK(coll->insertDocument(
-                &_txn, BSON("_id" << 3 << "a" << BSON_ARRAY(-1 << -2 << -3)), nullOpDebug, true));
+                &_opCtx,
+                InsertStatement(BSON("_id" << 3 << "a" << BSON_ARRAY(-1 << -2 << -3))),
+                nullOpDebug,
+                true));
             wunit.commit();
         }
 
         // Create a partial index.
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "partial_index"
@@ -517,10 +534,10 @@ public:
 
         // Update an unindexed document without updating the index.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -541,16 +558,19 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
-            ASSERT_OK(coll->insertDocument(
-                &_txn, BSON("_id" << 1 << "x" << 1 << "a" << 2), nullOpDebug, true));
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 1 << "x" << 1 << "a" << 2)),
+                                     nullOpDebug,
+                                     true));
             wunit.commit();
         }
 
         // Create a partial geo index that indexes the document. This should throw an error.
-        ASSERT_THROWS(dbtests::createIndexFromSpec(&_txn,
+        ASSERT_THROWS(dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "partial_index"
@@ -564,11 +584,12 @@ public:
                                                         << "background"
                                                         << false
                                                         << "partialFilterExpression"
-                                                        << BSON("a" << BSON("$eq" << 2)))),
+                                                        << BSON("a" << BSON("$eq" << 2))))
+                          .transitional_ignore(),
                       UserException);
 
         // Create a partial geo index that does not index the document.
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "partial_index"
@@ -599,24 +620,33 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 1 << "a" << 1 << "b" << 4)),
+                                     nullOpDebug,
+                                     true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(
+                coll->insertDocument(&_opCtx,
+                                     InsertStatement(BSON("_id" << 2 << "a" << 2 << "b" << 5)),
+                                     nullOpDebug,
+                                     true));
             ASSERT_OK(coll->insertDocument(
-                &_txn, BSON("_id" << 1 << "a" << 1 << "b" << 4), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "a" << 3)), nullOpDebug, true));
             ASSERT_OK(coll->insertDocument(
-                &_txn, BSON("_id" << 2 << "a" << 2 << "b" << 5), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 3 << "a" << 3), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 4 << "b" << 6), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 5 << "c" << 7), nullOpDebug, true));
+                &_opCtx, InsertStatement(BSON("_id" << 4 << "b" << 6)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 5 << "c" << 7)), nullOpDebug, true));
             wunit.commit();
         }
 
         // Create two compound indexes, one forward and one reverse, to test
         // validate()'s index direction parsing.
-        auto status = dbtests::createIndexFromSpec(&_txn,
+        auto status = dbtests::createIndexFromSpec(&_opCtx,
                                                    coll->ns().ns(),
                                                    BSON("name"
                                                         << "compound_index_1"
@@ -630,7 +660,7 @@ public:
                                                         << false));
         ASSERT_OK(status);
 
-        status = dbtests::createIndexFromSpec(&_txn,
+        status = dbtests::createIndexFromSpec(&_opCtx,
                                               coll->ns().ns(),
                                               BSON("name"
                                                    << "compound_index_2"
@@ -650,10 +680,10 @@ public:
 
         // Update a document's indexed field without updating the index.
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             auto doc = BSON("_id" << 1 << "a" << 1 << "b" << 3);
             auto updateStatus = rs->updateRecord(
-                &_txn, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
+                &_opCtx, id1, doc.objdata(), doc.objsize(), /*enforceQuota*/ false, NULL);
             ASSERT_OK(updateStatus);
             wunit.commit();
         }
@@ -673,20 +703,23 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 3 << "b" << 1), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "b" << 1)), nullOpDebug, true));
             wunit.commit();
         }
 
         const std::string indexName = "bad_index";
         auto status = dbtests::createIndexFromSpec(
-            &_txn,
+            &_opCtx,
             coll->ns().ns(),
             BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "v"
                         << static_cast<int>(kIndexVersion)
@@ -698,11 +731,11 @@ public:
 
         // Replace a correct index entry with a bad one and check it's invalid.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_txn, indexName);
+        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
         IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
 
         {
-            WriteUnitOfWork wunit(&_txn);
+            WriteUnitOfWork wunit(&_opCtx);
             int64_t numDeleted;
             int64_t numInserted;
             const BSONObj actualKey = BSON("a" << 1);
@@ -710,8 +743,8 @@ public:
             InsertDeleteOptions options;
             options.dupsAllowed = true;
             options.logIfError = true;
-            auto removeStatus = iam->remove(&_txn, actualKey, id1, options, &numDeleted);
-            auto insertStatus = iam->insert(&_txn, badKey, id1, options, &numInserted);
+            auto removeStatus = iam->remove(&_opCtx, actualKey, id1, options, &numDeleted);
+            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &numInserted);
 
             ASSERT_EQUALS(numDeleted, 1);
             ASSERT_EQUALS(numInserted, 1);
@@ -735,20 +768,23 @@ public:
         Collection* coll;
         RecordId id1;
         {
-            WriteUnitOfWork wunit(&_txn);
-            ASSERT_OK(db->dropCollection(&_txn, _ns));
-            coll = db->createCollection(&_txn, _ns);
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(db->dropCollection(&_opCtx, _ns));
+            coll = db->createCollection(&_opCtx, _ns);
 
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 1 << "a" << 1), nullOpDebug, true));
-            id1 = coll->getCursor(&_txn)->next()->id;
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 2 << "a" << 2), nullOpDebug, true));
-            ASSERT_OK(coll->insertDocument(&_txn, BSON("_id" << 3 << "b" << 1), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            id1 = coll->getCursor(&_opCtx)->next()->id;
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 2 << "a" << 2)), nullOpDebug, true));
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 3 << "b" << 1)), nullOpDebug, true));
             wunit.commit();
         }
 
         const std::string indexName = "bad_index";
         auto status = dbtests::createIndexFromSpec(
-            &_txn,
+            &_opCtx,
             coll->ns().ns(),
             BSON("name" << indexName << "ns" << coll->ns().ns() << "key" << BSON("a" << 1) << "v"
                         << static_cast<int>(kIndexVersion)
@@ -761,7 +797,7 @@ public:
         // Change the IndexDescriptor's keyPattern to descending so the index ordering
         // appears wrong.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_txn, indexName);
+        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
         descriptor->setKeyPatternForTest(BSON("a" << -1));
 
         ASSERT_FALSE(checkValid());

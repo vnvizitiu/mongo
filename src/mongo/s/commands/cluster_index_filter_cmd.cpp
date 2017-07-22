@@ -48,7 +48,7 @@ namespace {
  * Cluster index filter commands don't do much more than
  * forwarding the commands to all shards and combining the results.
  */
-class ClusterIndexFilterCmd : public Command {
+class ClusterIndexFilterCmd : public BasicCommand {
     MONGO_DISALLOW_COPYING(ClusterIndexFilterCmd);
 
 public:
@@ -57,7 +57,7 @@ public:
      * "helpText", and will require privilege "actionType" to run.
      */
     ClusterIndexFilterCmd(const std::string& name, const std::string& helpText)
-        : Command(name), _helpText(helpText) {}
+        : BasicCommand(name), _helpText(helpText) {}
 
     virtual ~ClusterIndexFilterCmd() {}
 
@@ -91,11 +91,9 @@ public:
     }
 
     // Cluster plan cache command entry point.
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
@@ -107,8 +105,13 @@ public:
         // commands are tied to query shape (data has no effect on query shape).
         vector<Strategy::CommandResult> results;
         const BSONObj query;
-        Strategy::commandOp(
-            txn, dbname, cmdObj, options, nss.ns(), query, CollationSpec::kSimpleSpec, &results);
+        Strategy::commandOp(opCtx,
+                            dbname,
+                            filterCommandRequestForPassthrough(cmdObj),
+                            nss.ns(),
+                            query,
+                            CollationSpec::kSimpleSpec,
+                            &results);
 
         // Set value of first shard result's "ok" field.
         bool clusterCmdResult = true;
@@ -121,7 +124,7 @@ public:
             // XXX: In absence of sensible aggregation strategy,
             //      promote first shard's result to top level.
             if (i == results.begin()) {
-                result.appendElements(cmdResult.result);
+                filterCommandReplyForPassthrough(cmdResult.result, &result);
                 clusterCmdResult = cmdResult.result["ok"].trueValue();
             }
 

@@ -45,7 +45,7 @@ PlanYieldPolicy::PlanYieldPolicy(PlanExecutor* exec, PlanExecutor::YieldPolicy p
     : _policy(policy),
       _forceYield(false),
       _elapsedTracker(exec->getOpCtx()->getServiceContext()->getFastClockSource(),
-                      internalQueryExecYieldIterations,
+                      internalQueryExecYieldIterations.load(),
                       Milliseconds(internalQueryExecYieldPeriodMS.load())),
       _planYielding(exec) {}
 
@@ -54,12 +54,12 @@ PlanYieldPolicy::PlanYieldPolicy(PlanExecutor::YieldPolicy policy, ClockSource* 
     : _policy(policy),
       _forceYield(false),
       _elapsedTracker(cs,
-                      internalQueryExecYieldIterations,
+                      internalQueryExecYieldIterations.load(),
                       Milliseconds(internalQueryExecYieldPeriodMS.load())),
       _planYielding(nullptr) {}
 
 bool PlanYieldPolicy::shouldYield() {
-    if (!allowedToYield())
+    if (!canAutoYield())
         return false;
     invariant(!_planYielding->getOpCtx()->lockState()->inAWriteUnitOfWork());
     if (_forceYield)
@@ -71,9 +71,21 @@ void PlanYieldPolicy::resetTimer() {
     _elapsedTracker.resetLastTime();
 }
 
-bool PlanYieldPolicy::yield(RecordFetcher* fetcher) {
+bool PlanYieldPolicy::yield(RecordFetcher* recordFetcher) {
     invariant(_planYielding);
-    invariant(allowedToYield());
+    if (recordFetcher) {
+        OperationContext* opCtx = _planYielding->getOpCtx();
+        return yield([recordFetcher, opCtx] { recordFetcher->setup(opCtx); },
+                     [recordFetcher] { recordFetcher->fetch(); });
+    } else {
+        return yield(nullptr, nullptr);
+    }
+}
+
+bool PlanYieldPolicy::yield(stdx::function<void()> beforeYieldingFn,
+                            stdx::function<void()> whileYieldingFn) {
+    invariant(_planYielding);
+    invariant(canAutoYield());
 
     // After we finish yielding (or in any early return), call resetTimer() to prevent yielding
     // again right away. We delay the resetTimer() call so that the clock doesn't start ticking
@@ -86,8 +98,7 @@ bool PlanYieldPolicy::yield(RecordFetcher* fetcher) {
     invariant(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
-    // Can't use MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN/END since we need to call saveState
-    // before reseting the transaction.
+    // Can't use writeConflictRetry since we need to call saveState before reseting the transaction.
     for (int attempt = 1; true; attempt++) {
         try {
             // All YIELD_AUTO plans will get here eventually when the elapsed tracker triggers
@@ -108,14 +119,16 @@ bool PlanYieldPolicy::yield(RecordFetcher* fetcher) {
                 opCtx->recoveryUnit()->abandonSnapshot();
             } else {
                 // Release and reacquire locks.
-                QueryYield::yieldAllLocks(opCtx, fetcher, _planYielding->ns());
+                if (beforeYieldingFn)
+                    beforeYieldingFn();
+                QueryYield::yieldAllLocks(opCtx, whileYieldingFn, _planYielding->nss());
             }
 
             return _planYielding->restoreStateWithoutRetrying();
         } catch (const WriteConflictException& wce) {
             CurOp::get(opCtx)->debug().writeConflicts++;
             WriteConflictException::logAndBackoff(
-                attempt, "plan execution restoreState", _planYielding->ns());
+                attempt, "plan execution restoreState", _planYielding->nss().ns());
             // retry
         }
     }

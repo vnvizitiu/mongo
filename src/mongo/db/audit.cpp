@@ -44,9 +44,8 @@ void logAuthentication(Client* client,
                        ErrorCodes::Error result) MONGO_AUDIT_STUB
 
     void logCommandAuthzCheck(Client* client,
-                              const std::string& dbname,
-                              const BSONObj& cmdObj,
-                              Command* command,
+                              const OpMsgRequest& cmdObj,
+                              CommandInterface* command,
                               ErrorCodes::Error result) MONGO_AUDIT_STUB
 
     void logDeleteAuthzCheck(Client* client,
@@ -172,7 +171,7 @@ void logAuthentication(Client* client,
     void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern, bool unique)
         MONGO_AUDIT_STUB
 
-    void writeImpersonatedUsersToMetadata(OperationContext* txn,
+    void writeImpersonatedUsersToMetadata(OperationContext* opCtx,
                                           BSONObjBuilder* metadata) MONGO_AUDIT_STUB
 
     void parseAndRemoveImpersonatedUsersField(BSONObj cmdObj,

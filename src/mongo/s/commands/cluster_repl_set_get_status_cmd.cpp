@@ -36,9 +36,9 @@
 namespace mongo {
 namespace {
 
-class CmdReplSetGetStatus : public Command {
+class CmdReplSetGetStatus : public ErrmsgCommandDeprecated {
 public:
-    CmdReplSetGetStatus() : Command("replSetGetStatus") {}
+    CmdReplSetGetStatus() : ErrmsgCommandDeprecated("replSetGetStatus") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -64,15 +64,14 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
         if (cmdObj["forShell"].trueValue()) {
             LastError::get(cc()).disable();
-            ClusterLastErrorInfo::get(cc()).disableForCommand();
+            ClusterLastErrorInfo::get(cc())->disableForCommand();
         }
 
         errmsg = "replSetGetStatus is not supported through mongos";

@@ -34,7 +34,8 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/diag_log.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/mmap.h"
@@ -64,7 +65,7 @@ void DataFileSync::run() {
         LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay.load() << endl;
     }
     int time_flushing = 0;
-    while (!inShutdown()) {
+    while (!globalInShutdownDeprecated()) {
         _diaglog.flush();
         if (storageGlobalParams.syncdelay == 0) {
             // in case at some point we add an option to change at runtime
@@ -75,16 +76,17 @@ void DataFileSync::run() {
         sleepmillis(
             (long long)std::max(0.0, (storageGlobalParams.syncdelay * 1000) - time_flushing));
 
-        if (inShutdown()) {
+        if (globalInShutdownDeprecated()) {
             // occasional issue trying to flush during shutdown when sleep interrupted
             break;
         }
 
+        auto opCtx = cc().makeOperationContext();
         Date_t start = jsTime();
         StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
 
         dur::notifyPreDataFileFlush();
-        int numFiles = storageEngine->flushAllFiles(true);
+        int numFiles = storageEngine->flushAllFiles(opCtx.get(), true);
         dur::notifyPostDataFileFlush();
 
         time_flushing = durationCount<Milliseconds>(jsTime() - start);
@@ -98,7 +100,7 @@ void DataFileSync::run() {
     }
 }
 
-BSONObj DataFileSync::generateSection(OperationContext* txn,
+BSONObj DataFileSync::generateSection(OperationContext* opCtx,
                                       const BSONElement& configElement) const {
     if (!running()) {
         return BSONObj();
@@ -125,7 +127,7 @@ class MemJournalServerStatusMetric : public ServerStatusMetric {
 public:
     MemJournalServerStatusMetric() : ServerStatusMetric(".mem.mapped") {}
     virtual void appendAtLeaf(BSONObjBuilder& b) const {
-        int m = static_cast<int>(MemoryMappedFile::totalMappedLength() / (1024 * 1024));
+        int m = MemoryMappedFile::totalMappedLengthInMB();
         b.appendNumber("mapped", m);
 
         if (storageGlobalParams.dur) {
@@ -133,6 +135,5 @@ public:
             b.appendNumber("mappedWithJournal", m);
         }
     }
-
 } memJournalServerStatusMetric;
 }

@@ -33,9 +33,9 @@
 namespace mongo {
 namespace {
 
-class IsDbGridCmd : public Command {
+class IsDbGridCmd : public BasicCommand {
 public:
-    IsDbGridCmd() : Command("isdbgrid") {}
+    IsDbGridCmd() : BasicCommand("isdbgrid") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -52,11 +52,9 @@ public:
         // No auth required
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         result.append("isdbgrid", 1);
         result.append("hostname", getHostNameCached());

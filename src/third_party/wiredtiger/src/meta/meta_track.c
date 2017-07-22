@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -286,7 +286,7 @@ __wt_meta_track_off(WT_SESSION_IMPL *session, bool need_sync, bool unroll)
 		 */
 		ckpt_session->txn.id = session->txn.id;
 		F_SET(ckpt_session, WT_SESSION_LOCKED_METADATA);
-		WT_WITH_METADATA_LOCK(session, ret,
+		WT_WITH_METADATA_LOCK(session,
 		    WT_WITH_DHANDLE(ckpt_session,
 			WT_SESSION_META_DHANDLE(session),
 			ret = __wt_checkpoint(ckpt_session, NULL)));

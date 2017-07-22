@@ -118,8 +118,31 @@ lsm_config = [
     ]),
 ]
 
+file_runtime_config = [
+    Config('access_pattern_hint', 'none', r'''
+        It is recommended that workloads that consist primarily of
+        updates and/or point queries specify \c random.  Workloads that
+        do many cursor scans through large ranges of data specify
+        \c sequential and other workloads specify \c none.  The
+        option leads to an advisory call to an appropriate operating
+        system API where available''',
+        choices=['none', 'random', 'sequential']),
+    Config('cache_resident', 'false', r'''
+        do not ever evict the object's pages from cache. Not compatible with
+        LSM tables; see @ref tuning_cache_resident for more information''',
+        type='boolean'),
+    Config('log', '', r'''
+        the transaction log configuration for this object.  Only valid if
+        log is enabled in ::wiredtiger_open''',
+        type='category', subconfig=[
+        Config('enabled', 'true', r'''
+            if false, this object has checkpoint-level durability''',
+            type='boolean'),
+        ]),
+]
+
 # Per-file configuration
-file_config = format_meta + [
+file_config = format_meta + file_runtime_config + [
     Config('block_allocation', 'best', r'''
         configure block allocation. Permitted values are \c "first" or
         \c "best"; the \c "first" configuration uses a first-available
@@ -138,10 +161,6 @@ file_config = format_meta + [
         WT_CONNECTION::add_compressor.  If WiredTiger has builtin support for
         \c "lz4", \c "snappy", \c "zlib" or \c "zstd" compression, these names
         are also available.  See @ref compression for more information'''),
-    Config('cache_resident', 'false', r'''
-        do not ever evict the object's pages from cache. Not compatible with
-        LSM tables; see @ref tuning_cache_resident for more information''',
-        type='boolean'),
     Config('checksum', 'uncompressed', r'''
         configure block checksums; permitted values are <code>on</code>
         (checksum all blocks), <code>off</code> (checksum no blocks) and
@@ -190,9 +209,8 @@ file_config = format_meta + [
         WiredTiger to consume memory over the configured cache limit''',
         type='boolean'),
     Config('internal_key_truncate', 'true', r'''
-        configure internal key truncation, discarding unnecessary
-        trailing bytes on internal keys (ignored for custom
-        collators)''',
+        configure internal key truncation, discarding unnecessary trailing
+        bytes on internal keys (ignored for custom collators)''',
         type='boolean'),
     Config('internal_page_max', '4KB', r'''
         the maximum page size for internal nodes, in bytes; the size
@@ -242,14 +260,6 @@ file_config = format_meta + [
     Config('leaf_item_max', '0', r'''
         historic term for leaf_key_max and leaf_value_max''',
         min=0, undoc=True),
-    Config('log', '', r'''
-        the transaction log configuration for this object.  Only valid if
-        log is enabled in ::wiredtiger_open''',
-        type='category', subconfig=[
-        Config('enabled', 'true', r'''
-            if false, this object has checkpoint-level durability''',
-            type='boolean'),
-        ]),
     Config('memory_page_max', '5MB', r'''
         the maximum size a page can grow to in memory before being
         reconciled to disk.  The specified size will be adjusted to a lower
@@ -285,12 +295,12 @@ file_config = format_meta + [
     Config('split_deepen_per_child', '0', r'''
         entries allocated per child when deepening the tree''',
         type='int', undoc=True),
-    Config('split_pct', '75', r'''
+    Config('split_pct', '90', r'''
         the Btree page split size as a percentage of the maximum Btree
         page size, that is, when a Btree page is split, it will be
         split into smaller pages, where each page is the specified
         percentage of the maximum Btree page size''',
-        min='25', max='100'),
+        min='50', max='100'),
 ]
 
 # File metadata, including both configurable and non-configurable (internal)
@@ -391,12 +401,27 @@ connection_runtime_config = [
             above 0 configures periodic checkpoints''',
             min='0', max='100000'),
         ]),
+    Config('compatibility', '', r'''
+        set compatibility version of database''',
+        type='category', subconfig=[
+        Config('release', '', r'''
+            compatibility release version string'''),
+        ]),
+    Config('diagnostic_timing_stress', '', r'''
+        enable insertion of code that interrupts the usual timing of
+        operations with a goal of uncovering race conditions and unexpected
+        blocking. This option is intended for use with internal stress
+        testing of WiredTiger. Only available if WiredTiger is configured
+        with --enable-diagnostic. Options are given as a list, such as
+        <code>"diagnostic_timing_stress=[checkpoint_slow]"</code>''',
+        type='list', undoc=True, choices=[
+            'checkpoint_slow']),
     Config('error_prefix', '', r'''
         prefix string for error messages'''),
     Config('eviction', '', r'''
         eviction configuration options''',
         type='category', subconfig=[
-            Config('threads_max', '1', r'''
+            Config('threads_max', '8', r'''
                 maximum number of threads WiredTiger will start to help evict
                 pages from cache. The number of threads started will vary
                 depending on the current eviction load. Each eviction worker
@@ -514,10 +539,12 @@ connection_runtime_config = [
             'checkpoint',
             'compact',
             'evict',
+            'evict_stuck',
             'evictserver',
             'fileops',
             'handleops',
             'log',
+            'lookaside_activity',
             'lsm',
             'lsm_manager',
             'metadata',
@@ -527,6 +554,7 @@ connection_runtime_config = [
             'rebalance',
             'reconcile',
             'recovery',
+            'recovery_progress',
             'salvage',
             'shared_cache',
             'split',
@@ -637,6 +665,12 @@ wiredtiger_open_statistics_log_configuration = [
 ]
 
 session_config = [
+    Config('ignore_cache_size', 'false', r'''
+        when set, operations performed by this session ignore the cache size
+        and are not blocked when the cache is full.  Note that use of this
+        option for operations that create cache pressure can starve ordinary
+        sessions that obey the cache size.''',
+        type='boolean'),
     Config('isolation', 'read-committed', r'''
         the default isolation level for operations in this session''',
         choices=['read-uncommitted', 'read-committed', 'snapshot']),
@@ -652,6 +686,11 @@ wiredtiger_open_common =\
         should be used (4KB on Linux systems when direct I/O is configured,
         zero elsewhere)''',
         min='-1', max='1MB'),
+    Config('builtin_extension_config', '', r'''
+        A structure where the keys are the names of builtin extensions and the
+        values are passed to WT_CONNECTION::load_extension as the \c config
+        parameter (for example,
+        <code>builtin_extension_config={zlib={compression_level=3}}</code>)'''),
     Config('checkpoint_sync', 'true', r'''
         flush files to stable storage when closing or writing
         checkpoints''',
@@ -695,7 +734,7 @@ wiredtiger_open_common =\
         ]),
     Config('extensions', '', r'''
         list of shared library extensions to load (using dlopen).
-        Any values specified to an library extension are passed to
+        Any values specified to a library extension are passed to
         WT_CONNECTION::load_extension as the \c config parameter
         (for example,
         <code>extensions=(/path/ext.so={entry=my_entry})</code>)''',
@@ -709,7 +748,7 @@ wiredtiger_open_common =\
     Config('hazard_max', '1000', r'''
         maximum number of simultaneous hazard pointers per session
         handle''',
-        min='15'),
+        min=15, undoc=True),
     Config('mmap', 'true', r'''
         Use memory mapping to access files when possible''',
         type='boolean'),
@@ -816,6 +855,8 @@ methods = {
 
 'WT_CURSOR.reconfigure' : Method(cursor_runtime_config),
 
+'WT_SESSION.alter' : Method(file_runtime_config),
+
 'WT_SESSION.close' : Method([]),
 
 'WT_SESSION.compact' : Method([
@@ -837,9 +878,10 @@ methods = {
 
 'WT_SESSION.drop' : Method([
     Config('checkpoint_wait', 'true', r'''
-        wait for the checkpoint lock, if \c checkpoint_wait=false, perform
-        the drop operation without taking a lock, returning EBUSY if the
-        operation conflicts with a running checkpoint''',
+        wait for concurrent checkpoints to complete before attempting the drop
+        operation. If \c checkpoint_wait=false, attempt the drop operation
+        without waiting, returning EBUSY if the operation conflicts with a
+        running checkpoint''',
         type='boolean', undoc=True),
     Config('force', 'false', r'''
         return success if the object does not exist''',
@@ -1001,7 +1043,8 @@ methods = {
 ]),
 'WT_SESSION.strerror' : Method([]),
 'WT_SESSION.transaction_sync' : Method([
-    Config('timeout_ms', '1200000', r'''
+    Config('timeout_ms', '1200000', # !!! Must match WT_SESSION_BG_SYNC_MSEC
+        r'''
         maximum amount of time to wait for background sync to complete in
         milliseconds.  A value of zero disables the timeout and returns
         immediately''',
@@ -1050,6 +1093,9 @@ methods = {
         priority of the transaction for resolving conflicts.
         Transactions with higher values are less likely to abort''',
         min='-100', max='100'),
+    Config('read_timestamp', '', r'''
+        read using the specified timestamp, see
+        @ref transaction_timestamps'''),
     Config('snapshot', '', r'''
         use a named, in-memory snapshot, see
         @ref transaction_named_snapshots'''),
@@ -1060,6 +1106,9 @@ methods = {
 ]),
 
 'WT_SESSION.commit_transaction' : Method([
+    Config('commit_timestamp', '', r'''
+        set the commit timestamp for the current transaction, see
+        @ref transaction_timestamps'''),
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits,
         inherited from ::wiredtiger_open \c transaction_sync.
@@ -1070,6 +1119,13 @@ methods = {
         \c on setting forces log records to be written to the storage device''',
         choices=['background', 'off', 'on']),
 ]),
+
+'WT_SESSION.timestamp_transaction' : Method([
+    Config('commit_timestamp', '', r'''
+        set the commit timestamp for the current transaction, see
+        @ref transaction_timestamps'''),
+]),
+
 'WT_SESSION.rollback_transaction' : Method([]),
 
 'WT_SESSION.checkpoint' : Method([
@@ -1090,6 +1146,9 @@ methods = {
     Config('name', '', r'''
         if set, specify a name for the checkpoint (note that checkpoints
         including LSM trees may not be named)'''),
+    Config('read_timestamp', '', r'''
+        if set, create the checkpoint as of the specified timestamp''',
+        undoc=True),
     Config('target', '', r'''
         if non-empty, checkpoint the list of objects''', type='list'),
 ]),
@@ -1109,6 +1168,10 @@ methods = {
         Config('to', '', r'''
             drop all snapshots up to and including the specified name'''),
     ]),
+    Config('include_updates', 'false', r'''
+        make updates from the current transaction visible to users of the
+        named snapshot.  Transactions started with such a named snapshot are
+        restricted to being read-only''', type='boolean'),
     Config('name', '', r'''specify a name for the snapshot'''),
 ]),
 
@@ -1172,6 +1235,22 @@ methods = {
 ]),
 
 'WT_CONNECTION.open_session' : Method(session_config),
+
+'WT_CONNECTION.query_timestamp' : Method([
+    Config('get', 'all_committed', r'''
+        specify which timestamp to query: \c all_committed returns the largest
+        timestamp such that all earlier timestamps have committed.  See @ref
+        transaction_timestamps''',
+        choices=['all_committed']),
+    # We also support "oldest_reader" as an internal-only choice.
+]),
+
+'WT_CONNECTION.set_timestamp' : Method([
+    Config('oldest_timestamp', '', r'''
+        future commits and queries will be no earlier than the specified
+        timestamp. Supplied values must be monotonically increasing.
+        see @ref transaction_timestamps'''),
+]),
 
 'WT_SESSION.reconfigure' : Method(session_config),
 

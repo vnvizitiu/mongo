@@ -81,10 +81,24 @@
     assert.commandFailed(
         mongos.adminCommand({shardCollection: kDbName + '.foo', key: {aKey: "hahahashed"}}));
 
-    // Error if a collection is already sharded.
-    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    //
+    // Test shardCollection's idempotency
+    //
 
-    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    // Succeed if a collection is already sharded with the same options.
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}}));
+    // Specifying the simple collation or not specifying a collation should be equivalent, because
+    // if no collation is specified, the collection default collation is used.
+    assert.commandWorked(mongos.adminCommand(
+        {shardCollection: kDbName + '.foo', key: {_id: 1}, collation: {locale: 'simple'}}));
+
+    // Fail if the collection is already sharded with different options.
+    // different shard key
+    assert.commandFailed(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {x: 1}}));
+    // different 'unique'
+    assert.commandFailed(
+        mongos.adminCommand({shardCollection: kDbName + '.foo', key: {_id: 1}, unique: true}));
 
     mongos.getDB(kDbName).dropDatabase();
 
@@ -233,40 +247,86 @@
     assert.commandFailed(mongos.adminCommand(
         {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
 
-    //
-    // Feature compatibility version collation tests.
-    //
-
-    // shardCollection should succeed on an empty collection with a non-simple default collation
-    // if feature compatibility version is 3.4.
+    // shardCollection should succeed on an empty collection with a non-simple default collation.
     mongos.getDB(kDbName).foo.drop();
     assert.commandWorked(
         mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
     assert.commandWorked(mongos.adminCommand(
         {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
 
-    // shardCollection should succeed on an empty collection with no default collation if feature
-    // compatibility version is 3.4.
-    mongos.getDB(kDbName).foo.drop();
-    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
-    assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
-
-    // shardCollection should fail on a collection with a non-simple default collation if feature
-    // compatibility version is 3.2.
-    mongos.getDB(kDbName).foo.drop();
-    assert.commandWorked(
-        mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
-    assert.commandWorked(mongos.adminCommand({setFeatureCompatibilityVersion: "3.2"}));
-    assert.commandFailed(mongos.adminCommand(
-        {shardCollection: kDbName + '.foo', key: {a: 1}, collation: {locale: 'simple'}}));
-
-    // shardCollection should succeed on an empty collection with no default collation if feature
-    // compatibility version is 3.2.
+    // shardCollection should succeed on an empty collection with no default collation.
     mongos.getDB(kDbName).foo.drop();
     assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
     assert.commandWorked(mongos.adminCommand({shardCollection: kDbName + '.foo', key: {a: 1}}));
 
     mongos.getDB(kDbName).dropDatabase();
+
+    //
+    // Tests for the shell helper sh.shardCollection().
+    //
+
+    db = mongos.getDB(kDbName);
+    assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
+
+    // shardCollection() propagates the shard key and the correct defaults.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(sh.shardCollection(kDbName + '.foo', {a: 1}));
+    indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(!indexSpec.hasOwnProperty('unique'), tojson(indexSpec));
+    assert(!indexSpec.hasOwnProperty('collation'), tojson(indexSpec));
+
+    // shardCollection() propagates the value for 'unique'.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(sh.shardCollection(kDbName + '.foo', {a: 1}, true));
+    indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(indexSpec.hasOwnProperty('unique'), tojson(indexSpec));
+    assert.eq(indexSpec.unique, true, tojson(indexSpec));
+
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(sh.shardCollection(kDbName + '.foo', {a: 1}, false));
+    indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(!indexSpec.hasOwnProperty('unique'), tojson(indexSpec));
+
+    // shardCollections() 'options' parameter must be an object.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.throws(function() {
+        sh.shardCollection(kDbName + '.foo', {a: 1}, false, 'not an object');
+    });
+
+    // shardCollection() propagates the value for 'collation'.
+    // Currently only the simple collation is supported.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandFailed(
+        sh.shardCollection(kDbName + '.foo', {a: 1}, false, {collation: {locale: 'en_US'}}));
+    assert.commandWorked(
+        sh.shardCollection(kDbName + '.foo', {a: 1}, false, {collation: {locale: 'simple'}}));
+    indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(!indexSpec.hasOwnProperty('collation'), tojson(indexSpec));
+
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(
+        mongos.getDB(kDbName).createCollection('foo', {collation: {locale: 'en_US'}}));
+    assert.commandFailed(sh.shardCollection(kDbName + '.foo', {a: 1}));
+    assert.commandFailed(
+        sh.shardCollection(kDbName + '.foo', {a: 1}, false, {collation: {locale: 'en_US'}}));
+    assert.commandWorked(
+        sh.shardCollection(kDbName + '.foo', {a: 1}, false, {collation: {locale: 'simple'}}));
+    indexSpec = getIndexSpecByName(mongos.getDB(kDbName).foo, 'a_1');
+    assert(!indexSpec.hasOwnProperty('collation'), tojson(indexSpec));
+
+    // shardCollection() propagates the value for 'numInitialChunks'.
+    mongos.getDB(kDbName).foo.drop();
+    assert.commandWorked(mongos.getDB(kDbName).createCollection('foo'));
+    assert.commandWorked(
+        sh.shardCollection(kDbName + '.foo', {a: "hashed"}, false, {numInitialChunks: 5}));
+    st.printShardingStatus();
+    var numChunks = st.config.chunks.find({ns: kDbName + '.foo'}).count();
+    assert.eq(numChunks, 5, "unexpected number of chunks");
 
     st.stop();
 

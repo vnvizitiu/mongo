@@ -36,14 +36,15 @@
 
 namespace mongo {
 
-ClusterClientCursorMock::ClusterClientCursorMock(stdx::function<void(void)> killCallback)
-    : _killCallback(std::move(killCallback)) {}
+ClusterClientCursorMock::ClusterClientCursorMock(boost::optional<LogicalSessionId> lsid,
+                                                 stdx::function<void(void)> killCallback)
+    : _killCallback(std::move(killCallback)), _lsid(lsid) {}
 
 ClusterClientCursorMock::~ClusterClientCursorMock() {
     invariant(_exhausted || _killed);
 }
 
-StatusWith<ClusterQueryResult> ClusterClientCursorMock::next() {
+StatusWith<ClusterQueryResult> ClusterClientCursorMock::next(OperationContext* opCtx) {
     invariant(!_killed);
 
     if (_resultsQueue.empty()) {
@@ -66,7 +67,7 @@ long long ClusterClientCursorMock::getNumReturnedSoFar() const {
     return _numReturnedSoFar;
 }
 
-void ClusterClientCursorMock::kill() {
+void ClusterClientCursorMock::kill(OperationContext* opCtx) {
     _killed = true;
     if (_killCallback) {
         _killCallback();
@@ -75,6 +76,14 @@ void ClusterClientCursorMock::kill() {
 
 bool ClusterClientCursorMock::isTailable() const {
     return false;
+}
+
+namespace {
+const std::vector<UserName> emptyAuthenticatedUsers{};
+}  // namespace
+
+UserNameIterator ClusterClientCursorMock::getAuthenticatedUsers() const {
+    return makeUserNameIterator(emptyAuthenticatedUsers.begin(), emptyAuthenticatedUsers.end());
 }
 
 void ClusterClientCursorMock::queueResult(const ClusterQueryResult& result) {
@@ -97,9 +106,8 @@ Status ClusterClientCursorMock::setAwaitDataTimeout(Milliseconds awaitDataTimeou
     MONGO_UNREACHABLE;
 }
 
-
-void ClusterClientCursorMock::setOperationContext(OperationContext* txn) {
-    // Do nothing
+boost::optional<LogicalSessionId> ClusterClientCursorMock::getLsid() const {
+    return _lsid;
 }
 
 }  // namespace mongo

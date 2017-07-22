@@ -51,7 +51,7 @@ namespace executor {
 namespace {
 
 using ExecutorFactory =
-    stdx::function<std::unique_ptr<TaskExecutor>(std::unique_ptr<NetworkInterfaceMock>*)>;
+    stdx::function<std::unique_ptr<TaskExecutor>(std::unique_ptr<NetworkInterfaceMock>)>;
 
 class CommonTaskExecutorTestFixture : public TaskExecutorTest {
 public:
@@ -61,7 +61,7 @@ public:
 private:
     std::unique_ptr<TaskExecutor> makeTaskExecutor(
         std::unique_ptr<NetworkInterfaceMock> net) override {
-        return _makeExecutor(&net);
+        return _makeExecutor(std::move(net));
     }
 
     ExecutorFactory _makeExecutor;
@@ -252,8 +252,10 @@ EventChainAndWaitingTest::~EventChainAndWaitingTest() {
 }
 
 void EventChainAndWaitingTest::run() {
-    executor->onEvent(goEvent,
-                      stdx::bind(&EventChainAndWaitingTest::onGo, this, stdx::placeholders::_1));
+    executor
+        ->onEvent(goEvent,
+                  stdx::bind(&EventChainAndWaitingTest::onGo, this, stdx::placeholders::_1))
+        .status_with_transitional_ignore();
     executor->signalEvent(goEvent);
     executor->waitForEvent(goEvent);
     executor->waitForEvent(event2);

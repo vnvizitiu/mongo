@@ -60,44 +60,70 @@ OpTimeWithTerm DataReplicatorExternalStateImpl::getCurrentTermAndLastCommittedOp
     return {_replicationCoordinator->getTerm(), _replicationCoordinator->getLastCommittedOpTime()};
 }
 
-void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata& metadata) {
-    _replicationCoordinator->processReplSetMetadata(metadata);
-    if (metadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary) {
+void DataReplicatorExternalStateImpl::processMetadata(
+    const rpc::ReplSetMetadata& replMetadata, boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
+    OpTime newCommitPoint;
+    // If OplogQueryMetadata was provided, use its values, otherwise use the ones in
+    // ReplSetMetadata.
+    if (oqMetadata) {
+        newCommitPoint = oqMetadata->getLastOpCommitted();
+    } else {
+        newCommitPoint = replMetadata.getLastOpCommitted();
+    }
+    _replicationCoordinator->advanceCommitPoint(newCommitPoint);
+
+    _replicationCoordinator->processReplSetMetadata(replMetadata);
+
+    if ((oqMetadata && (oqMetadata->getPrimaryIndex() != rpc::OplogQueryMetadata::kNoPrimary)) ||
+        (replMetadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary)) {
         _replicationCoordinator->cancelAndRescheduleElectionTimeout();
     }
 }
 
-bool DataReplicatorExternalStateImpl::shouldStopFetching(const HostAndPort& source,
-                                                         const rpc::ReplSetMetadata& metadata) {
+bool DataReplicatorExternalStateImpl::shouldStopFetching(
+    const HostAndPort& source,
+    const rpc::ReplSetMetadata& replMetadata,
+    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
     // Re-evaluate quality of sync target.
-    if (_replicationCoordinator->shouldChangeSyncSource(source, metadata)) {
-        LOG(1) << "Canceling oplog query because we have to choose a sync source. Current source: "
-               << source << ", OpTime " << metadata.getLastOpVisible()
-               << ", its sync source index:" << metadata.getSyncSourceIndex();
+    if (_replicationCoordinator->shouldChangeSyncSource(source, replMetadata, oqMetadata)) {
+        // If OplogQueryMetadata was provided, its values were used to determine if we should
+        // change sync sources.
+        if (oqMetadata) {
+            log() << "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
+                     "sync source. Current source: "
+                  << source << ", OpTime " << oqMetadata->getLastOpApplied()
+                  << ", its sync source index:" << oqMetadata->getSyncSourceIndex();
+
+        } else {
+            log() << "Canceling oplog query due to ReplSetMetadata. We have to choose a new sync "
+                     "source. Current source: "
+                  << source << ", OpTime " << replMetadata.getLastOpVisible()
+                  << ", its sync source index:" << replMetadata.getSyncSourceIndex();
+        }
         return true;
     }
     return false;
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOplogBuffer(
-    OperationContext* txn) const {
-    return _replicationCoordinatorExternalState->makeInitialSyncOplogBuffer(txn);
+    OperationContext* opCtx) const {
+    return _replicationCoordinatorExternalState->makeInitialSyncOplogBuffer(opCtx);
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeSteadyStateOplogBuffer(
-    OperationContext* txn) const {
-    return _replicationCoordinatorExternalState->makeSteadyStateOplogBuffer(txn);
+    OperationContext* opCtx) const {
+    return _replicationCoordinatorExternalState->makeSteadyStateOplogBuffer(opCtx);
 }
 
-StatusWith<ReplicaSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
+StatusWith<ReplSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
     return _replicationCoordinator->getConfig();
 }
 
 StatusWith<OpTime> DataReplicatorExternalStateImpl::_multiApply(
-    OperationContext* txn,
+    OperationContext* opCtx,
     MultiApplier::Operations ops,
     MultiApplier::ApplyOperationFn applyOperation) {
-    return _replicationCoordinatorExternalState->multiApply(txn, std::move(ops), applyOperation);
+    return _replicationCoordinatorExternalState->multiApply(opCtx, std::move(ops), applyOperation);
 }
 
 Status DataReplicatorExternalStateImpl::_multiSyncApply(MultiApplier::OperationPtrs* ops) {

@@ -30,16 +30,22 @@
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/s/catalog/dist_lock_manager_mock.h"
+#include "mongo/s/catalog/sharding_catalog_client_impl.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
@@ -54,17 +60,23 @@ public:
         return &_shardingState;
     }
 
+    std::string shardName() const {
+        return _shardName.toString();
+    }
+
 protected:
     // Used to write to set up local collections before exercising server logic.
     std::unique_ptr<DBDirectClient> _dbDirectClient;
 
     void setUp() override {
+        _shardName = ShardId("a");
+
         serverGlobalParams.clusterRole = ClusterRole::None;
         ShardingMongodTestFixture::setUp();
 
         // When sharding initialization is triggered, initialize sharding state as a shard server.
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        _shardingState.setGlobalInitMethodForTest([&](OperationContext* txn,
+        _shardingState.setGlobalInitMethodForTest([&](OperationContext* opCtx,
                                                       const ConnectionString& configConnStr,
                                                       StringData distLockProcessId) {
             auto status = initializeGlobalShardingStateForMongodForTest(configConnStr);
@@ -76,6 +88,7 @@ protected:
             auto configTargeter =
                 RemoteCommandTargeterMock::get(shardRegistry()->getConfigShard()->getTargeter());
             configTargeter->setConnectionStringReturnValue(configConnStr);
+            configTargeter->setFindHostReturnValue(configConnStr.getServers()[0]);
 
             return Status::OK();
         });
@@ -96,32 +109,60 @@ protected:
         ShardingMongodTestFixture::tearDown();
     }
 
+    std::unique_ptr<DistLockManager> makeDistLockManager(
+        std::unique_ptr<DistLockCatalog> distLockCatalog) override {
+        return stdx::make_unique<DistLockManagerMock>(nullptr);
+    }
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager) override {
+        invariant(distLockManager);
+        return stdx::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
+    }
+
+    std::unique_ptr<CatalogCacheLoader> makeCatalogCacheLoader() {
+        return stdx::make_unique<ShardServerCatalogCacheLoader>(
+            stdx::make_unique<ConfigServerCatalogCacheLoader>());
+    }
+
+    std::unique_ptr<CatalogCache> makeCatalogCache(
+        std::unique_ptr<CatalogCacheLoader> catalogCacheLoader) {
+        invariant(catalogCacheLoader);
+        return stdx::make_unique<CatalogCache>(std::move(catalogCacheLoader));
+    }
+
 private:
     ShardingState _shardingState;
+    ShardId _shardName;
 };
 
 TEST_F(ShardingStateTest, ValidShardIdentitySucceeds) {
+    Lock::GlobalWrite lk(operationContext());
+
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
 
     ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
     ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
+    ASSERT_EQ(shardName(), shardingState()->getShardName());
     ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
 }
 
 TEST_F(ShardingStateTest, InitWhilePreviouslyInErrorStateWillStayInErrorState) {
+    // Must hold a lock to call initializeFromShardIdentity.
+    Lock::GlobalWrite lk(operationContext());
+
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
 
     shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
+        [](OperationContext* opCtx, const ConnectionString& connStr, StringData distLockProcessId) {
             return Status{ErrorCodes::ShutdownInProgress, "shutting down"};
         });
 
@@ -134,7 +175,7 @@ TEST_F(ShardingStateTest, InitWhilePreviouslyInErrorStateWillStayInErrorState) {
     // ShardingState is now in error state, attempting to call it again will still result in error.
 
     shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
+        [](OperationContext* opCtx, const ConnectionString& connStr, StringData distLockProcessId) {
             return Status::OK();
         });
 
@@ -148,11 +189,14 @@ TEST_F(ShardingStateTest, InitWhilePreviouslyInErrorStateWillStayInErrorState) {
 }
 
 TEST_F(ShardingStateTest, InitializeAgainWithMatchingShardIdentitySucceeds) {
+    // Must hold a lock to call initializeFromShardIdentity.
+    Lock::GlobalWrite lk(operationContext());
+
     auto clusterID = OID::gen();
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(clusterID);
 
     ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
@@ -160,27 +204,30 @@ TEST_F(ShardingStateTest, InitializeAgainWithMatchingShardIdentitySucceeds) {
     ShardIdentityType shardIdentity2;
     shardIdentity2.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity2.setShardName("a");
+    shardIdentity2.setShardName(shardName());
     shardIdentity2.setClusterId(clusterID);
 
     shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
+        [](OperationContext* opCtx, const ConnectionString& connStr, StringData distLockProcessId) {
             return Status{ErrorCodes::InternalError, "should not reach here"};
         });
 
     ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity2));
 
     ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
+    ASSERT_EQ(shardName(), shardingState()->getShardName());
     ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
 }
 
 TEST_F(ShardingStateTest, InitializeAgainWithSameReplSetNameSucceeds) {
+    // Must hold a lock to call initializeFromShardIdentity.
+    Lock::GlobalWrite lk(operationContext());
+
     auto clusterID = OID::gen();
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(clusterID);
 
     ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
@@ -188,107 +235,20 @@ TEST_F(ShardingStateTest, InitializeAgainWithSameReplSetNameSucceeds) {
     ShardIdentityType shardIdentity2;
     shardIdentity2.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "b:2,c:3", "config"));
-    shardIdentity2.setShardName("a");
+    shardIdentity2.setShardName(shardName());
     shardIdentity2.setClusterId(clusterID);
 
     shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
+        [](OperationContext* opCtx, const ConnectionString& connStr, StringData distLockProcessId) {
             return Status{ErrorCodes::InternalError, "should not reach here"};
         });
 
     ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity2));
 
     ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
+    ASSERT_EQ(shardName(), shardingState()->getShardName());
     ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
 }
-
-TEST_F(ShardingStateTest, InitializeAgainWithDifferentReplSetNameFails) {
-    auto clusterID = OID::gen();
-    ShardIdentityType shardIdentity;
-    shardIdentity.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
-    shardIdentity.setClusterId(clusterID);
-
-    ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
-
-    ShardIdentityType shardIdentity2;
-    shardIdentity2.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "configRS"));
-    shardIdentity2.setShardName("a");
-    shardIdentity2.setClusterId(clusterID);
-
-    shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
-            return Status{ErrorCodes::InternalError, "should not reach here"};
-        });
-
-    auto status = shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity2);
-    ASSERT_EQ(ErrorCodes::InconsistentShardIdentity, status);
-
-    ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
-    ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
-}
-
-TEST_F(ShardingStateTest, InitializeAgainWithDifferentShardNameFails) {
-    auto clusterID = OID::gen();
-    ShardIdentityType shardIdentity;
-    shardIdentity.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
-    shardIdentity.setClusterId(clusterID);
-
-    ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
-
-    ShardIdentityType shardIdentity2;
-    shardIdentity2.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity2.setShardName("b");
-    shardIdentity2.setClusterId(clusterID);
-
-    shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
-            return Status{ErrorCodes::InternalError, "should not reach here"};
-        });
-
-    auto status = shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity2);
-    ASSERT_EQ(ErrorCodes::InconsistentShardIdentity, status);
-
-    ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
-    ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
-}
-
-TEST_F(ShardingStateTest, InitializeAgainWithDifferentClusterIdFails) {
-    ShardIdentityType shardIdentity;
-    shardIdentity.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
-    shardIdentity.setClusterId(OID::gen());
-
-    ASSERT_OK(shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity));
-
-    ShardIdentityType shardIdentity2;
-    shardIdentity2.setConfigsvrConnString(
-        ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity2.setShardName("a");
-    shardIdentity2.setClusterId(OID::gen());
-
-    shardingState()->setGlobalInitMethodForTest(
-        [](OperationContext* txn, const ConnectionString& connStr, StringData distLockProcessId) {
-            return Status{ErrorCodes::InternalError, "should not reach here"};
-        });
-
-    auto status = shardingState()->initializeFromShardIdentity(operationContext(), shardIdentity2);
-    ASSERT_EQ(ErrorCodes::InconsistentShardIdentity, status);
-
-    ASSERT_TRUE(shardingState()->enabled());
-    ASSERT_EQ("a", shardingState()->getShardName());
-    ASSERT_EQ("config/a:1,b:2", shardingState()->getConfigServer(operationContext()).toString());
-}
-
 
 // The below tests check for compatible startup parameters for --shardsvr, --overrideShardIdentity,
 // and queryableBackup (readOnly) mode.
@@ -327,7 +287,7 @@ TEST_F(ShardingStateTest,
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
     ASSERT_OK(shardIdentity.validate());
     serverGlobalParams.overrideShardIdentity = shardIdentity.toBSON();
@@ -375,7 +335,7 @@ TEST_F(ShardingStateTest,
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
     ASSERT_OK(shardIdentity.validate());
     serverGlobalParams.overrideShardIdentity = shardIdentity.toBSON();
@@ -415,7 +375,7 @@ TEST_F(ShardingStateTest,
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
     ASSERT_OK(shardIdentity.validate());
     serverGlobalParams.overrideShardIdentity = shardIdentity.toBSON();
@@ -449,7 +409,7 @@ TEST_F(ShardingStateTest,
 TEST_F(ShardingStateTest,
        InitializeShardingAwarenessIfNeededNotReadOnlyAndShardServerAndInvalidShardIdentity) {
 
-    replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY);
+    ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Insert the shardIdentity doc to disk before setting the clusterRole, since if the clusterRole
     // is ShardServer, the OpObserver for inserts will prevent the insert from occurring, since the
@@ -459,7 +419,7 @@ TEST_F(ShardingStateTest,
                                         << "shardIdentity"
                                         << "configsvrConnectionString"
                                         << "invalid");
-    _dbDirectClient->insert(NamespaceString::kConfigCollectionNamespace.toString(),
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
                             invalidShardIdentity);
 
     storageGlobalParams.readOnly = false;
@@ -475,7 +435,7 @@ TEST_F(ShardingStateTest,
 TEST_F(ShardingStateTest,
        InitializeShardingAwarenessIfNeededNotReadOnlyAndShardServerAndValidShardIdentity) {
 
-    replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY);
+    ASSERT_OK(replicationCoordinator()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
     // Insert the shardIdentity doc to disk before setting the clusterRole, since if the clusterRole
     // is ShardServer, the OpObserver for inserts will trigger sharding initialization from the
@@ -485,12 +445,12 @@ TEST_F(ShardingStateTest,
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
     ASSERT_OK(shardIdentity.validate());
     BSONObj validShardIdentity = shardIdentity.toBSON();
 
-    _dbDirectClient->insert(NamespaceString::kConfigCollectionNamespace.toString(),
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
                             validShardIdentity);
 
     storageGlobalParams.readOnly = false;
@@ -518,7 +478,7 @@ TEST_F(ShardingStateTest,
 
 TEST_F(ShardingStateTest,
        InitializeShardingAwarenessIfNeededNotReadOnlyAndNotShardServerAndInvalidShardIdentity) {
-    _dbDirectClient->insert(NamespaceString::kConfigCollectionNamespace.toString(),
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
                             BSON("_id"
                                  << "shardIdentity"
                                  << "configsvrConnectionString"
@@ -545,12 +505,12 @@ TEST_F(ShardingStateTest,
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
         ConnectionString(ConnectionString::SET, "a:1,b:2", "config"));
-    shardIdentity.setShardName("a");
+    shardIdentity.setShardName(shardName());
     shardIdentity.setClusterId(OID::gen());
     ASSERT_OK(shardIdentity.validate());
     BSONObj validShardIdentity = shardIdentity.toBSON();
 
-    _dbDirectClient->insert(NamespaceString::kConfigCollectionNamespace.toString(),
+    _dbDirectClient->insert(NamespaceString::kServerConfigurationNamespace.toString(),
                             validShardIdentity);
 
     // The shardIdentity doc on disk is ignored if ClusterRole is None.

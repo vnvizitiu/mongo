@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <utility>
@@ -100,16 +101,6 @@ public:
     virtual ~MultiApplier();
 
     /**
-     * Returns diagnostic information.
-     */
-    std::string getDiagnosticString() const;
-
-    /**
-     * Returns an informational string.
-     */
-    std::string toString() const;
-
-    /**
      * Returns true if the applier has been started (but has not completed).
      */
     bool isActive() const;
@@ -117,7 +108,7 @@ public:
     /**
      * Starts applier by scheduling initial db work to be run by the executor.
      */
-    Status startup();
+    Status startup() noexcept;
 
     /**
      * Cancels current db work request.
@@ -133,7 +124,23 @@ public:
      */
     void join();
 
+    // State transitions:
+    // PreStart --> Running --> ShuttingDown --> Complete
+    // It is possible to skip intermediate states. For example,
+    // Calling shutdown() when the cloner has not started will transition from PreStart directly
+    // to Complete.
+    // This enum class is made public for testing.
+    enum class State { kPreStart, kRunning, kShuttingDown, kComplete };
+
+    /**
+     * Returns current MultiApplier state.
+     * For testing only.
+     */
+    State getState_forTest() const;
+
 private:
+    bool _isActive_inlock() const;
+
     /**
      * DB worker callback function - applies all operations.
      */
@@ -153,11 +160,17 @@ private:
 
     stdx::condition_variable _condition;
 
-    // _active is true when MultiApplier is scheduled to be run by the executor.
-    bool _active;
+    // Current multi applier state. See comments for State enum class for details.
+    State _state = State::kPreStart;
 
     executor::TaskExecutor::CallbackHandle _dbWorkCallbackHandle;
 };
+
+/**
+ * Insertion operator for MultiApplier::State. Formats fetcher state for output stream.
+ * For testing only.
+ */
+std::ostream& operator<<(std::ostream& os, const MultiApplier::State& state);
 
 }  // namespace repl
 }  // namespace mongo

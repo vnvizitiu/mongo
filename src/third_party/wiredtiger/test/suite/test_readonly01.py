@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
-# Public Domain 2016-2016 MongoDB, Inc.
-# Public Domain 2008-2016 WiredTiger, Inc.
+# Public Domain 2014-2017 MongoDB, Inc.
+# Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
 #
@@ -75,8 +75,7 @@ class test_readonly01(wttest.WiredTigerTestCase, suite_subprocess):
 
     scenarios = make_scenarios(basecfg_list, dir_list, log_list, types)
 
-    def conn_config(self, dir):
-        self.home = dir
+    def conn_config(self):
         params = \
             'error_prefix="%s",' % self.shortid() + \
             '%s' % self.logcfg + \

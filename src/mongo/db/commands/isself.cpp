@@ -39,9 +39,9 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class IsSelfCommand : public Command {
+class IsSelfCommand : public BasicCommand {
 public:
-    IsSelfCommand() : Command("_isSelf") {}
+    IsSelfCommand() : BasicCommand("_isSelf") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -54,11 +54,9 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         result.append("id", repl::instanceId);
         return true;

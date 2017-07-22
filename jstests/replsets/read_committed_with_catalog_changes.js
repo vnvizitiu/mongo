@@ -68,6 +68,10 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
         dropDB: {
             prepare: function(db) {
                 assert.writeOK(db.coll.insert({_id: 1}));
+                // Drop collection explicitly during the preparation phase while we are still able
+                // to write to a majority. Otherwise, dropDatabase() will drop the collection
+                // and wait for the collection drop to be replicated to a majority of the nodes.
+                assert(db.coll.drop());
             },
             performOp: function(db) {
                 assert.commandWorked(db.dropDatabase());
@@ -90,6 +94,10 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
         dropAndRecreateDB: {
             prepare: function(db) {
                 assert.writeOK(db.coll.insert({_id: 1}));
+                // Drop collection explicitly during the preparation phase while we are still able
+                // to write to a majority. Otherwise, dropDatabase() will drop the collection
+                // and wait for the collection drop to be replicated to a majority of the nodes.
+                assert(db.coll.drop());
             },
             performOp: function(db) {
                 assert.commandWorked(db.dropDatabase());
@@ -214,7 +222,7 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
                                      "Expected read of " + coll.getFullName() + " to block");
     }
 
-    function assertReadsSucceed(coll, timeoutMs = 10000) {
+    function assertReadsSucceed(coll, timeoutMs = 20000) {
         var res =
             coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": timeoutMs});
         assert.commandWorked(res, 'reading from ' + coll.getFullName());
@@ -241,7 +249,7 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
             {"_id": 2, "host": nodes[2], arbiterOnly: true}
         ]
     };
-    updateConfigIfNotDurable(config);
+
     replTest.initiate(config);
 
     // Get connections.

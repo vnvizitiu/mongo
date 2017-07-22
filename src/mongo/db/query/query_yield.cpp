@@ -25,7 +25,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/query_yield.h"
@@ -45,23 +44,18 @@ MONGO_FP_DECLARE(setYieldAllLocksWait);
 }  // namespace
 
 // static
-void QueryYield::yieldAllLocks(OperationContext* txn,
-                               RecordFetcher* fetcher,
-                               const std::string& planExecNS) {
+void QueryYield::yieldAllLocks(OperationContext* opCtx,
+                               stdx::function<void()> whileYieldingFn,
+                               const NamespaceString& planExecNS) {
     // Things have to happen here in a specific order:
-    //   1) Tell the RecordFetcher to do any setup which needs to happen inside locks
-    //   2) Release lock mgr locks
-    //   3) Go to sleep
-    //   4) Touch the record we're yielding on, if there is one (RecordFetcher::fetch)
-    //   5) Reacquire lock mgr locks
+    //   * Release lock mgr locks
+    //   * Go to sleep
+    //   * Call the whileYieldingFn
+    //   * Reacquire lock mgr locks
 
-    Locker* locker = txn->lockState();
+    Locker* locker = opCtx->lockState();
 
     Locker::LockSnapshot snapshot;
-
-    if (fetcher) {
-        fetcher->setup();
-    }
 
     // Nothing was unlocked, just return, yielding is pointless.
     if (!locker->saveLockStateAndUnlock(&snapshot)) {
@@ -70,7 +64,10 @@ void QueryYield::yieldAllLocks(OperationContext* txn,
 
     // Top-level locks are freed, release any potential low-level (storage engine-specific
     // locks). If we are yielding, we are at a safe place to do so.
-    txn->recoveryUnit()->abandonSnapshot();
+    opCtx->recoveryUnit()->abandonSnapshot();
+
+    // Track the number of yields in CurOp.
+    CurOp::get(opCtx)->yielded();
 
     MONGO_FAIL_POINT_PAUSE_WHILE_SET(setYieldAllLocksHang);
 
@@ -82,11 +79,8 @@ void QueryYield::yieldAllLocks(OperationContext* txn,
         }
     }
 
-    // Track the number of yields in CurOp.
-    CurOp::get(txn)->yielded();
-
-    if (fetcher) {
-        fetcher->fetch();
+    if (whileYieldingFn) {
+        whileYieldingFn();
     }
 
     locker->restoreLockState(snapshot);

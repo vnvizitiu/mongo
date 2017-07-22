@@ -76,9 +76,11 @@ public:
             if (ret == 0 && fs_stats.f_type == EXT4_SUPER_MAGIC) {
                 log() << startupWarningsLog;
                 log() << "** WARNING: Using the XFS filesystem is strongly recommended with the "
-                         "WiredTiger storage engine";
-                log() << "See "
-                         "http://dochub.mongodb.org/core/prodnotes-filesystem";
+                         "WiredTiger storage engine"
+                      << startupWarningsLog;
+                log() << "**          See "
+                         "http://dochub.mongodb.org/core/prodnotes-filesystem"
+                      << startupWarningsLog;
             }
         }
 #endif
@@ -134,6 +136,19 @@ public:
             return status;
         }
 
+        // If the 'groupCollections' field does not exist in the 'storage.bson' file, the
+        // data-format of existing tables is as if 'groupCollections' is false. Passing this in
+        // prevents validation from accepting 'params.groupCollections' being true when a "group
+        // collections" aware mongod is launched on an 3.4- dbpath.
+        const bool kDefaultGroupCollections = false;
+        status =
+            metadata.validateStorageEngineOption("groupCollections",
+                                                 params.groupCollections,
+                                                 boost::optional<bool>(kDefaultGroupCollections));
+        if (!status.isOK()) {
+            return status;
+        }
+
         return Status::OK();
     }
 
@@ -141,6 +156,7 @@ public:
         BSONObjBuilder builder;
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
+        builder.appendBool("groupCollections", params.groupCollections);
         return builder.obj();
     }
 

@@ -41,7 +41,7 @@
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/ops/update_driver.h"
+#include "mongo/db/update/update_driver.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/map_util.h"
@@ -107,7 +107,7 @@ AuthzManagerExternalStateMock::makeAuthzSessionExternalState(AuthorizationManage
     return stdx::make_unique<AuthzSessionExternalStateMock>(authzManager);
 }
 
-Status AuthzManagerExternalStateMock::findOne(OperationContext* txn,
+Status AuthzManagerExternalStateMock::findOne(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
                                               const BSONObj& query,
                                               BSONObj* result) {
@@ -120,7 +120,7 @@ Status AuthzManagerExternalStateMock::findOne(OperationContext* txn,
 }
 
 Status AuthzManagerExternalStateMock::query(
-    OperationContext* txn,
+    OperationContext* opCtx,
     const NamespaceString& collectionName,
     const BSONObj& query,
     const BSONObj&,
@@ -142,7 +142,7 @@ Status AuthzManagerExternalStateMock::query(
     return status;
 }
 
-Status AuthzManagerExternalStateMock::insert(OperationContext* txn,
+Status AuthzManagerExternalStateMock::insert(OperationContext* opCtx,
                                              const NamespaceString& collectionName,
                                              const BSONObj& document,
                                              const BSONObj&) {
@@ -158,19 +158,19 @@ Status AuthzManagerExternalStateMock::insert(OperationContext* txn,
     _documents[collectionName].push_back(toInsert);
 
     if (_authzManager) {
-        _authzManager->logOp(txn, "i", collectionName.ns().c_str(), toInsert, NULL);
+        _authzManager->logOp(opCtx, "i", collectionName, toInsert, NULL);
     }
 
     return Status::OK();
 }
 
-Status AuthzManagerExternalStateMock::insertPrivilegeDocument(OperationContext* txn,
+Status AuthzManagerExternalStateMock::insertPrivilegeDocument(OperationContext* opCtx,
                                                               const BSONObj& userObj,
                                                               const BSONObj& writeConcern) {
-    return insert(txn, AuthorizationManager::usersCollectionNamespace, userObj, writeConcern);
+    return insert(opCtx, AuthorizationManager::usersCollectionNamespace, userObj, writeConcern);
 }
 
-Status AuthzManagerExternalStateMock::updateOne(OperationContext* txn,
+Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
                                                 const NamespaceString& collectionName,
                                                 const BSONObj& query,
                                                 const BSONObj& updatePattern,
@@ -179,7 +179,8 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* txn,
     namespace mmb = mutablebson;
     UpdateDriver::Options updateOptions;
     UpdateDriver driver(updateOptions);
-    Status status = driver.parse(updatePattern);
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    Status status = driver.parse(updatePattern, arrayFilters);
     if (!status.isOK())
         return status;
 
@@ -188,8 +189,16 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* txn,
     mmb::Document document;
     if (status.isOK()) {
         document.reset(*iter, mmb::Document::kInPlaceDisabled);
+        const BSONObj emptyOriginal;
+        const bool validateForStorage = false;
+        const FieldRefSet emptyImmutablePaths;
         BSONObj logObj;
-        status = driver.update(StringData(), &document, &logObj);
+        status = driver.update(StringData(),
+                               emptyOriginal,
+                               &document,
+                               validateForStorage,
+                               emptyImmutablePaths,
+                               &logObj);
         if (!status.isOK())
             return status;
         BSONObj newObj = document.getObject().copy();
@@ -197,29 +206,39 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* txn,
         BSONObj idQuery = driver.makeOplogEntryQuery(newObj, false);
 
         if (_authzManager) {
-            _authzManager->logOp(txn, "u", collectionName.ns().c_str(), logObj, &idQuery);
+            _authzManager->logOp(opCtx, "u", collectionName, logObj, &idQuery);
         }
 
         return Status::OK();
     } else if (status == ErrorCodes::NoMatchingDocument && upsert) {
         if (query.hasField("_id")) {
-            document.root().appendElement(query["_id"]);
+            document.root().appendElement(query["_id"]).transitional_ignore();
         }
-        status = driver.populateDocumentWithQueryFields(txn, query, NULL, document);
+        const FieldRef idFieldRef("_id");
+        FieldRefSet immutablePaths;
+        invariant(immutablePaths.insert(&idFieldRef));
+        status = driver.populateDocumentWithQueryFields(opCtx, query, immutablePaths, document);
         if (!status.isOK()) {
             return status;
         }
-        status = driver.update(StringData(), &document);
+
+        // The original document can be empty because it is only needed for validation of immutable
+        // paths.
+        const BSONObj emptyOriginal;
+        const bool validateForStorage = false;
+        const FieldRefSet emptyImmutablePaths;
+        status = driver.update(
+            StringData(), emptyOriginal, &document, validateForStorage, emptyImmutablePaths);
         if (!status.isOK()) {
             return status;
         }
-        return insert(txn, collectionName, document.getObject(), writeConcern);
+        return insert(opCtx, collectionName, document.getObject(), writeConcern);
     } else {
         return status;
     }
 }
 
-Status AuthzManagerExternalStateMock::update(OperationContext* txn,
+Status AuthzManagerExternalStateMock::update(OperationContext* opCtx,
                                              const NamespaceString& collectionName,
                                              const BSONObj& query,
                                              const BSONObj& updatePattern,
@@ -231,7 +250,7 @@ Status AuthzManagerExternalStateMock::update(OperationContext* txn,
                   "AuthzManagerExternalStateMock::update not implemented in mock.");
 }
 
-Status AuthzManagerExternalStateMock::remove(OperationContext* txn,
+Status AuthzManagerExternalStateMock::remove(OperationContext* opCtx,
                                              const NamespaceString& collectionName,
                                              const BSONObj& query,
                                              const BSONObj&,
@@ -244,7 +263,7 @@ Status AuthzManagerExternalStateMock::remove(OperationContext* txn,
         ++n;
 
         if (_authzManager) {
-            _authzManager->logOp(txn, "d", collectionName.ns().c_str(), idQuery, NULL);
+            _authzManager->logOp(opCtx, "d", collectionName, idQuery, NULL);
         }
     }
     *numRemoved = n;

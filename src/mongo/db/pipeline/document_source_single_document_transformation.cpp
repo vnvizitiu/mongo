@@ -70,12 +70,13 @@ intrusive_ptr<DocumentSource> DocumentSourceSingleDocumentTransformation::optimi
     return this;
 }
 
-void DocumentSourceSingleDocumentTransformation::dispose() {
+void DocumentSourceSingleDocumentTransformation::doDispose() {
     _parsedTransform.reset();
 }
 
-Value DocumentSourceSingleDocumentTransformation::serialize(bool explain) const {
-    return Value(Document{{getSourceName(), _parsedTransform->serialize(explain)}});
+Value DocumentSourceSingleDocumentTransformation::serialize(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
+    return Value(Document{{getSourceName(), _parsedTransform->serializeStageOptions(explain)}});
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceSingleDocumentTransformation::doOptimizeAt(
@@ -96,10 +97,6 @@ DocumentSource::GetDepsReturn DocumentSourceSingleDocumentTransformation::getDep
     // Each parsed transformation is responsible for adding its own dependencies, and returning
     // the correct dependency return type for that transformation.
     return _parsedTransform->addDependencies(deps);
-}
-
-void DocumentSourceSingleDocumentTransformation::doInjectExpressionContext() {
-    _parsedTransform->injectExpressionContext(pExpCtx);
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceSingleDocumentTransformation::getModifiedPaths()

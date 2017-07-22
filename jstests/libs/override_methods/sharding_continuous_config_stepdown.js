@@ -40,9 +40,10 @@ function retryOnNetworkError(func) {
     var originalReplSetTest = ReplSetTest;
     var originalShardingTest = ShardingTest;
 
+    const stepdownDelaySeconds = 10;
     const verbositySetting =
         "{ verbosity: 0, command: {verbosity: 1}, network: {verbosity: 1, asio: {verbosity: 2}}, \
-tracking: {verbosity: 1} }";
+tracking: {verbosity: 0} }";
 
     /**
      * Overrides the ReplSetTest constructor to start the continuous config server stepdown
@@ -60,18 +61,19 @@ tracking: {verbosity: 1} }";
          *      primary of the replica set.
          * @param {CountDownLatch} stopCounter Object, which can be used to stop the thread.
          *
+         * @param {integer} stepdownDelaySeconds The number of seconds after stepping down the
+         *      primary for which the node is not re-electable.
+         *
          * @return Object with the following fields:
          *      ok {integer}: 0 if it failed, 1 if it succeeded.
          *      error {string}: Only present if ok == 0. Contains the cause for the error.
          *      stack {string}: Only present if ok == 0. Contains the stack at the time of the
          *          error.
          */
-        function _continuousPrimaryStepdownFn(seedNode, stopCounter) {
+        function _continuousPrimaryStepdownFn(seedNode, stopCounter, stepdownDelaySeconds) {
             'use strict';
 
             load('jstests/libs/override_methods/sharding_continuous_config_stepdown.js');
-
-            var stepdownDelaySeconds = 10;
 
             print('*** Continuous stepdown thread running with seed node ' + seedNode);
 
@@ -169,11 +171,26 @@ tracking: {verbosity: 1} }";
                 throw new Error('Continuous failover thread is already active');
             }
 
+            // This suite will step down the config primary every 10 seconds, and
+            // electionTimeoutMillis defaults to 10 seconds. Set electionTimeoutMillis to 5 seconds,
+            // so config operations have some time to run before being interrupted by stepdown.
+            //
+            // Note: this is done after ShardingTest runs because ShardingTest operations are not
+            // resilient to stepdowns, which a shorter election timeout can cause to happen on
+            // slow machines.
+            var rsconfig = this.getReplSetConfigFromNode();
+            rsconfig.settings.electionTimeoutMillis = stepdownDelaySeconds * 1000 / 2;
+            rsconfig.version++;
+            reconfig(this, rsconfig);
+            assert.eq(this.getReplSetConfigFromNode().settings.electionTimeoutMillis,
+                      5000,
+                      "Failed to lower the electionTimeoutMillis to 5000 milliseconds.");
+
             _scopedPrimaryStepdownThreadStopCounter = new CountDownLatch(1);
-            _scopedPrimaryStepdownThread =
-                new ScopedThread(_continuousPrimaryStepdownFn,
-                                 this.nodes[0].host,
-                                 _scopedPrimaryStepdownThreadStopCounter);
+            _scopedPrimaryStepdownThread = new ScopedThread(_continuousPrimaryStepdownFn,
+                                                            this.nodes[0].host,
+                                                            _scopedPrimaryStepdownThreadStopCounter,
+                                                            stepdownDelaySeconds);
             _scopedPrimaryStepdownThread.start();
         };
 
@@ -220,15 +237,6 @@ tracking: {verbosity: 1} }";
             arguments[0].other.setParameter = {logComponentVerbosity: verbositySetting};
         }
 
-        // Set electionTimeoutMillis to 5 seconds, from 10, so that chunk migrations don't
-        // time out because of the CSRS primary being down so often for so long.
-        arguments[0].configReplSetTestOptions =
-            Object.merge(arguments[0].configReplSetTestOptions, {
-                settings: {
-                    electionTimeoutMillis: 5000,
-                },
-            });
-
         // Construct the original object
         originalShardingTest.apply(this, arguments);
 
@@ -244,14 +252,59 @@ tracking: {verbosity: 1} }";
 
         };
 
-        assert.eq(this.configRS.getReplSetConfigFromNode().settings.electionTimeoutMillis,
-                  5000,
-                  "Failed to set the electionTimeoutMillis to 5000 milliseconds");
-
         // Start the continuous config server stepdown thread
         this.configRS.startContinuousFailover();
     };
 
     Object.extend(ShardingTest, originalShardingTest);
+
+    /**
+     * If the config primary steps down during a metadata command, mongos will internally retry the
+     * command. On the retry, the command may fail with the error "ManualInterventionRequired" if
+     * the earlier try left the config database in an inconsistent state.
+     *
+     * This override allows for automating the manual cleanup by catching the
+     * "ManualInterventionRequired" error, performing the cleanup, and transparently retrying the
+     * command.
+     */
+    (function(original) {
+        Mongo.prototype.runCommand = function runCommand(dbName, cmdObj, options) {
+            const cmdName = Object.keys(cmdObj)[0];
+            const commandsToRetry = new Set(["shardCollection", "shardcollection"]);
+
+            if (!commandsToRetry.has(cmdName)) {
+                return original.apply(this, arguments);
+            }
+
+            const maxAttempts = 10;
+            let numAttempts = 0;
+            let res;
+
+            while (numAttempts < maxAttempts) {
+                res = original.apply(this, arguments);
+                ++numAttempts;
+
+                if (res.ok === 1 || res.code !== ErrorCodes.ManualInterventionRequired ||
+                    numAttempts === maxAttempts) {
+                    break;
+                }
+
+                if (cmdName === "shardCollection" || cmdName === "shardcollection") {
+                    const ns = cmdObj[cmdName];
+
+                    print(
+                        "shardCollection command " + tojson(cmdObj) + " failed after " +
+                        numAttempts +
+                        " attempts due to partially written chunks. Manually deleting chunks for " +
+                        ns + " from config.chunks and retrying the shardCollection command.");
+
+                    // Remove the partially written chunks.
+                    assert.writeOK(this.getDB("config").chunks.remove(
+                        {ns: ns}, {writeConcern: {w: "majority"}}));
+                }
+            }
+            return res;
+        };
+    })(Mongo.prototype.runCommand);
 
 })();

@@ -39,7 +39,6 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace rpc {
 
 void ShardingEgressMetadataHookForMongos::_saveGLEStats(const BSONObj& metadata,
@@ -73,7 +72,7 @@ void ShardingEgressMetadataHookForMongos::_saveGLEStats(const BSONObj& metadata,
            << " electionId:" << shardingMetadata.getLastElectionId();
 
     ClusterLastErrorInfo::get(clientInfo)
-        .addHostOpTime(
+        ->addHostOpTime(
             shardConn.getValue(),
             HostOpTime(shardingMetadata.getLastOpTime(), shardingMetadata.getLastElectionId()));
 }

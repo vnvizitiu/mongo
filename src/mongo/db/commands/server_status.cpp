@@ -64,9 +64,9 @@ using std::map;
 using std::string;
 using std::stringstream;
 
-class CmdServerStatus : public Command {
+class CmdServerStatus : public BasicCommand {
 public:
-    CmdServerStatus() : Command("serverStatus", true), _started(Date_t::now()), _runCalled(false) {}
+    CmdServerStatus() : BasicCommand("serverStatus"), _started(Date_t::now()), _runCalled(false) {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -85,15 +85,13 @@ public:
         actions.addAction(ActionType::serverStatus);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         _runCalled = true;
 
-        const auto service = txn->getServiceContext();
+        const auto service = opCtx->getServiceContext();
         const auto clock = service->getFastClockSource();
         const auto runStart = clock->now();
         BSONObjBuilder timeBuilder(256);
@@ -117,7 +115,7 @@ public:
 
         // --- all sections
 
-        for (SectionMap::const_iterator i = _sections->begin(); i != _sections->end(); ++i) {
+        for (SectionMap::const_iterator i = _sections.begin(); i != _sections.end(); ++i) {
             ServerStatusSection* section = i->second;
 
             std::vector<Privilege> requiredPrivileges;
@@ -135,7 +133,7 @@ public:
                 continue;
             }
 
-            section->appendSection(txn, elem, &result);
+            section->appendSection(opCtx, elem, &result);
             timeBuilder.appendNumber(
                 static_cast<string>(str::stream() << "after " << section->getSectionName()),
                 durationCount<Milliseconds>(clock->now() - runStart));
@@ -176,10 +174,7 @@ public:
 
     void addSection(ServerStatusSection* section) {
         verify(!_runCalled);
-        if (_sections == 0) {
-            _sections = new SectionMap();
-        }
-        (*_sections)[section->getSectionName()] = section;
+        _sections[section->getSectionName()] = section;
     }
 
 private:
@@ -187,21 +182,36 @@ private:
     bool _runCalled;
 
     typedef map<string, ServerStatusSection*> SectionMap;
-    static SectionMap* _sections;
-} cmdServerStatus;
+    SectionMap _sections;
+};
 
+namespace {
 
-CmdServerStatus::SectionMap* CmdServerStatus::_sections = 0;
+// This widget ensures that the serverStatus command is registered even if no
+// server status sections are registered.
+
+const struct CmdServerStatusInstantiator {
+    explicit CmdServerStatusInstantiator() {
+        getInstance();
+    }
+
+    static CmdServerStatus& getInstance() {
+        static CmdServerStatus instance;
+        return instance;
+    }
+} kDoNotMentionThisVariable;
+
+}  // namespace
 
 ServerStatusSection::ServerStatusSection(const string& sectionName) : _sectionName(sectionName) {
-    cmdServerStatus.addSection(this);
+    CmdServerStatusInstantiator::getInstance().addSection(this);
 }
 
 OpCounterServerStatusSection::OpCounterServerStatusSection(const string& sectionName,
                                                            OpCounters* counters)
     : ServerStatusSection(sectionName), _counters(counters) {}
 
-BSONObj OpCounterServerStatusSection::generateSection(OperationContext* txn,
+BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
                                                       const BSONElement& configElement) const {
     return _counters->getObj();
 }
@@ -220,9 +230,12 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObjBuilder bb;
-        auto stats = txn->getServiceContext()->getTransportLayer()->sessionStats();
+        if (!opCtx->getServiceContext()->getTransportLayer()) {
+            return bb.obj();
+        }
+        auto stats = opCtx->getServiceContext()->getTransportLayer()->sessionStats();
         bb.append("current", static_cast<int>(stats.numOpenSessions));
         bb.append("available", static_cast<int>(stats.numAvailableSessions));
         bb.append("totalCreated", static_cast<int>(stats.numCreatedSessions));
@@ -238,7 +251,7 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObjBuilder bb;
 
         bb.append("note", "fields vary by platform");
@@ -258,7 +271,7 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObjBuilder asserts;
         asserts.append("regular", assertionCount.regular);
         asserts.append("warning", assertionCount.warning);
@@ -278,10 +291,14 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObjBuilder b;
         networkCounter.append(b);
         appendMessageCompressionStats(&b);
+        auto executor = opCtx->getServiceContext()->getServiceExecutor();
+        if (executor)
+            executor->appendStats(&b);
+
         return b.obj();
     }
 
@@ -295,7 +312,7 @@ public:
         return true;
     }
 
-    BSONObj generateSection(OperationContext* txn, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
         BSONObj result;
         if (getSSLManager()) {
             result = getSSLManager()->getSSLConfiguration().getServerStatusBSON();
@@ -334,7 +351,7 @@ public:
         return false;
     }
 
-    void appendSection(OperationContext* txn,
+    void appendSection(OperationContext* opCtx,
                        const BSONElement& configElement,
                        BSONObjBuilder* out) const override {
         out->append(

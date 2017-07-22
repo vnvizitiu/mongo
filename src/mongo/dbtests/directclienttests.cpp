@@ -39,6 +39,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/timer.h"
 
 namespace DirectClientTests {
@@ -61,9 +62,9 @@ const char* ns = "a.b";
 class Capped : public ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
         for (int pass = 0; pass < 3; pass++) {
             client.createCollection(ns, 1024 * 1024, true, 999);
             for (int j = 0; j < pass * 3; j++)
@@ -92,9 +93,9 @@ public:
 class InsertMany : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         vector<BSONObj> objs;
         objs.push_back(BSON("_id" << 1));
@@ -117,23 +118,24 @@ public:
 class BadNSCmd : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         BSONObj result;
         BSONObj cmdObj = BSON("count"
                               << "");
-        ASSERT_THROWS(client.runCommand("", cmdObj, result), UserException);
+        ASSERT(!client.runCommand("", cmdObj, result)) << result;
+        ASSERT_EQ(getStatusFromCommandResult(result), ErrorCodes::InvalidNamespace);
     }
 };
 
 class BadNSQuery : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         unique_ptr<DBClientCursor> cursor = client.query("", Query(), 1);
         ASSERT(cursor->more());
@@ -146,9 +148,9 @@ public:
 class BadNSGetMore : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         unique_ptr<DBClientCursor> cursor = client.getMore("", 1, 1);
         ASSERT(cursor->more());
@@ -161,9 +163,9 @@ public:
 class BadNSInsert : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.insert("", BSONObj(), 0);
         ASSERT(!client.getLastError().empty());
@@ -173,9 +175,9 @@ public:
 class BadNSUpdate : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.update("", Query(), BSON("$set" << BSON("x" << 1)));
         ASSERT(!client.getLastError().empty());
@@ -185,9 +187,9 @@ public:
 class BadNSRemove : ClientBase {
 public:
     virtual void run() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.remove("", Query());
         ASSERT(!client.getLastError().empty());
@@ -210,4 +212,4 @@ public:
 };
 
 SuiteInstance<All> myall;
-}
+}  // namespace DirectClientTests

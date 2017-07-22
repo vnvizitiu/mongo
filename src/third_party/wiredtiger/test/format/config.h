@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2016 MongoDB, Inc.
+ * Public Domain 2014-2017 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -65,6 +65,10 @@ static CONFIG c[] = {
 	  "if timed run should drop core",			/* 0% */
 	  C_BOOL, 0, 0, 0, &g.c_abort, NULL },
 
+	{ "alter",
+	  "if altering the table is enabled",			/* 10% */
+	  C_BOOL, 10, 0, 0, &g.c_alter, NULL },
+
 	{ "auto_throttle",
 	  "if LSM inserts are throttled",			/* 90% */
 	  C_BOOL, 90, 0, 0, &g.c_auto_throttle, NULL },
@@ -113,6 +117,10 @@ static CONFIG c[] = {
 	  "if compaction is running",				/* 10% */
 	  C_BOOL, 10, 0, 0, &g.c_compact, NULL },
 
+	{ "compatibility",
+	  "log file compatibility (none | v1 | v2 )",
+	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_compat },
+
 	{ "compression",
 	  "type of compression " COMPRESSION_LIST,
 	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_compression },
@@ -127,7 +135,7 @@ static CONFIG c[] = {
 
 	{ "delete_pct",
 	  "percent operations that are deletes",
-	  0x0, 0, 45, 90, &g.c_delete_pct, NULL },
+	  C_IGNORE, 0, 0, 100, &g.c_delete_pct, NULL },
 
 	{ "dictionary",
 	  "if values are dictionary compressed",		/* 20% */
@@ -167,7 +175,7 @@ static CONFIG c[] = {
 
 	{ "insert_pct",
 	  "percent operations that are inserts",
-	  0x0, 0, 45, 90, &g.c_insert_pct, NULL },
+	  C_IGNORE, 0, 0, 100, &g.c_insert_pct, NULL },
 
 	{ "internal_key_truncation",
 	  "if internal keys are truncated",			/* 95% */
@@ -234,6 +242,10 @@ static CONFIG c[] = {
 	  "configure for mmap operations",			/* 90% */
 	  C_BOOL, 90, 0, 0, &g.c_mmap, NULL },
 
+	{ "modify_pct",
+	  "percent operations that are value modifications",
+	  C_IGNORE, 0, 0, 100, &g.c_modify_pct, NULL },
+
 	{ "ops",
 	  "the number of modification operations done per run",
 	  0x0, 0, M(2), M(100), &g.c_ops, NULL },
@@ -249,6 +261,14 @@ static CONFIG c[] = {
 	{ "quiet",
 	  "quiet run (same as -q)",
 	  C_IGNORE|C_BOOL, 0, 0, 0, &g.c_quiet, NULL },
+
+	{ "read_pct",
+	  "percent operations that are reads",
+	  C_IGNORE, 0, 0, 100, &g.c_read_pct, NULL },
+
+	{ "rebalance",
+	  "rebalance testing",					/* 100% */
+	  C_BOOL, 100, 1, 0, &g.c_rebalance, NULL },
 
 	{ "repeat_data_pct",
 	  "percent duplicate values in row- or var-length column-stores",
@@ -266,17 +286,13 @@ static CONFIG c[] = {
 	  "the number of runs",
 	  C_IGNORE, 0, UINT_MAX, UINT_MAX, &g.c_runs, NULL },
 
-	{ "rebalance",
-	  "rebalance testing",					/* 100% */
-	  C_BOOL, 100, 1, 0, &g.c_rebalance, NULL },
-
 	{ "salvage",
 	  "salvage testing",					/* 100% */
 	  C_BOOL, 100, 1, 0, &g.c_salvage, NULL },
 
 	{ "split_pct",
 	  "page split size as a percentage of the maximum page size",
-	  0x0, 40, 85, 85, &g.c_split_pct, NULL },
+	  0x0, 50, 100, 100, &g.c_split_pct, NULL },
 
 	{ "statistics",
 	  "maintain statistics",				/* 20% */
@@ -293,6 +309,10 @@ static CONFIG c[] = {
 	{ "timer",
 	  "maximum time to run in minutes (default 20 minutes)",
 	  C_IGNORE, 0, UINT_MAX, UINT_MAX, &g.c_timer, NULL },
+
+	{ "transaction_timestamps",				/* 10% */
+	  "enable transaction timestamp support",
+	  C_BOOL, 10, 0, 0, &g.c_txn_timestamps, NULL },
 
 	{ "transaction-frequency",
 	  "percent operations done inside an explicit transaction",
@@ -315,8 +335,8 @@ static CONFIG c[] = {
 	  C_IGNORE|C_STRING, 0, 0, 0, NULL, &g.c_config_open },
 
 	{ "write_pct",
-	  "percent operations that are writes",
-	  0x0, 0, 90, 90, &g.c_write_pct, NULL },
+	  "percent operations that are value updates",
+	  C_IGNORE, 0, 0, 100, &g.c_write_pct, NULL },
 
 	{ NULL, NULL, 0x0, 0, 0, 0, NULL, NULL }
 };

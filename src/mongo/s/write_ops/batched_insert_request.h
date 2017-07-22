@@ -34,6 +34,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -45,32 +46,21 @@ class BatchedInsertRequest {
     MONGO_DISALLOW_COPYING(BatchedInsertRequest);
 
 public:
-    //
-    // schema declarations
-    //
-
-    // Name used for the batched insert invocation.
-    static const std::string BATCHED_INSERT_REQUEST;
-
-    // Field names and types in the batched insert command type.
     static const BSONField<std::string> collName;
     static const BSONField<std::vector<BSONObj>> documents;
-    static const BSONField<BSONObj> writeConcern;
-    static const BSONField<bool> ordered;
 
     //
     // construction / destruction
     //
 
     BatchedInsertRequest();
-    ~BatchedInsertRequest();
 
     /** Copies all the fields present in 'this' to 'other'. */
     void cloneTo(BatchedInsertRequest* other) const;
 
     bool isValid(std::string* errMsg) const;
     BSONObj toBSON() const;
-    bool parseBSON(StringData dbName, const BSONObj& source, std::string* errMsg);
+    void parseRequest(const OpMsgRequest& request);
     void clear();
     std::string toString() const;
 
@@ -88,28 +78,10 @@ public:
     const NamespaceString& getIndexTargetingNS() const;
 
     void addToDocuments(const BSONObj& documents);
-    bool isDocumentsSet() const;
     std::size_t sizeDocuments() const;
     const std::vector<BSONObj>& getDocuments() const;
     const BSONObj& getDocumentsAt(std::size_t pos) const;
     void setDocumentAt(std::size_t pos, const BSONObj& doc);
-
-    void setWriteConcern(const BSONObj& writeConcern);
-    void unsetWriteConcern();
-    bool isWriteConcernSet() const;
-    const BSONObj& getWriteConcern() const;
-
-    void setOrdered(bool ordered);
-    void unsetOrdered();
-    bool isOrderedSet() const;
-    bool getOrdered() const;
-
-    void setShouldBypassValidation(bool newVal) {
-        _shouldBypassValidation = newVal;
-    }
-    bool shouldBypassValidation() const {
-        return _shouldBypassValidation;
-    }
 
 private:
     // Convention: (M)andatory, (O)ptional
@@ -122,19 +94,8 @@ private:
     std::vector<BSONObj> _documents;
     bool _isDocumentsSet;
 
-    // (O)  to be issued after the batch applied
-    BSONObj _writeConcern;
-    bool _isWriteConcernSet;
-
-    // (O)  whether batch is issued in parallel or not
-    bool _ordered;
-    bool _isOrderedSet;
-
     // (O)  cached copied of target ns
     NamespaceString _targetNSS;
-
-    // (O)  should document validation be bypassed (default false)
-    bool _shouldBypassValidation;
 };
 
 }  // namespace mongo

@@ -160,7 +160,7 @@ class LogRecordingScope {
 public:
     LogRecordingScope()
         : _logged(false),
-          _threadName(mongo::getThreadName()),
+          _threadName(mongo::getThreadName().toString()),
           _handle(mongo::logger::globalLogDomain()->attachAppender(
               mongo::logger::MessageLogDomain::AppenderAutoPtr(new Tee(this)))) {}
     ~LogRecordingScope() {
@@ -789,11 +789,6 @@ public:
 class NumberDecimal {
 public:
     void run() {
-        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
-        // BSONVersion::kLatest.
-        serverGlobalParams.featureCompatibility.version.store(
-            ServerGlobalParams::FeatureCompatibility::Version::k34);
-
         unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
         BSONObjBuilder b;
         Decimal128 val = Decimal128("2.010");
@@ -823,11 +818,6 @@ public:
 class NumberDecimalGetFromScope {
 public:
     void run() {
-        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
-        // BSONVersion::kLatest.
-        serverGlobalParams.featureCompatibility.version.store(
-            ServerGlobalParams::FeatureCompatibility::Version::k34);
-
         unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
         ASSERT(s->exec("a = 5;", "a", false, true, false));
         ASSERT_TRUE(Decimal128(5).isEqual(s->getNumberDecimal("a")));
@@ -837,11 +827,6 @@ public:
 class NumberDecimalBigObject {
 public:
     void run() {
-        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
-        // BSONVersion::kLatest.
-        serverGlobalParams.featureCompatibility.version.store(
-            ServerGlobalParams::FeatureCompatibility::Version::k34);
-
         unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
 
         BSONObj in;
@@ -1002,9 +987,9 @@ public:
         string utf8ObjSpec = "{'_id':'\\u0001\\u007f\\u07ff\\uffff'}";
         BSONObj utf8Obj = fromjson(utf8ObjSpec);
 
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.insert(ns(), utf8Obj);
         client.eval("unittest",
@@ -1023,9 +1008,9 @@ private:
     }
 
     void reset() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.dropCollection(ns());
     }
@@ -1047,9 +1032,9 @@ public:
         if (!getGlobalScriptEngine()->utf8Ok())
             return;
 
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.eval("unittest",
                     "db.jstests.longutf8string.save( {_id:'\\uffff\\uffff\\uffff\\uffff'} )");
@@ -1057,9 +1042,9 @@ public:
 
 private:
     void reset() {
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.dropCollection(ns());
     }
@@ -1136,15 +1121,10 @@ public:
     void run() {
         // Insert in Javascript -> Find using DBDirectClient
 
-        // Set the featureCompatibilityVersion to 3.4 so that BSON validation always uses
-        // BSONVersion::kLatest.
-        serverGlobalParams.featureCompatibility.version.store(
-            ServerGlobalParams::FeatureCompatibility::Version::k34);
-
         // Drop the collection
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
 
         client.dropCollection("unittest.testroundtrip");
 
@@ -2251,9 +2231,9 @@ public:
         update.appendCode("value",
                           "function () { db.test.find().forEach(function(obj) { continue; }); }");
 
-        const ServiceContext::UniqueOperationContext txnPtr = cc().makeOperationContext();
-        OperationContext& txn = *txnPtr;
-        DBDirectClient client(&txn);
+        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
+        OperationContext& opCtx = *opCtxPtr;
+        DBDirectClient client(&opCtx);
         client.update("test.system.js", query.obj(), update.obj(), true /* upsert */);
 
         unique_ptr<Scope> s(getGlobalScriptEngine()->newScope());
@@ -2513,4 +2493,4 @@ public:
 
 SuiteInstance<All> myall;
 
-}  // namespace JavaJSTests
+}  // namespace JSTests

@@ -7,16 +7,11 @@ Import("get_option")
 Import("endian")
 
 env = env.Clone()
+
 env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib'])
 
 if endian == "big":
     env.Append(CPPDEFINES=[('WORDS_BIGENDIAN', 1)])
-
-# WiredTiger is not currently alignment clean; see
-# https://jira.mongodb.org/browse/WT-2402.
-sanitizer_list = get_option('sanitize')
-if sanitizer_list and ('undefined' in sanitizer_list.split(',')):
-    env.Append(CCFLAGS=["-fno-sanitize=alignment"])
 
 env.Append(CPPPATH=[
         "src/include",
@@ -55,7 +50,7 @@ if env.TargetOSIs('windows'):
     if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         env.InjectThirdPartyIncludePaths(libraries=['gperftools'])
         env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
-elif env.TargetOSIs('osx'):
+elif env.TargetOSIs('darwin'):
     env.Append(CPPPATH=["build_darwin"])
 elif env.TargetOSIs('solaris'):
     env.Append(CPPPATH=["build_solaris"])
@@ -179,7 +174,9 @@ wtlib = env.Library(
         '$BUILD_DIR/third_party/shim_snappy',
         '$BUILD_DIR/third_party/shim_zlib',
     ],
+    LIBDEPS_TAGS=[
+        'init-no-global-side-effects',
+    ],
 )
 
 env.Depends(wtlib, [filelistfile, version_file])
-

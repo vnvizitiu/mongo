@@ -83,12 +83,8 @@ DocumentSource::GetNextResult DocumentSourceSample::getNext() {
     return _sortStage->getNext();
 }
 
-Value DocumentSourceSample::serialize(bool explain) const {
+Value DocumentSourceSample::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(DOC(getSourceName() << DOC("size" << _size)));
-}
-
-void DocumentSourceSample::doInjectExpressionContext() {
-    _sortStage->injectExpressionContext(pExpCtx);
 }
 
 namespace {

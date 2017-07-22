@@ -95,7 +95,19 @@ public:
         // Expressions that are only created internally
         INTERNAL_2DSPHERE_KEY_IN_REGION,
         INTERNAL_2D_KEY_IN_REGION,
-        INTERNAL_2D_POINT_IN_ANNULUS
+        INTERNAL_2D_POINT_IN_ANNULUS,
+
+        // JSON Schema expressions.
+        INTERNAL_SCHEMA_COND,
+        INTERNAL_SCHEMA_MAX_ITEMS,
+        INTERNAL_SCHEMA_MIN_ITEMS,
+        INTERNAL_SCHEMA_MAX_PROPERTIES,
+        INTERNAL_SCHEMA_MIN_PROPERTIES,
+        INTERNAL_SCHEMA_OBJECT_MATCH,
+        INTERNAL_SCHEMA_UNIQUE_ITEMS,
+        INTERNAL_SCHEMA_XOR,
+        INTERNAL_SCHEMA_MIN_LENGTH,
+        INTERNAL_SCHEMA_MAX_LENGTH,
     };
 
     MatchExpression(MatchType type);
@@ -128,7 +140,11 @@ public:
     }
 
     /**
-     * Get all the children of a node
+     * Returns the underlying vector storing the children of a logical node. Note that this is not
+     * guaranteed to return all children. It can be used to modify the children of logical nodes
+     * like AND/OR, but it cannot be used to traverse the MatchExpression tree. Traversing the
+     * MatchExpression tree should instead be achieved using numChildren() and getChild(), which are
+     * guaranteed to be accurate.
      */
     virtual std::vector<MatchExpression*>* getChildVector() {
         return NULL;
@@ -141,47 +157,19 @@ public:
         return StringData();
     }
 
-    /**
-     * Notes on structure:
-     * isLogical, isArray, and isLeaf define three partitions of all possible operators.
-     *
-     * isLogical can have children and its children can be arbitrary operators.
-     *
-     * isArray can have children and its children are predicates over one field.
-     *
-     * isLeaf is a predicate over one field.
-     */
+    enum class MatchCategory {
+        // Expressions that are leaves on the AST, these do not have any children.
+        kLeaf,
+        // Logical Expressions such as $and, $or, etc. that do not have a path and may have
+        // one or more children.
+        kLogical,
+        // Expressions that operate on arrays only.
+        kArrayMatching,
+        // Expressions that don't fall into any particular bucket.
+        kOther,
+    };
 
-    /**
-     * Is this node a logical operator?  All of these inherit from ListOfMatchExpression.
-     * AND, OR, NOT, NOR.
-     */
-    bool isLogical() const {
-        return AND == _matchType || OR == _matchType || NOT == _matchType || NOR == _matchType;
-    }
-
-    /**
-     * Is this node an array operator?  Array operators have multiple clauses but operate on one
-     * field.
-     *
-     * ELEM_MATCH_VALUE, ELEM_MATCH_OBJECT, SIZE (ArrayMatchingMatchExpression)
-     */
-    bool isArray() const {
-        return SIZE == _matchType || ELEM_MATCH_VALUE == _matchType ||
-            ELEM_MATCH_OBJECT == _matchType;
-    }
-
-    /**
-     * Not-internal nodes, predicates over one field.  Almost all of these inherit from
-     * LeafMatchExpression.
-     *
-     * Exceptions: WHERE, which doesn't have a field.
-     *             TYPE_OPERATOR, which inherits from MatchExpression due to unique array
-     *                            semantics.
-     */
-    bool isLeaf() const {
-        return !isArray() && !isLogical();
-    }
+    virtual MatchCategory getCategory() const = 0;
 
     // XXX: document
     virtual std::unique_ptr<MatchExpression> shallowClone() const = 0;
@@ -189,17 +177,22 @@ public:
     // XXX document
     virtual bool equivalent(const MatchExpression* other) const = 0;
 
-    /**
-    * Determine if a document satisfies the tree-predicate.
-    *
-    * The caller may optionally provide a non-null MatchDetails as an out-parameter. For matching
-    *documents, the MatchDetails provide further info on how the document was
-    *matched---specifically, which array element matched an array predicate.
-    *
-    * The caller must check that the MatchDetails is valid via the isValid() method before using.
-    */
+    //
+    // Determine if a document satisfies the tree-predicate.
+    //
+
     virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const = 0;
+
     virtual bool matchesBSON(const BSONObj& doc, MatchDetails* details = 0) const;
+
+    /**
+     * Determines if 'elem' would satisfy the predicate if wrapped with the top-level field name of
+     * the predicate. Does not check that the predicate has a single top-level field name. For
+     * example, given the object obj={a: [5]}, the predicate {i: {$gt: 0}} would match the element
+     * obj["a"]["0"] because it performs the match as if the element at "a.0" were the BSONObj {i:
+     * 5}.
+     */
+    virtual bool matchesBSONElement(BSONElement elem, MatchDetails* details = nullptr) const;
 
     /**
      * Determines if the element satisfies the tree-predicate.
@@ -213,9 +206,11 @@ public:
 
     class TagData {
     public:
+        enum class Type { IndexTag, RelevantTag, OrPushdownTag };
         virtual ~TagData() {}
         virtual void debugString(StringBuilder* builder) const = 0;
         virtual TagData* clone() const = 0;
+        virtual Type getType() const = 0;
     };
 
     /**
@@ -292,6 +287,10 @@ public:
 
     virtual bool equivalent(const MatchExpression* other) const {
         return other->matchType() == ALWAYS_FALSE;
+    }
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kOther;
     }
 
 private:

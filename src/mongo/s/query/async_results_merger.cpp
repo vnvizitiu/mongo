@@ -38,7 +38,6 @@
 #include "mongo/db/query/killcursors_request.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
@@ -54,31 +53,25 @@ const int kMaxNumFailedHostRetryAttempts = 3;
 }  // namespace
 
 AsyncResultsMerger::AsyncResultsMerger(executor::TaskExecutor* executor,
-                                       ClusterClientCursorParams&& params)
+                                       ClusterClientCursorParams* params)
     : _executor(executor),
-      _params(std::move(params)),
-      _mergeQueue(MergingComparator(_remotes, _params.sort)) {
-    for (const auto& remote : _params.remotes) {
-        if (remote.shardId) {
-            invariant(remote.cmdObj);
-            invariant(!remote.cursorId);
-            invariant(!remote.hostAndPort);
-            _remotes.emplace_back(*remote.shardId, *remote.cmdObj);
-        } else {
-            invariant(!remote.cmdObj);
-            invariant(remote.cursorId);
-            invariant(remote.hostAndPort);
-            _remotes.emplace_back(*remote.hostAndPort, *remote.cursorId);
-        }
+      _params(params),
+      _mergeQueue(MergingComparator(_remotes, _params->sort)) {
+    size_t remoteIndex = 0;
+    for (const auto& remote : _params->remotes) {
+        _remotes.emplace_back(remote.hostAndPort, remote.cursorResponse.getCursorId());
+
+        // We don't check the return value of addBatchToBuffer here; if there was an error,
+        // it will be stored in the remote and the first call to ready() will return true.
+        addBatchToBuffer(remoteIndex, remote.cursorResponse.getBatch());
+        ++remoteIndex;
     }
 
-    // Initialize command metadata to handle the read preference.
-    if (_params.readPreference) {
-        BSONObjBuilder metadataBuilder;
-        rpc::ServerSelectionMetadata metadata(
-            _params.readPreference->pref != ReadPreference::PrimaryOnly, boost::none);
-        uassertStatusOK(metadata.writeToMetadata(&metadataBuilder));
-        _metadataObj = metadataBuilder.obj();
+    // Initialize command metadata to handle the read preference. We do this in case the readPref
+    // is primaryOnly, in which case if the remote host for one of the cursors changes roles, the
+    // remote will return an error.
+    if (_params->readPreference) {
+        _metadataObj = _params->readPreference->toContainingBSON();
     }
 }
 
@@ -105,18 +98,13 @@ bool AsyncResultsMerger::remotesExhausted_inlock() {
 Status AsyncResultsMerger::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
-    if (!_params.isTailable || !_params.isAwaitData) {
+    if (!_params->isTailable || !_params->isAwaitData) {
         return Status(ErrorCodes::BadValue,
                       "maxTimeMS can only be used with getMore for tailable, awaitData cursors");
     }
 
     _awaitDataTimeout = awaitDataTimeout;
     return Status::OK();
-}
-
-void AsyncResultsMerger::setOperationContext(OperationContext* txn) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _params.txn = txn;
 }
 
 bool AsyncResultsMerger::ready() {
@@ -141,22 +129,15 @@ bool AsyncResultsMerger::ready_inlock() {
             _status = remote.status;
             return true;
         }
-
-        // We don't return any results until we have received at least one response from each remote
-        // node. This is necessary for versioned commands: we have to ensure that we've properly
-        // established the shard version on each node before we can start returning results.
-        if (!remote.cursorId) {
-            return false;
-        }
     }
 
-    const bool hasSort = !_params.sort.isEmpty();
+    const bool hasSort = !_params->sort.isEmpty();
     return hasSort ? readySorted_inlock() : readyUnsorted_inlock();
 }
 
 bool AsyncResultsMerger::readySorted_inlock() {
     // Tailable cursors cannot have a sort.
-    invariant(!_params.isTailable);
+    invariant(!_params->isTailable);
 
     for (const auto& remote : _remotes) {
         if (!remote.hasNext() && !remote.exhausted()) {
@@ -198,13 +179,13 @@ StatusWith<ClusterQueryResult> AsyncResultsMerger::nextReady() {
         return {ClusterQueryResult()};
     }
 
-    const bool hasSort = !_params.sort.isEmpty();
+    const bool hasSort = !_params->sort.isEmpty();
     return hasSort ? nextReadySorted() : nextReadyUnsorted();
 }
 
 ClusterQueryResult AsyncResultsMerger::nextReadySorted() {
     // Tailable cursors cannot have a sort.
-    invariant(!_params.isTailable);
+    invariant(!_params->isTailable);
 
     if (_mergeQueue.empty()) {
         return {};
@@ -238,7 +219,7 @@ ClusterQueryResult AsyncResultsMerger::nextReadyUnsorted() {
             ClusterQueryResult front = _remotes[_gettingFromRemote].docBuffer.front();
             _remotes[_gettingFromRemote].docBuffer.pop();
 
-            if (_params.isTailable && !_remotes[_gettingFromRemote].hasNext()) {
+            if (_params->isTailable && !_remotes[_gettingFromRemote].hasNext()) {
                 // The cursor is tailable and we're about to return the last buffered result. This
                 // means that the next value returned should be boost::none to indicate the end of
                 // the batch.
@@ -258,7 +239,7 @@ ClusterQueryResult AsyncResultsMerger::nextReadyUnsorted() {
     return {};
 }
 
-Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
+Status AsyncResultsMerger::askForNextBatch_inlock(OperationContext* opCtx, size_t remoteIndex) {
     auto& remote = _remotes[remoteIndex];
 
     invariant(!remote.cbHandle.isValid());
@@ -267,44 +248,29 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
     // request to fetch the remaining docs only. If the remote node has a plan with OR for top k and
     // a full sort as is the case for the OP_QUERY find then this optimization will prevent
     // switching to the full sort plan branch.
-    BSONObj cmdObj;
-
-    if (remote.cursorId) {
-        auto adjustedBatchSize = _params.batchSize;
-
-        if (_params.batchSize && *_params.batchSize > remote.fetchedCount) {
-            adjustedBatchSize = *_params.batchSize - remote.fetchedCount;
-        }
-
-        cmdObj = GetMoreRequest(_params.nsString,
-                                *remote.cursorId,
-                                adjustedBatchSize,
-                                _awaitDataTimeout,
-                                boost::none,
-                                boost::none)
-                     .toBSON();
-    } else {
-        // Do the first time shard host resolution.
-        invariant(_params.readPreference);
-        Status resolveStatus = remote.resolveShardIdToHostAndPort(*_params.readPreference);
-        if (!resolveStatus.isOK()) {
-            return resolveStatus;
-        }
-
-        remote.fetchedCount = 0;
-        cmdObj = *remote.initialCmdObj;
+    auto adjustedBatchSize = _params->batchSize;
+    if (_params->batchSize && *_params->batchSize > remote.fetchedCount) {
+        adjustedBatchSize = *_params->batchSize - remote.fetchedCount;
     }
 
-    executor::RemoteCommandRequest request(remote.getTargetHost(),
-                                           _params.nsString.db().toString(),
-                                           cmdObj,
-                                           _metadataObj,
-                                           _params.txn);
+    BSONObj cmdObj = GetMoreRequest(_params->nsString,
+                                    remote.cursorId,
+                                    adjustedBatchSize,
+                                    _awaitDataTimeout,
+                                    boost::none,
+                                    boost::none)
+                         .toBSON();
 
-    auto callbackStatus = _executor->scheduleRemoteCommand(
-        request,
-        stdx::bind(
-            &AsyncResultsMerger::handleBatchResponse, this, stdx::placeholders::_1, remoteIndex));
+    executor::RemoteCommandRequest request(
+        remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, _metadataObj, opCtx);
+
+    auto callbackStatus =
+        _executor->scheduleRemoteCommand(request,
+                                         stdx::bind(&AsyncResultsMerger::handleBatchResponse,
+                                                    this,
+                                                    stdx::placeholders::_1,
+                                                    opCtx,
+                                                    remoteIndex));
     if (!callbackStatus.isOK()) {
         return callbackStatus.getStatus();
     }
@@ -321,7 +287,8 @@ Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
  * 2. Remotes that already has some result will have a non-empty buffer.
  * 3. Remotes that reached maximum retries will be in 'exhausted' state.
  */
-StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
+StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent(
+    OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     if (_lifecycleState != kAlive) {
@@ -341,14 +308,14 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     for (size_t i = 0; i < _remotes.size(); ++i) {
         auto& remote = _remotes[i];
 
-        // It is illegal to call this method if there is an error received from any shard.
-        invariant(remote.status.isOK());
+        if (!remote.status.isOK()) {
+            return remote.status;
+        }
 
         if (!remote.hasNext() && !remote.exhausted() && !remote.cbHandle.isValid()) {
-            // If we already have established a cursor with this remote, and there is no outstanding
-            // request for which we have a valid callback handle, then schedule work to retrieve the
-            // next batch.
-            auto nextBatchStatus = askForNextBatch_inlock(i);
+            // If this remote is not exhausted and there is no outstanding request for it, schedule
+            // work to retrieve the next batch.
+            auto nextBatchStatus = askForNextBatch_inlock(opCtx, i);
             if (!nextBatchStatus.isOK()) {
                 return nextBatchStatus;
             }
@@ -362,9 +329,10 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() 
     auto eventToReturn = eventStatus.getValue();
     _currentEvent = eventToReturn;
 
-    // It's possible that after we told the caller we had no ready results but before the call to
-    // this method, new results became available. In this case we have to signal the event right
-    // away so that the caller will not block.
+    // It's possible that after we told the caller we had no ready results but before we replaced
+    // _currentEvent with a new event, new results became available. In this case we have to signal
+    // the new event right away to propagate the fact that the previous event had been signaled to
+    // the new event.
     signalCurrentEventIfReady_inlock();
 
     return eventToReturn;
@@ -379,12 +347,11 @@ StatusWith<CursorResponse> AsyncResultsMerger::parseCursorResponse(const BSONObj
 
     auto cursorResponse = std::move(getMoreParseStatus.getValue());
 
-    // If we have a cursor established, and we get a non-zero cursor id that is not equal to the
-    // established cursor id, we will fail the operation.
-    if (remote.cursorId && cursorResponse.getCursorId() != 0 &&
-        *remote.cursorId != cursorResponse.getCursorId()) {
+    // If we get a non-zero cursor id that is not equal to the established cursor id, we will fail
+    // the operation.
+    if (cursorResponse.getCursorId() != 0 && remote.cursorId != cursorResponse.getCursorId()) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Expected cursorid " << *remote.cursorId << " but received "
+                      str::stream() << "Expected cursorid " << remote.cursorId << " but received "
                                     << cursorResponse.getCursorId());
     }
 
@@ -392,7 +359,9 @@ StatusWith<CursorResponse> AsyncResultsMerger::parseCursorResponse(const BSONObj
 }
 
 void AsyncResultsMerger::handleBatchResponse(
-    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData, size_t remoteIndex) {
+    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
+    OperationContext* opCtx,
+    size_t remoteIndex) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     auto& remote = _remotes[remoteIndex];
@@ -408,15 +377,6 @@ void AsyncResultsMerger::handleBatchResponse(
         // Make sure to wake up anyone waiting on '_currentEvent' if we're shutting down.
         signalCurrentEventIfReady_inlock();
 
-        // Make a best effort to parse the response and retrieve the cursor id. We need the cursor
-        // id in order to issue a killCursors command against it.
-        if (cbData.response.isOK()) {
-            auto cursorResponse = parseCursorResponse(cbData.response.data, remote);
-            if (cursorResponse.isOK()) {
-                remote.cursorId = cursorResponse.getValue().getCursorId();
-            }
-        }
-
         // If we're killed and we're not waiting on any more batches to come back, then we are ready
         // to kill the cursors on the remote hosts and clean up this cursor. Schedule the
         // killCursors command and signal that this cursor is safe now safe to destroy. We have to
@@ -426,7 +386,7 @@ void AsyncResultsMerger::handleBatchResponse(
             // If the event handle is invalid, then the executor is in the middle of shutting down,
             // and we can't schedule any more work for it to complete.
             if (_killCursorsScheduledEvent.isValid()) {
-                scheduleKillCursors_inlock();
+                scheduleKillCursors_inlock(opCtx);
                 _executor->signalEvent(_killCursorsScheduledEvent);
             }
 
@@ -444,80 +404,19 @@ void AsyncResultsMerger::handleBatchResponse(
                                : cbData.response.status);
 
     if (!cursorResponseStatus.isOK()) {
-        // In the case a read is performed against a view, the shard primary can return an error
-        // indicating that the underlying collection may be sharded. When this occurs the return
-        // message will include an expanded view definition and collection namespace which we need
-        // to store. This allows for a second attempt at the read directly against the underlying
-        // collection.
-        if (cursorResponseStatus.getStatus() ==
-            ErrorCodes::CommandOnShardedViewNotSupportedOnMongod) {
-            auto& responseObj = cbData.response.data;
-            if (!responseObj.hasField("resolvedView")) {
-                remote.status = Status(ErrorCodes::InternalError,
-                                       str::stream() << "Missing field 'resolvedView' in document: "
-                                                     << responseObj);
-                return;
-            }
-
-            auto resolvedViewObj = responseObj.getObjectField("resolvedView");
-            if (resolvedViewObj.isEmpty()) {
-                remote.status = Status(ErrorCodes::InternalError,
-                                       str::stream() << "Field 'resolvedView' must be an object: "
-                                                     << responseObj);
-                return;
-            }
-
-            ClusterQueryResult result;
-            result.setViewDefinition(resolvedViewObj.getOwned());
-
-            remote.docBuffer.push(result);
-            remote.cursorId = 0;
-            remote.status = Status::OK();
-            return;
-        }
-
         auto shard = remote.getShard();
         if (!shard) {
             remote.status = Status(cursorResponseStatus.getStatus().code(),
-                                   str::stream() << "Could not find shard " << *remote.shardId
-                                                 << " containing host "
+                                   str::stream() << "Could not find shard containing host "
                                                  << remote.getTargetHost().toString());
         } else {
             shard->updateReplSetMonitor(remote.getTargetHost(), cursorResponseStatus.getStatus());
-
-            // If we can still retry the initial cursor establishment, reset the state so it can be
-            // retried the next time nextEvent is called. Never retry getMores to avoid
-            // accidentally skipping results.
-            if (!remote.cursorId && remote.retryCount < kMaxNumFailedHostRetryAttempts &&
-                shard->isRetriableError(cursorResponseStatus.getStatus().code(),
-                                        Shard::RetryPolicy::kIdempotent)) {
-                invariant(remote.shardId);
-                invariant(remote.docBuffer.empty());
-
-                LOG(1) << "Initial cursor establishment failed with retriable error and will be "
-                          "retried"
-                       << causedBy(redact(cursorResponseStatus.getStatus()));
-
-                ++remote.retryCount;
-                remote.status = Status::OK();  // Reset status so it can be retried.
-
-                // Signal the merger thread to make it retry this remote again.
-                if (_currentEvent.isValid()) {
-                    // To prevent ourselves from signalling the event twice,
-                    // we set '_currentEvent' as invalid after signalling it.
-                    _executor->signalEvent(_currentEvent);
-                    _currentEvent = executor::TaskExecutor::EventHandle();
-                }
-
-                return;
-            } else {
-                remote.status = cursorResponseStatus.getStatus();
-            }
+            remote.status = cursorResponseStatus.getStatus();
         }
 
         // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
         // remove the unreachable host entirely from consideration by marking it as exhausted.
-        if (_params.isAllowPartialResults) {
+        if (_params->isAllowPartialResults) {
             remote.status = Status::OK();
 
             // Clear the results buffer and cursor id.
@@ -529,37 +428,23 @@ void AsyncResultsMerger::handleBatchResponse(
         return;
     }
 
-    // Cursor id successfully established.
+    // Response successfully received.
+
     auto cursorResponse = std::move(cursorResponseStatus.getValue());
+
+    // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
     remote.cursorId = cursorResponse.getCursorId();
-    remote.initialCmdObj = boost::none;
 
-    for (const auto& obj : cursorResponse.getBatch()) {
-        // If there's a sort, we're expecting the remote node to give us back a sort key.
-        if (!_params.sort.isEmpty() &&
-            obj[ClusterClientCursorParams::kSortKeyField].type() != BSONType::Object) {
-            remote.status = Status(ErrorCodes::InternalError,
-                                   str::stream() << "Missing field '"
-                                                 << ClusterClientCursorParams::kSortKeyField
-                                                 << "' in document: "
-                                                 << obj);
-            return;
-        }
-
-        ClusterQueryResult result(obj);
-        remote.docBuffer.push(result);
-        ++remote.fetchedCount;
-    }
-
-    // If we're doing a sorted merge, then we have to make sure to put this remote onto the
-    // merge queue.
-    if (!_params.sort.isEmpty() && !cursorResponse.getBatch().empty()) {
-        _mergeQueue.push(remoteIndex);
+    // Save the batch in the remote's buffer.
+    if (!addBatchToBuffer(remoteIndex, cursorResponse.getBatch())) {
+        return;
     }
 
     // If the cursor is tailable and we just received an empty batch, the next return value should
     // be boost::none in order to indicate the end of the batch.
-    if (_params.isTailable && !remote.hasNext()) {
+    // (Note: tailable cursors are only valid on unsharded collections, so the end of the batch from
+    // one shard means the end of the overall batch).
+    if (_params->isTailable && !remote.hasNext()) {
         _eofNext = true;
     }
 
@@ -568,8 +453,8 @@ void AsyncResultsMerger::handleBatchResponse(
     //
     // We do not ask for the next batch if the cursor is tailable, as batches received from remote
     // tailable cursors should be passed through to the client without asking for more batches.
-    if (!_params.isTailable && !remote.hasNext() && !remote.exhausted()) {
-        remote.status = askForNextBatch_inlock(remoteIndex);
+    if (!_params->isTailable && !remote.hasNext() && !remote.exhausted()) {
+        remote.status = askForNextBatch_inlock(opCtx, remoteIndex);
         if (!remote.status.isOK()) {
             return;
         }
@@ -579,6 +464,33 @@ void AsyncResultsMerger::handleBatchResponse(
     // well as failure.
     signaller.Dismiss();
     signalCurrentEventIfReady_inlock();
+}
+
+bool AsyncResultsMerger::addBatchToBuffer(size_t remoteIndex, const std::vector<BSONObj>& batch) {
+    auto& remote = _remotes[remoteIndex];
+    for (const auto& obj : batch) {
+        // If there's a sort, we're expecting the remote node to have given us back a sort key.
+        if (!_params->sort.isEmpty() &&
+            obj[ClusterClientCursorParams::kSortKeyField].type() != BSONType::Object) {
+            remote.status = Status(ErrorCodes::InternalError,
+                                   str::stream() << "Missing field '"
+                                                 << ClusterClientCursorParams::kSortKeyField
+                                                 << "' in document: "
+                                                 << obj);
+            return false;
+        }
+
+        ClusterQueryResult result(obj);
+        remote.docBuffer.push(result);
+        ++remote.fetchedCount;
+    }
+
+    // If we're doing a sorted merge, then we have to make sure to put this remote onto the
+    // merge queue.
+    if (!_params->sort.isEmpty() && !batch.empty()) {
+        _mergeQueue.push(remoteIndex);
+    }
+    return true;
 }
 
 void AsyncResultsMerger::signalCurrentEventIfReady_inlock() {
@@ -600,7 +512,7 @@ bool AsyncResultsMerger::haveOutstandingBatchRequests_inlock() {
     return false;
 }
 
-void AsyncResultsMerger::scheduleKillCursors_inlock() {
+void AsyncResultsMerger::scheduleKillCursors_inlock(OperationContext* opCtx) {
     invariant(_lifecycleState == kKillStarted);
     invariant(_killCursorsScheduledEvent.isValid());
 
@@ -608,14 +520,16 @@ void AsyncResultsMerger::scheduleKillCursors_inlock() {
         invariant(!remote.cbHandle.isValid());
 
         if (remote.status.isOK() && remote.cursorId && !remote.exhausted()) {
-            BSONObj cmdObj = KillCursorsRequest(_params.nsString, {*remote.cursorId}).toBSON();
+            BSONObj cmdObj = KillCursorsRequest(_params->nsString, {remote.cursorId}).toBSON();
 
             executor::RemoteCommandRequest request(
-                remote.getTargetHost(), _params.nsString.db().toString(), cmdObj, _params.txn);
+                remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, opCtx);
 
-            _executor->scheduleRemoteCommand(
-                request,
-                stdx::bind(&AsyncResultsMerger::handleKillCursorsResponse, stdx::placeholders::_1));
+            _executor
+                ->scheduleRemoteCommand(request,
+                                        stdx::bind(&AsyncResultsMerger::handleKillCursorsResponse,
+                                                   stdx::placeholders::_1))
+                .status_with_transitional_ignore();
         }
     }
 }
@@ -625,7 +539,7 @@ void AsyncResultsMerger::handleKillCursorsResponse(
     // We just ignore any killCursors command responses.
 }
 
-executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
+executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_killCursorsScheduledEvent.isValid()) {
         invariant(_lifecycleState != kAlive);
@@ -651,9 +565,15 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
     // remotes now. Otherwise, we have to wait until all responses are back, and then we can kill
     // the remote cursors.
     if (!haveOutstandingBatchRequests_inlock()) {
-        scheduleKillCursors_inlock();
+        scheduleKillCursors_inlock(opCtx);
         _lifecycleState = kKillComplete;
         _executor->signalEvent(_killCursorsScheduledEvent);
+    } else {
+        for (const auto& remote : _remotes) {
+            if (remote.cbHandle.isValid()) {
+                _executor->cancel(remote.cbHandle);
+            }
+        }
     }
 
     return _killCursorsScheduledEvent;
@@ -663,16 +583,12 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill() {
 // AsyncResultsMerger::RemoteCursorData
 //
 
-AsyncResultsMerger::RemoteCursorData::RemoteCursorData(ShardId shardId, BSONObj cmdObj)
-    : shardId(std::move(shardId)), initialCmdObj(std::move(cmdObj)) {}
-
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(HostAndPort hostAndPort,
                                                        CursorId establishedCursorId)
-    : cursorId(establishedCursorId), _shardHostAndPort(std::move(hostAndPort)) {}
+    : cursorId(establishedCursorId), shardHostAndPort(std::move(hostAndPort)) {}
 
 const HostAndPort& AsyncResultsMerger::RemoteCursorData::getTargetHost() const {
-    invariant(_shardHostAndPort);
-    return *_shardHostAndPort;
+    return shardHostAndPort;
 }
 
 bool AsyncResultsMerger::RemoteCursorData::hasNext() const {
@@ -680,38 +596,11 @@ bool AsyncResultsMerger::RemoteCursorData::hasNext() const {
 }
 
 bool AsyncResultsMerger::RemoteCursorData::exhausted() const {
-    return cursorId && (*cursorId == 0);
-}
-
-Status AsyncResultsMerger::RemoteCursorData::resolveShardIdToHostAndPort(
-    const ReadPreferenceSetting& readPref) {
-    invariant(shardId);
-    invariant(!cursorId);
-
-    const auto shard = getShard();
-    if (!shard) {
-        return Status(ErrorCodes::ShardNotFound,
-                      str::stream() << "Could not find shard " << *shardId);
-    }
-
-    // TODO: Pass down an OperationContext* to use here.
-    auto findHostStatus = shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20});
-    if (!findHostStatus.isOK()) {
-        return findHostStatus.getStatus();
-    }
-
-    _shardHostAndPort = std::move(findHostStatus.getValue());
-
-    return Status::OK();
+    return cursorId == 0;
 }
 
 std::shared_ptr<Shard> AsyncResultsMerger::RemoteCursorData::getShard() {
-    invariant(shardId || _shardHostAndPort);
-    if (shardId) {
-        return grid.shardRegistry()->getShardNoReload(*shardId);
-    } else {
-        return grid.shardRegistry()->getShardNoReload(_shardHostAndPort->toString());
-    }
+    return grid.shardRegistry()->getShardNoReload(shardHostAndPort.toString());
 }
 
 //

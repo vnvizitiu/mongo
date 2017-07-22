@@ -49,9 +49,9 @@ using std::stringstream;
 
 MONGO_FP_DECLARE(validateCmdCollectionNotValid);
 
-class ValidateCmd : public Command {
+class ValidateCmd : public ErrmsgCommandDeprecated {
 public:
-    ValidateCmd() : Command("validate") {}
+    ValidateCmd() : ErrmsgCommandDeprecated("validate") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -75,21 +75,19 @@ public:
     }
     //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         if (MONGO_FAIL_POINT(validateCmdCollectionNotValid)) {
             errmsg = "validateCmdCollectionNotValid fail point was triggered";
             result.appendBool("valid", false);
             return true;
         }
 
-        string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
 
-        NamespaceString ns_string(ns);
         const bool full = cmdObj["full"].trueValue();
         const bool scanData = cmdObj["scandata"].trueValue();
 
@@ -101,20 +99,20 @@ public:
             level = kValidateRecordStore;
         }
 
-        if (!ns_string.isNormal() && full) {
+        if (!nss.isNormal() && full) {
             errmsg = "Can only run full validate on a regular collection";
             return false;
         }
 
-        if (!serverGlobalParams.quiet) {
-            LOG(0) << "CMD: validate " << ns;
+        if (!serverGlobalParams.quiet.load()) {
+            LOG(0) << "CMD: validate " << nss.ns();
         }
 
-        AutoGetDb ctx(txn, ns_string.db(), MODE_IX);
-        Lock::CollectionLock collLk(txn->lockState(), ns_string.ns(), MODE_X);
-        Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(ns_string) : NULL;
+        AutoGetDb ctx(opCtx, nss.db(), MODE_IX);
+        Lock::CollectionLock collLk(opCtx->lockState(), nss.ns(), MODE_X);
+        Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(opCtx, nss) : NULL;
         if (!collection) {
-            if (ctx.getDb() && ctx.getDb()->getViewCatalog()->lookup(txn, ns_string.ns())) {
+            if (ctx.getDb() && ctx.getDb()->getViewCatalog()->lookup(opCtx, nss.ns())) {
                 errmsg = "Cannot validate a view";
                 return appendCommandStatus(result, {ErrorCodes::CommandNotSupportedOnView, errmsg});
             }
@@ -123,10 +121,10 @@ public:
             return false;
         }
 
-        result.append("ns", ns);
+        result.append("ns", nss.ns());
 
         ValidateResults results;
-        Status status = collection->validate(txn, level, &results, &result);
+        Status status = collection->validate(opCtx, level, &results, &result);
         if (!status.isOK())
             return appendCommandStatus(result, status);
 

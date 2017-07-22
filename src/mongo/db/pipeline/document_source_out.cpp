@@ -46,7 +46,7 @@ DocumentSourceOut::~DocumentSourceOut() {
         if (_mongod && _tempNs.size()) _mongod->directClient()->dropCollection(_tempNs.ns());)
 }
 
-std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> DocumentSourceOut::liteParse(
+std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceOut::liteParse(
     const AggregationRequest& request, const BSONElement& spec) {
     uassert(40325,
             str::stream() << "$out stage requires a string argument, but found "
@@ -57,7 +57,7 @@ std::unique_ptr<LiteParsedDocumentSourceOneForeignCollection> DocumentSourceOut:
     uassert(40326,
             str::stream() << "Invalid $out target namespace, " << targetNss.ns(),
             targetNss.isValid());
-    return stdx::make_unique<LiteParsedDocumentSourceOneForeignCollection>(std::move(targetNss));
+    return stdx::make_unique<LiteParsedDocumentSourceForeignCollections>(std::move(targetNss));
 }
 
 REGISTER_DOCUMENT_SOURCE(out, DocumentSourceOut::liteParse, DocumentSourceOut::createFromBson);
@@ -220,7 +220,7 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     return new DocumentSourceOut(outputNs, pExpCtx);
 }
 
-Value DocumentSourceOut::serialize(bool explain) const {
+Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     massert(
         17000, "$out shouldn't have different db than input", _outputNs.db() == pExpCtx->ns.db());
 

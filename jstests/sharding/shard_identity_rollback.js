@@ -7,6 +7,8 @@
 (function() {
     "use strict";
 
+    load('jstests/libs/write_concern_util.js');
+
     var st = new ShardingTest({shards: 1});
 
     var replTest = new ReplSetTest({nodes: 3});
@@ -17,6 +19,16 @@
     var secondaries = replTest.getSecondaries();
     var configConnStr = st.configRS.getURL();
 
+    // Wait for the secondaries to have the latest oplog entries before stopping the fetcher to
+    // avoid the situation where one of the secondaries will not have an overlapping oplog with
+    // the other nodes once the primary is killed.
+    replTest.awaitSecondaryNodes();
+    replTest.awaitReplication();
+
+    stopServerReplication(secondaries);
+
+    jsTest.log("inserting shardIdentity document to primary that shouldn't replicate");
+
     var shardIdentityDoc = {
         _id: 'shardIdentity',
         configsvrConnectionString: configConnStr,
@@ -24,16 +36,6 @@
         clusterId: ObjectId()
     };
 
-    nodes.forEach(function(node) {
-        // Pause bgsync so it doesn't keep trying to sync from other nodes.
-        assert.commandWorked(
-            node.adminCommand({configureFailPoint: 'pauseRsBgSyncProducer', mode: 'alwaysOn'}));
-        // Stop oplog fetcher so that the ongoing fetcher doesn't return anything new.
-        assert.commandWorked(
-            node.adminCommand({configureFailPoint: 'stopOplogFetcher', mode: 'alwaysOn'}));
-    });
-
-    jsTest.log("inserting shardIdentity document to primary that shouldn't replicate");
     assert.writeOK(priConn.getDB('admin').system.version.update(
         {_id: 'shardIdentity'}, shardIdentityDoc, {upsert: true}));
 
@@ -63,18 +65,7 @@
 
     // Disable the fail point so that the elected node can exit drain mode and finish becoming
     // primary.
-    secondaries.forEach(function(secondary) {
-        assert.commandWorked(
-            secondary.adminCommand({configureFailPoint: 'stopOplogFetcher', mode: 'off'}));
-        try {
-            assert.commandWorked(
-                secondary.adminCommand({configureFailPoint: 'pauseRsBgSyncProducer', mode: 'off'}));
-        } catch (e) {
-            // Enabling bgsync producer may cause rollback, which will close all connections
-            // including the one sending "configureFailPoint".
-            print("got exception when disabling fail point 'pauseRsBgSyncProducer': " + e);
-        }
-    });
+    restartServerReplication(secondaries);
 
     // Wait for a new healthy primary
     var newPriConn = replTest.getPrimary();
@@ -98,8 +89,9 @@
             }
         },
         function() {
-            var oldPriOplog = priConn.getDB('local').oplog.rs.find().sort({ts: -1}).toArray();
-            var newPriOplog = newPriConn.getDB('local').oplog.rs.find().sort({ts: -1}).toArray();
+            var oldPriOplog = priConn.getDB('local').oplog.rs.find().sort({$natural: -1}).toArray();
+            var newPriOplog =
+                newPriConn.getDB('local').oplog.rs.find().sort({$natural: -1}).toArray();
             return "timed out waiting for original primary to shut down after rollback. " +
                 "Old primary oplog: " + tojson(oldPriOplog) + "; new primary oplog: " +
                 tojson(newPriOplog);

@@ -38,9 +38,9 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class CmdConnectionStatus : public Command {
+class CmdConnectionStatus : public BasicCommand {
 public:
-    CmdConnectionStatus() : Command("connectionStatus") {}
+    CmdConnectionStatus() : BasicCommand("connectionStatus") {}
     virtual bool slaveOk() const {
         return true;
     }
@@ -55,11 +55,9 @@ public:
         h << "Returns connection-specific information such as logged-in users and their roles";
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const string&,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         AuthorizationSession* authSession = AuthorizationSession::get(Client::getCurrent());
 

@@ -47,13 +47,14 @@ class BSONObjBuilder;
 struct HostAndPort;
 class NamespaceString;
 class OperationContext;
+class ServiceContext;
 class ShardFactory;
 class Shard;
 class ShardType;
 
 class ShardRegistryData {
 public:
-    ShardRegistryData(OperationContext* txn, ShardFactory* shardFactory);
+    ShardRegistryData(OperationContext* opCtx, ShardFactory* shardFactory);
     ShardRegistryData() = default;
     ~ShardRegistryData() = default;
 
@@ -97,17 +98,11 @@ public:
      */
     void rebuildShardIfExists(const ConnectionString& newConnString, ShardFactory* factory);
 
-    /**
-     * Rebuilds config shard. The result is to recreate a ReplicaSetMonitor in the case it does
-     * not exist.
-     */
-    void rebuildConfigShard(ShardFactory* factory);
-
 private:
     /**
      * Reads shards docs from the catalog client and fills in maps.
      */
-    void _init(OperationContext* txn, ShardFactory* factory);
+    void _init(OperationContext* opCtx, ShardFactory* factory);
 
     /**
      * Creates a shard based on the specified information and puts it into the lookup maps.
@@ -158,8 +153,15 @@ public:
     /**
      *  Starts ReplicaSetMonitor by adding a config shard.
      */
-    void startup();
+    void startup(OperationContext* opCtx);
 
+    /**
+     * This is invalid to use on the config server and will hit an invariant if it is done.
+     * If the config server has need of a connection string for itself, it should get it from the
+     * replication state.
+     *
+     * Returns the connection string for the config server.
+     */
     ConnectionString getConfigServerConnectionString() const;
 
     /**
@@ -170,15 +172,7 @@ public:
      * reloading is required, the caller should call this method one more time if the first call
      * returned false.
      */
-    bool reload(OperationContext* txn);
-
-    /**
-     * Throws out and reconstructs the config shard.  This has the effect that if replica set
-     * monitoring of the config server replica set has stopped (because the set was down for too
-     * long), this will cause the ReplicaSetMonitor to be rebuilt, which will re-trigger monitoring
-     * of the config replica set to resume.
-     */
-    void rebuildConfigShard();
+    bool reload(OperationContext* opCtx);
 
     /**
      * Takes a connection string describing either a shard or config server replica set, looks
@@ -195,7 +189,7 @@ public:
      * parameter can actually be the shard name or the HostAndPort for any
      * server in the shard.
      */
-    StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* txn, const ShardId& shardId);
+    StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* opCtx, const ShardId& shardId);
 
     /**
      * Returns a shared pointer to the shard object with the given shard id. The shardId parameter
@@ -248,6 +242,24 @@ public:
      * as it's owned by the static grid object.
      */
     void shutdown();
+
+    /**
+     * For use in mongos and mongod which needs notifications about changes to shard and config
+     * server replset membership to update the ShardRegistry.
+     *
+     * This is expected to be run in an existing thread.
+     */
+    static void replicaSetChangeShardRegistryUpdateHook(const std::string& setName,
+                                                        const std::string& newConnectionString);
+
+    /**
+     * For use in mongos which needs notifications about changes to shard replset membership to
+     * update the config.shards collection.
+     *
+     * This is expected to be run in a brand new thread.
+     */
+    static void replicaSetChangeConfigServerUpdateHook(const std::string& setName,
+                                                       const std::string& newConnectionString);
 
 private:
     /**

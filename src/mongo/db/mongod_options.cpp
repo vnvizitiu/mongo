@@ -40,7 +40,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/db.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/diag_log.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
@@ -50,6 +50,7 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/stringutils.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
@@ -59,8 +60,6 @@ using std::endl;
 using std::string;
 
 MongodGlobalParams mongodGlobalParams;
-
-extern DiagLog _diaglog;
 
 Status addMongodOptions(moe::OptionSection* options) {
     moe::OptionSection general_options("General options");
@@ -101,6 +100,15 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy)
         .incompatibleWith("noauth");
 
+    // IP Whitelisting Options
+    general_options
+        .addOptionChaining("security.clusterIpSourceWhitelist",
+                           "clusterIpSourceWhitelist",
+                           moe::StringVector,
+                           "Network CIDR specification of permitted origin for `__system` access.")
+        .composing();
+
+
     // Way to enable or disable auth in JSON Config
     general_options
         .addOptionChaining(
@@ -122,17 +130,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     general_options.addOptionChaining("security.enableLocalhostAuthBypass", "", moe::String, "TODO")
         .setSources(moe::SourceYAMLConfig);
 
-
-    // Network Options
-
-    general_options.addOptionChaining("net.http.JSONPEnabled",
-                                      "jsonp",
-                                      moe::Switch,
-                                      "allow JSONP access via http (has security implications)");
-
-    general_options.addOptionChaining(
-        "net.http.RESTInterfaceEnabled", "rest", moe::Switch, "turn on simple rest api");
-
     // Diagnostic Options
 
     general_options
@@ -147,6 +144,13 @@ Status addMongodOptions(moe::OptionSection* options) {
                            moe::Int,
                            "value of slow for profile and console log")
         .setDefault(moe::Value(100));
+
+    general_options
+        .addOptionChaining("operationProfiling.slowOpSampleRate",
+                           "slowOpSampleRate",
+                           moe::Double,
+                           "fraction of slow ops to include in the profile and console log")
+        .setDefault(moe::Value(1.0));
 
     general_options.addOptionChaining("profile", "profile", moe::Int, "0=off 1=slow, 2=all")
         .setSources(moe::SourceAllLegacy);
@@ -207,6 +211,13 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAll)
         .hidden();
 
+    storage_options
+        .addOptionChaining("storage.groupCollections",
+                           "groupCollections",
+                           moe::Switch,
+                           "group collections - if true the storage engine may group "
+                           "collections within a database into a shared record store.")
+        .hidden();
 
     general_options
         .addOptionChaining("noIndexBuildRetry",
@@ -350,10 +361,12 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     // Deprecated option that we don't want people to use for performance reasons
     storage_options
-        .addOptionChaining(
-            "nopreallocj", "nopreallocj", moe::Switch, "don't preallocate journal files")
+        .addOptionChaining("storage.mmapv1.journal.nopreallocj",
+                           "nopreallocj",
+                           moe::Switch,
+                           "don't preallocate journal files")
         .hidden()
-        .setSources(moe::SourceAllLegacy);
+        .setSources(moe::SourceAll);
 
 #if defined(__linux__)
     general_options.addOptionChaining(
@@ -511,18 +524,18 @@ Status addMongodOptions(moe::OptionSection* options) {
         .setSources(moe::SourceYAMLConfig);
 
 
-    options->addSection(general_options);
+    options->addSection(general_options).transitional_ignore();
 #if defined(_WIN32)
-    options->addSection(windows_scm_options);
+    options->addSection(windows_scm_options).transitional_ignore();
 #endif
-    options->addSection(replication_options);
-    options->addSection(ms_options);
-    options->addSection(rs_options);
-    options->addSection(sharding_options);
+    options->addSection(replication_options).transitional_ignore();
+    options->addSection(ms_options).transitional_ignore();
+    options->addSection(rs_options).transitional_ignore();
+    options->addSection(sharding_options).transitional_ignore();
 #ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options);
+    options->addSection(ssl_options).transitional_ignore();
 #endif
-    options->addSection(storage_options);
+    options->addSection(storage_options).transitional_ignore();
 
     // The following are legacy options that are disallowed in the JSON config file
 
@@ -625,33 +638,6 @@ Status validateMongodOptions(const moe::Environment& params) {
                       "Can't specify both --journal and --nojournal options.");
     }
 
-    // SERVER-10019 Enabling rest/jsonp without --httpinterface should break in all cases in the
-    // future
-    if (params.count("net.http.RESTInterfaceEnabled") &&
-        params["net.http.RESTInterfaceEnabled"].as<bool>() == true) {
-        // If we are explicitly setting httpinterface to false in the config file (the source of
-        // "net.http.enabled") and not overriding it on the command line (the source of
-        // "httpinterface"), then we can fail with an error message without breaking backwards
-        // compatibility.
-        if (!params.count("httpinterface") && params.count("net.http.enabled") &&
-            params["net.http.enabled"].as<bool>() == false) {
-            return Status(ErrorCodes::BadValue,
-                          "httpinterface must be enabled to use the rest api");
-        }
-    }
-
-    if (params.count("net.http.JSONPEnabled") &&
-        params["net.http.JSONPEnabled"].as<bool>() == true) {
-        // If we are explicitly setting httpinterface to false in the config file (the source of
-        // "net.http.enabled") and not overriding it on the command line (the source of
-        // "httpinterface"), then we can fail with an error message without breaking backwards
-        // compatibility.
-        if (!params.count("httpinterface") && params.count("net.http.enabled") &&
-            params["net.http.enabled"].as<bool>() == false) {
-            return Status(ErrorCodes::BadValue, "httpinterface must be enabled to use jsonp");
-        }
-    }
-
 #ifdef _WIN32
     if (params.count("install") || params.count("reinstall")) {
         if (params.count("storage.dbPath") &&
@@ -701,48 +687,6 @@ Status validateMongodOptions(const moe::Environment& params) {
 }
 
 Status canonicalizeMongodOptions(moe::Environment* params) {
-    // Need to handle this before canonicalizing the general "server options", since
-    // httpinterface and nohttpinterface are shared between mongos and mongod, but mongod has
-    // extra validation required.
-    if (params->count("net.http.RESTInterfaceEnabled") &&
-        (*params)["net.http.RESTInterfaceEnabled"].as<bool>() == true) {
-        bool httpEnabled = false;
-        if (params->count("net.http.enabled")) {
-            Status ret = params->get("net.http.enabled", &httpEnabled);
-            if (!ret.isOK()) {
-                return ret;
-            }
-        }
-        if (params->count("nohttpinterface")) {
-            log() << "** WARNING: Should not specify both --rest and --nohttpinterface"
-                  << startupWarningsLog;
-        } else if (!(params->count("httpinterface") ||
-                     (params->count("net.http.enabled") && httpEnabled == true))) {
-            log() << "** WARNING: --rest is specified without --httpinterface,"
-                  << startupWarningsLog;
-            log() << "**          enabling http interface" << startupWarningsLog;
-            Status ret = params->set("httpinterface", moe::Value(true));
-            if (!ret.isOK()) {
-                return ret;
-            }
-        }
-    }
-
-    if (params->count("net.http.JSONPEnabled") &&
-        (*params)["net.http.JSONPEnabled"].as<bool>() == true) {
-        if (params->count("nohttpinterface")) {
-            log() << "** WARNING: Should not specify both --jsonp and --nohttpinterface"
-                  << startupWarningsLog;
-        } else if (!params->count("httpinterface")) {
-            log() << "** WARNING --jsonp is specified without --httpinterface,"
-                  << startupWarningsLog;
-            log() << "**         enabling http interface" << startupWarningsLog;
-            Status ret = params->set("httpinterface", moe::Value(true));
-            if (!ret.isOK()) {
-                return ret;
-            }
-        }
-    }
 
     Status ret = canonicalizeServerOptions(params);
     if (!ret.isOK()) {
@@ -1044,8 +988,19 @@ Status storeMongodOptions(const moe::Environment& params) {
         serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
     }
 
+    if (params.count("operationProfiling.slowOpSampleRate")) {
+        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+    }
+
     if (params.count("storage.syncPeriodSecs")) {
         storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
+        if (storageGlobalParams.syncdelay < 0 ||
+            storageGlobalParams.syncdelay > StorageGlobalParams::kMaxSyncdelaySecs) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "syncdelay out of allowed range (0-"
+                                        << StorageGlobalParams::kMaxSyncdelaySecs
+                                        << "s)");
+        }
     }
 
     if (params.count("storage.directoryPerDB")) {
@@ -1056,6 +1011,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         params["storage.queryableBackupMode"].as<bool>()) {
         storageGlobalParams.readOnly = true;
         storageGlobalParams.dur = false;
+    }
+
+    if (params.count("storage.groupCollections")) {
+        storageGlobalParams.groupCollections = params["storage.groupCollections"].as<bool>();
     }
 
     if (params.count("cpu")) {
@@ -1077,11 +1036,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         // don't check if dur is false here as many will just use the default, and will default
         // to off on win32.  ie no point making life a little more complex by giving an error on
         // a dev environment.
-        storageGlobalParams.journalCommitIntervalMs =
-            params["storage.journal.commitIntervalMs"].as<int>();
-        if (storageGlobalParams.journalCommitIntervalMs < 1 ||
-            storageGlobalParams.journalCommitIntervalMs >
-                StorageGlobalParams::kMaxJournalCommitIntervalMs) {
+        auto journalCommitIntervalMs = params["storage.journal.commitIntervalMs"].as<int>();
+        storageGlobalParams.journalCommitIntervalMs.store(journalCommitIntervalMs);
+        if (journalCommitIntervalMs < 1 ||
+            journalCommitIntervalMs > StorageGlobalParams::kMaxJournalCommitIntervalMs) {
             return Status(ErrorCodes::BadValue,
                           str::stream() << "--journalCommitInterval out of allowed range (1-"
                                         << StorageGlobalParams::kMaxJournalCommitIntervalMs
@@ -1091,19 +1049,26 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("storage.mmapv1.journal.debugFlags")) {
         mmapv1GlobalOptions.journalOptions = params["storage.mmapv1.journal.debugFlags"].as<int>();
     }
-    if (params.count("nopreallocj")) {
-        mmapv1GlobalOptions.preallocj = !params["nopreallocj"].as<bool>();
+    if (params.count("storage.mmapv1.journal.nopreallocj")) {
+        mmapv1GlobalOptions.preallocj = !params["storage.mmapv1.journal.nopreallocj"].as<bool>();
     }
 
-    if (params.count("net.http.RESTInterfaceEnabled")) {
-        serverGlobalParams.rest = params["net.http.RESTInterfaceEnabled"].as<bool>();
-    }
-    if (params.count("net.http.JSONPEnabled")) {
-        serverGlobalParams.jsonp = params["net.http.JSONPEnabled"].as<bool>();
-    }
     if (params.count("security.javascriptEnabled")) {
         mongodGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
+
+    if (params.count("security.clusterIpSourceWhitelist")) {
+        mongodGlobalParams.whitelistedClusterNetwork = std::vector<std::string>();
+        for (const std::string& whitelistEntry :
+             params["security.clusterIpSourceWhitelist"].as<std::vector<std::string>>()) {
+            std::vector<std::string> intermediates;
+            splitStringDelim(whitelistEntry, &intermediates, ',');
+            std::copy(intermediates.begin(),
+                      intermediates.end(),
+                      std::back_inserter(*mongodGlobalParams.whitelistedClusterNetwork));
+        }
+    }
+
     if (params.count("storage.mmapv1.preallocDataFiles")) {
         mmapv1GlobalOptions.prealloc = params["storage.mmapv1.preallocDataFiles"].as<bool>();
         cout << "note: noprealloc may hurt performance in many applications" << endl;
@@ -1137,7 +1102,7 @@ Status storeMongodOptions(const moe::Environment& params) {
         storageGlobalParams.upgrade = 1;
     }
     if (params.count("notablescan")) {
-        storageGlobalParams.noTableScan = params["notablescan"].as<bool>();
+        storageGlobalParams.noTableScan.store(params["notablescan"].as<bool>());
     }
 
     repl::ReplSettings replSettings;
@@ -1239,7 +1204,7 @@ Status storeMongodOptions(const moe::Environment& params) {
             }
         }
     } else {
-        if (serverGlobalParams.port <= 0 || serverGlobalParams.port > 65535) {
+        if (serverGlobalParams.port < 0 || serverGlobalParams.port > 65535) {
             return Status(ErrorCodes::BadValue, "bad --port number");
         }
     }

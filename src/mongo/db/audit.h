@@ -36,16 +36,16 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
 class AuthorizationSession;
 class BSONObj;
 class Client;
-class Command;
+class CommandInterface;
 class NamespaceString;
 class OperationContext;
-class ReplSetConfig;
 class StringData;
 class UserName;
 
@@ -70,9 +70,8 @@ void logAuthentication(Client* client,
  * Logs the result of a command authorization check.
  */
 void logCommandAuthzCheck(Client* client,
-                          const std::string& dbname,
-                          const BSONObj& cmdObj,
-                          Command* command,
+                          const OpMsgRequest& cmdObj,
+                          CommandInterface* command,
                           ErrorCodes::Error result);
 
 /**
@@ -300,41 +299,7 @@ void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern
  * to the provided metadata builder. The users and roles are extracted from the current client.
  * They are to be the impersonated users and roles for a Command run by an internal user.
  */
-void writeImpersonatedUsersToMetadata(OperationContext* txn, BSONObjBuilder* metadataBob);
-
-/*
- * Looks for an 'impersonatedUsers' field.  This field is used by mongos to
- * transmit the usernames of the currently authenticated user when it runs commands
- * on a shard using internal user authentication.  Auditing uses this information
- * to properly ascribe users to actions.  This is necessary only for implicit actions that
- * mongos cannot properly audit itself; examples are implicit collection and database creation.
- * This function requires that the field is the last field in the bson object; it edits the
- * command BSON to efficiently remove the field before returning.
- *
- * cmdObj [in, out]: If any impersonated users field exists, it will be parsed and removed.
- * parsedUserNames [out]: populated with parsed usernames
- * fieldIsPresent [out]: true if impersonatedUsers field was present in the object
- */
-void parseAndRemoveImpersonatedUsersField(BSONObj cmdObj,
-                                          std::vector<UserName>* parsedUserNames,
-                                          bool* fieldIsPresent);
-
-/*
- * Looks for an 'impersonatedRoles' field.  This field is used by mongos to
- * transmit the roles of the currently authenticated user when it runs commands
- * on a shard using internal user authentication.  Auditing uses this information
- * to properly ascribe user roles to actions.  This is necessary only for implicit actions that
- * mongos cannot properly audit itself; examples are implicit collection and database creation.
- * This function requires that the field is the last field in the bson object; it edits the
- * command BSON to efficiently remove the field before returning.
- *
- * cmdObj [in, out]: If any impersonated roles field exists, it will be parsed and removed.
- * parsedRoleNames [out]: populated with parsed user rolenames
- * fieldIsPresent [out]: true if impersonatedRoles field was present in the object
- */
-void parseAndRemoveImpersonatedRolesField(BSONObj cmdObj,
-                                          std::vector<RoleName>* parsedRoleNames,
-                                          bool* fieldIsPresent);
+void writeImpersonatedUsersToMetadata(OperationContext* opCtx, BSONObjBuilder* metadataBob);
 
 }  // namespace audit
 }  // namespace mongo

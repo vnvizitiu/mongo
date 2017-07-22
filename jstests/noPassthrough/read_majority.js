@@ -71,7 +71,7 @@ load("jstests/libs/analyze_plan.js");
         jsTestLog("curOp output: " + tojson(curOps));
         for (var i in curOps.inprog) {
             var op = curOps.inprog[i];
-            if (op.op === 'query' && op.ns === "test.$cmd" && op.query.find === 'readMajority') {
+            if (op.op === 'query' && op.ns === "test.$cmd" && op.command.find === 'readMajority') {
                 db.killOp(op.opid);
                 return true;
             }
@@ -197,10 +197,10 @@ load("jstests/libs/analyze_plan.js");
     assert.eq(res.code, ErrorCodes.InvalidOptions);
 
     // Agg $out also doesn't support read concern majority.
-    assert.commandWorked(
-        t.runCommand('aggregate', {pipeline: [{$out: 'out'}], readConcern: {level: 'local'}}));
-    var res = assert.commandFailed(
-        t.runCommand('aggregate', {pipeline: [{$out: 'out'}], readConcern: {level: 'majority'}}));
+    assert.commandWorked(t.runCommand(
+        'aggregate', {pipeline: [{$out: 'out'}], cursor: {}, readConcern: {level: 'local'}}));
+    var res = assert.commandFailed(t.runCommand(
+        'aggregate', {pipeline: [{$out: 'out'}], cursor: {}, readConcern: {level: 'majority'}}));
     assert.eq(res.code, ErrorCodes.InvalidOptions);
 
     MongoRunner.stopMongod(testServer);

@@ -86,6 +86,18 @@ Status bsonExtractBooleanField(const BSONObj& object, StringData fieldName, bool
 Status bsonExtractIntegerField(const BSONObj& object, StringData fieldName, long long* out);
 
 /**
+ * Finds an element named "fieldName" in "object" that represents a double-precision floating point
+ * value.
+ *
+ * Returns Status::OK() and sets *out to the element's double floating point value representation on
+ * success. Returns ErrorCodes::NoSuchKey if there are no matches for "fieldName". Returns
+ * ErrorCodes::TypeMismatch if the value of the matching element is not of a numeric type. Returns
+ * ErrorCodes::BadValue if the value does not have an exact floating point number representation.
+ * For return values other than Status::OK(), the resulting value of "*out" is undefined.
+ */
+Status bsonExtractDoubleField(const BSONObj& object, StringData fieldName, double* out);
+
+/**
  * Finds a string-typed element named "fieldName" in "object" and stores its value in "out".
  *
  * Returns Status::OK() and sets *out to the found element's std::string value on success.  Returns
@@ -144,6 +156,21 @@ Status bsonExtractIntegerFieldWithDefault(const BSONObj& object,
                                           StringData fieldName,
                                           long long defaultValue,
                                           long long* out);
+
+/**
+ * Finds a double-precision floating point element named "fieldName" in "object".
+ *
+ * If a field named "fieldName" is present, and is a double, stores the value of the field into
+ * "*out". If no field named fieldName is present, sets "*out" to "defaultValue". In these cases,
+ * returns Status::OK().
+ *
+ * If "fieldName" is present more than once, behavior is undefined. If the found field is not a
+ * double, returns ErrorCodes::TypeMismatch.
+ */
+Status bsonExtractDoubleFieldWithDefault(const BSONObj& object,
+                                         StringData fieldName,
+                                         double defaultValue,
+                                         double* out);
 
 /**
  * Finds a std::string element named "fieldName" in "object".

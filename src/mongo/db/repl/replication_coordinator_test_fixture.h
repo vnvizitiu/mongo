@@ -33,7 +33,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -47,7 +47,7 @@ class NetworkInterfaceMock;
 
 namespace repl {
 
-class ReplicaSetConfig;
+class ReplSetConfig;
 class ReplicationCoordinatorExternalStateMock;
 class ReplicationCoordinatorImpl;
 class StorageInterfaceMock;
@@ -59,24 +59,23 @@ class TopologyCoordinatorImpl;
 class ReplCoordTest : public mongo::unittest::Test {
 public:
     /**
-     * Makes a ResponseStatus with the given "doc" response and optional elapsed time "millis".
+     * Makes a command response with the given "doc" response and optional elapsed time "millis".
      */
-    static ResponseStatus makeResponseStatus(const BSONObj& doc,
-                                             Milliseconds millis = Milliseconds(0));
+    static executor::RemoteCommandResponse makeResponseStatus(
+        const BSONObj& doc, Milliseconds millis = Milliseconds(0));
 
     /**
-     * Makes a ResponseStatus with the given "doc" response, metadata and optional elapsed time
+     * Makes a command response with the given "doc" response, metadata and optional elapsed time
      * "millis".
      */
-    static ResponseStatus makeResponseStatus(const BSONObj& doc,
-                                             const BSONObj& metadata,
-                                             Milliseconds millis = Milliseconds(0));
+    static executor::RemoteCommandResponse makeResponseStatus(
+        const BSONObj& doc, const BSONObj& metadata, Milliseconds millis = Milliseconds(0));
 
     /**
-     * Constructs a ReplicaSetConfig from the given BSON, or raises a test failure exception.
+     * Constructs a ReplSetConfig from the given BSON, or raises a test failure exception.
      */
-    static ReplicaSetConfig assertMakeRSConfig(const BSONObj& configBSON);
-    static ReplicaSetConfig assertMakeRSConfigV0(const BSONObj& configBson);
+    static ReplSetConfig assertMakeRSConfig(const BSONObj& configBSON);
+    static ReplSetConfig assertMakeRSConfigV0(const BSONObj& configBson);
 
     /**
      * Adds { protocolVersion: 0 or 1 } to the config.
@@ -103,9 +102,7 @@ protected:
     /**
      * Gets the replication executor under test.
      */
-    ReplicationExecutor* getReplExec() {
-        return _replExec.get();
-    }
+    executor::TaskExecutor* getReplExec();
 
     /**
      * Gets the replication coordinator under test.
@@ -235,23 +232,13 @@ protected:
     /**
      * Shuts down the objects under test.
      */
-    void shutdown(OperationContext* txn);
+    void shutdown(OperationContext* opCtx);
 
     /**
      * Receive the heartbeat request from replication coordinator and reply with a response.
      */
     void replyToReceivedHeartbeat();
     void replyToReceivedHeartbeatV1();
-
-    /**
-     * Sets how the test fixture reports the storage engine's durability feature.
-     */
-    void setStorageEngineDurable(bool val = true) {
-        _isStorageEngineDurable = val;
-    }
-    bool isStorageEngineDurable() const {
-        return _isStorageEngineDurable;
-    }
 
     void simulateEnoughHeartbeatsForAllNodesUp();
 
@@ -266,22 +253,23 @@ protected:
     void disableSnapshots();
 
     /**
-     * Timeout all freshness scan request for primary catch-up.
+     * Timeout all heartbeat requests for primary catch-up.
      */
-    void simulateCatchUpTimeout();
+    void simulateCatchUpAbort();
 
 private:
     std::unique_ptr<ReplicationCoordinatorImpl> _repl;
     // Owned by ReplicationCoordinatorImpl
     TopologyCoordinatorImpl* _topo = nullptr;
-    // Owned by ReplicationExecutor
+    // Owned by executor
     executor::NetworkInterfaceMock* _net = nullptr;
-    std::unique_ptr<ReplicationExecutor> _replExec;
     // Owned by ReplicationCoordinatorImpl
     ReplicationCoordinatorExternalStateMock* _externalState = nullptr;
+    // Owned by ReplicationCoordinatorImpl
+    executor::TaskExecutor* _replExec = nullptr;
+
     ReplSettings _settings;
     bool _callShutdown = false;
-    bool _isStorageEngineDurable = true;
     ServiceContext::UniqueClient _client = getGlobalServiceContext()->makeClient("testClient");
 };
 

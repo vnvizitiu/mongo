@@ -42,12 +42,11 @@ const BSONField<BSONObj> BatchedUpdateDocument::updateExpr("u");
 const BSONField<bool> BatchedUpdateDocument::multi("multi", false);
 const BSONField<bool> BatchedUpdateDocument::upsert("upsert", false);
 const BSONField<BSONObj> BatchedUpdateDocument::collation("collation");
+const BSONField<BSONArray> BatchedUpdateDocument::arrayFilters("arrayFilters");
 
 BatchedUpdateDocument::BatchedUpdateDocument() {
     clear();
 }
-
-BatchedUpdateDocument::~BatchedUpdateDocument() {}
 
 bool BatchedUpdateDocument::isValid(std::string* errMsg) const {
     std::string dummy;
@@ -86,6 +85,14 @@ BSONObj BatchedUpdateDocument::toBSON() const {
 
     if (_isCollationSet)
         builder.append(collation(), _collation);
+
+    if (_isArrayFiltersSet) {
+        BSONArrayBuilder arrayBuilder(builder.subarrayStart(arrayFilters()));
+        for (auto arrayFilter : _arrayFilters) {
+            arrayBuilder.append(arrayFilter);
+        }
+        arrayBuilder.doneFast();
+    }
 
     return builder.obj();
 }
@@ -129,6 +136,23 @@ bool BatchedUpdateDocument::parseBSON(const BSONObj& source, string* errMsg) {
             if (fieldState == FieldParser::FIELD_INVALID)
                 return false;
             _isCollationSet = fieldState == FieldParser::FIELD_SET;
+        } else if (fieldName == arrayFilters.name()) {
+            BSONArray arrayFiltersArray;
+            fieldState = FieldParser::extract(elem, arrayFilters, &arrayFiltersArray, errMsg);
+            if (fieldState == FieldParser::FIELD_INVALID)
+                return false;
+            _isArrayFiltersSet = fieldState == FieldParser::FIELD_SET;
+
+            if (_isArrayFiltersSet) {
+                for (auto arrayFilter : arrayFiltersArray) {
+                    if (arrayFilter.type() != BSONType::Object) {
+                        *errMsg = str::stream() << "Each array filter must be an object, found "
+                                                << arrayFilter.type();
+                        return false;
+                    }
+                    _arrayFilters.push_back(arrayFilter.Obj().getOwned());
+                }
+            }
         } else {
             *errMsg = str::stream() << "Unknown option in update document: " << fieldName;
             return false;
@@ -153,6 +177,9 @@ void BatchedUpdateDocument::clear() {
 
     _collation = BSONObj();
     _isCollationSet = false;
+
+    _arrayFilters.clear();
+    _isArrayFiltersSet = false;
 }
 
 void BatchedUpdateDocument::cloneTo(BatchedUpdateDocument* other) const {
@@ -172,6 +199,9 @@ void BatchedUpdateDocument::cloneTo(BatchedUpdateDocument* other) const {
 
     other->_collation = _collation;
     other->_isCollationSet = _isCollationSet;
+
+    other->_arrayFilters = _arrayFilters;
+    other->_isArrayFiltersSet = _isArrayFiltersSet;
 }
 
 std::string BatchedUpdateDocument::toString() const {
@@ -272,6 +302,27 @@ bool BatchedUpdateDocument::isCollationSet() const {
 const BSONObj& BatchedUpdateDocument::getCollation() const {
     dassert(_isCollationSet);
     return _collation;
+}
+
+void BatchedUpdateDocument::setArrayFilters(const std::vector<BSONObj>& arrayFilters) {
+    _arrayFilters.clear();
+    for (auto arrayFilter : arrayFilters) {
+        _arrayFilters.emplace_back(arrayFilter.getOwned());
+    }
+    _isArrayFiltersSet = true;
+}
+
+void BatchedUpdateDocument::unsetArrayFilters() {
+    _isArrayFiltersSet = false;
+}
+
+bool BatchedUpdateDocument::isArrayFiltersSet() const {
+    return _isArrayFiltersSet;
+}
+
+const std::vector<BSONObj>& BatchedUpdateDocument::getArrayFilters() const {
+    dassert(_isArrayFiltersSet);
+    return _arrayFilters;
 }
 
 }  // namespace mongo

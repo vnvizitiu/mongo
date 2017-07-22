@@ -31,8 +31,8 @@
 
 #pragma once
 
+#include <list>
 #include <memory>
-#include <queue>
 #include <string>
 
 #include <wiredtiger.h>
@@ -40,6 +40,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/elapsed_tracker.h"
 
@@ -84,20 +85,50 @@ public:
     virtual Status createRecordStore(OperationContext* opCtx,
                                      StringData ns,
                                      StringData ident,
-                                     const CollectionOptions& options);
+                                     const CollectionOptions& options) {
+        return createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
+    }
 
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
                                                         StringData ident,
-                                                        const CollectionOptions& options);
+                                                        const CollectionOptions& options) {
+        return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
+    }
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const IndexDescriptor* desc);
+                                             const IndexDescriptor* desc) {
+        return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
+    }
 
     virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
                                                         StringData ident,
-                                                        const IndexDescriptor* desc);
+                                                        const IndexDescriptor* desc) {
+        return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
+    }
+
+    virtual Status createGroupedRecordStore(OperationContext* opCtx,
+                                            StringData ns,
+                                            StringData ident,
+                                            const CollectionOptions& options,
+                                            KVPrefix prefix);
+
+    virtual std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
+                                                               StringData ns,
+                                                               StringData ident,
+                                                               const CollectionOptions& options,
+                                                               KVPrefix prefix);
+
+    virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
+                                                    StringData ident,
+                                                    const IndexDescriptor* desc,
+                                                    KVPrefix prefix);
+
+    virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
+                                                               StringData ident,
+                                                               const IndexDescriptor* desc,
+                                                               KVPrefix prefix);
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
@@ -107,11 +138,11 @@ public:
                               StringData ident,
                               const RecordStore* originalRecordStore) const;
 
-    virtual int flushAllFiles(bool sync);
+    virtual int flushAllFiles(OperationContext* opCtx, bool sync);
 
-    virtual Status beginBackup(OperationContext* txn);
+    virtual Status beginBackup(OperationContext* opCtx);
 
-    virtual void endBackup(OperationContext* txn);
+    virtual void endBackup(OperationContext* opCtx);
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
@@ -138,9 +169,18 @@ public:
         return _conn;
     }
     void dropSomeQueuedIdents();
+    std::list<WiredTigerCachedCursor> filterCursorsWithQueuedDrops(
+        std::list<WiredTigerCachedCursor>* cache);
     bool haveDropsQueued() const;
 
     void syncSizeInfo(bool sync) const;
+
+    /**
+     * Sets the implementation for `initRsOplogBackgroundThread` (allowing tests to skip the
+     * background job, for example). Intended to be called from a MONGO_INITIALIZER and therefroe in
+     * a single threaded context.
+     */
+    static void setInitRsOplogBackgroundThreadCallback(stdx::function<bool(StringData)> cb);
 
     /**
      * Initializes a background job to remove excess documents in the oplog collections.
@@ -154,6 +194,7 @@ public:
 
 private:
     class WiredTigerJournalFlusher;
+    class WiredTigerCheckpointThread;
 
     Status _salvageIfNeeded(const char* uri);
     void _checkIdentPath(StringData ident);
@@ -177,13 +218,14 @@ private:
     bool _ephemeral;
     bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
+    std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
     std::string _rsOptions;
     std::string _indexOptions;
 
     mutable stdx::mutex _dropAllQueuesMutex;
     mutable stdx::mutex _identToDropMutex;
-    std::queue<std::string> _identToDrop;
+    std::list<std::string> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 

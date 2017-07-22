@@ -65,12 +65,14 @@ public:
      */
     void startSession(transport::SessionHandle session) override;
 
+    void endAllSessions(transport::Session::TagMask tags) override;
+
+    DbResponse handleRequest(OperationContext* opCtx, const Message& request) override;
+
 private:
     void run(transport::SessionHandle session);
 
     transport::TransportLayer* _tl;
-
-    Message _outMessage;
 
     stdx::mutex _shutdownLock;
     bool _inShutdown;

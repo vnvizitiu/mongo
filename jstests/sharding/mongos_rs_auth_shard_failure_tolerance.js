@@ -29,7 +29,6 @@ admin.createUser({user: adminUser, pwd: password, roles: ["root"]});
 admin.auth(adminUser, password);
 
 st.stopBalancer();
-var shards = mongos.getDB("config").shards.find().toArray();
 
 assert.commandWorked(admin.runCommand({setParameter: 1, traceExceptions: true}));
 
@@ -39,15 +38,16 @@ var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 // Create the unsharded database with shard0 primary
 assert.writeOK(collUnsharded.insert({some: "doc"}));
 assert.writeOK(collUnsharded.remove({}));
-printjson(admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: shards[0]._id}));
+printjson(
+    admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
 
 // Create the sharded database with shard1 primary
 assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-printjson(admin.runCommand({movePrimary: collSharded.getDB().toString(), to: shards[1]._id}));
+printjson(admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
-assert.commandWorked(
-    admin.runCommand({moveChunk: collSharded.toString(), find: {_id: -1}, to: shards[0]._id}));
+assert.commandWorked(admin.runCommand(
+    {moveChunk: collSharded.toString(), find: {_id: -1}, to: st.shard0.shardName}));
 
 st.printShardingStatus();
 var shardedDBUser = "shardedDBUser";
@@ -66,6 +66,19 @@ function authDBUsers(conn) {
     conn.getDB(collUnsharded.getDB().toString()).auth(unshardedDBUser, password);
     return conn;
 }
+
+// Secondaries do not refresh their in-memory routing table until a request with a higher version
+// is received, and refreshing requires communication with the primary to obtain the newest version.
+// Read from the secondaries once before taking down primaries to ensure they have loaded the
+// routing table into memory.
+// TODO SERVER-30148: replace this with calls to awaitReplication() on each shard owning data for
+// the sharded collection once secondaries refresh proactively.
+var mongosSetupConn = new Mongo(mongos.host);
+authDBUsers(mongosSetupConn);
+mongosSetupConn.setReadPref("secondary");
+assert(!mongosSetupConn.getCollection(collSharded.toString()).find({}).hasNext());
+
+gc();  // Clean up connections
 
 //
 // Setup is complete

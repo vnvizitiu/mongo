@@ -40,24 +40,30 @@ namespace mongo {
 
 namespace {
 
+// Note: Though the next() method on RouterExecStage and its subclasses takes an OperationContext*,
+// these stages are mocked in this test using RouterStageMock. RouterStageMock does not actually use
+// the OperationContext, so we pass a nullptr OperationContext* to next() in these tests.
+
 TEST(ClusterClientCursorImpl, NumReturnedSoFar) {
     auto mockStage = stdx::make_unique<RouterStageMock>();
     for (int i = 1; i < 10; ++i) {
         mockStage->queueResult(BSON("a" << i));
     }
 
-    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ClusterClientCursorImpl cursor(std::move(mockStage),
+                                   ClusterClientCursorParams(NamespaceString("unused"), {}),
+                                   boost::none);
 
     ASSERT_EQ(cursor.getNumReturnedSoFar(), 0);
 
     for (int i = 1; i < 10; ++i) {
-        auto result = cursor.next();
+        auto result = cursor.next(nullptr);
         ASSERT(result.isOK());
         ASSERT_BSONOBJ_EQ(*result.getValue().getResult(), BSON("a" << i));
         ASSERT_EQ(cursor.getNumReturnedSoFar(), i);
     }
     // Now check that if nothing is fetched the getNumReturnedSoFar stays the same.
-    auto result = cursor.next();
+    auto result = cursor.next(nullptr);
     ASSERT_OK(result.getStatus());
     ASSERT_TRUE(result.getValue().isEOF());
     ASSERT_EQ(cursor.getNumReturnedSoFar(), 9LL);
@@ -68,9 +74,11 @@ TEST(ClusterClientCursorImpl, QueueResult) {
     mockStage->queueResult(BSON("a" << 1));
     mockStage->queueResult(BSON("a" << 4));
 
-    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ClusterClientCursorImpl cursor(std::move(mockStage),
+                                   ClusterClientCursorParams(NamespaceString("unused"), {}),
+                                   boost::none);
 
-    auto firstResult = cursor.next();
+    auto firstResult = cursor.next(nullptr);
     ASSERT_OK(firstResult.getStatus());
     ASSERT(firstResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*firstResult.getValue().getResult(), BSON("a" << 1));
@@ -78,47 +86,26 @@ TEST(ClusterClientCursorImpl, QueueResult) {
     cursor.queueResult(BSON("a" << 2));
     cursor.queueResult(BSON("a" << 3));
 
-    auto secondResult = cursor.next();
+    auto secondResult = cursor.next(nullptr);
     ASSERT_OK(secondResult.getStatus());
     ASSERT(secondResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*secondResult.getValue().getResult(), BSON("a" << 2));
 
-    auto thirdResult = cursor.next();
+    auto thirdResult = cursor.next(nullptr);
     ASSERT_OK(thirdResult.getStatus());
     ASSERT(thirdResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*thirdResult.getValue().getResult(), BSON("a" << 3));
 
-    auto fourthResult = cursor.next();
+    auto fourthResult = cursor.next(nullptr);
     ASSERT_OK(fourthResult.getStatus());
     ASSERT(fourthResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*fourthResult.getValue().getResult(), BSON("a" << 4));
 
-    auto fifthResult = cursor.next();
+    auto fifthResult = cursor.next(nullptr);
     ASSERT_OK(fifthResult.getStatus());
     ASSERT(fifthResult.getValue().isEOF());
 
     ASSERT_EQ(cursor.getNumReturnedSoFar(), 4LL);
-}
-
-TEST(ClusterClientCursorImpl, CursorPropagatesViewDefinition) {
-    auto mockStage = stdx::make_unique<RouterStageMock>();
-
-    auto viewDef = BSON("ns"
-                        << "view_ns"
-                        << "pipeline"
-                        << BSON_ARRAY(BSON("$match" << BSONNULL)));
-
-    ClusterQueryResult cqResult;
-    cqResult.setViewDefinition(viewDef);
-    mockStage->queueResult(cqResult);
-
-    ClusterClientCursorImpl cursor(std::move(mockStage));
-
-    auto result = cursor.next();
-    ASSERT_OK(result.getStatus());
-    ASSERT(!result.getValue().getResult());
-    ASSERT(result.getValue().getViewDefinition());
-    ASSERT_BSONOBJ_EQ(*result.getValue().getViewDefinition(), viewDef);
 }
 
 TEST(ClusterClientCursorImpl, RemotesExhausted) {
@@ -127,22 +114,24 @@ TEST(ClusterClientCursorImpl, RemotesExhausted) {
     mockStage->queueResult(BSON("a" << 2));
     mockStage->markRemotesExhausted();
 
-    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ClusterClientCursorImpl cursor(std::move(mockStage),
+                                   ClusterClientCursorParams(NamespaceString("unused"), {}),
+                                   boost::none);
     ASSERT_TRUE(cursor.remotesExhausted());
 
-    auto firstResult = cursor.next();
+    auto firstResult = cursor.next(nullptr);
     ASSERT_OK(firstResult.getStatus());
     ASSERT(firstResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*firstResult.getValue().getResult(), BSON("a" << 1));
     ASSERT_TRUE(cursor.remotesExhausted());
 
-    auto secondResult = cursor.next();
+    auto secondResult = cursor.next(nullptr);
     ASSERT_OK(secondResult.getStatus());
     ASSERT(secondResult.getValue().getResult());
     ASSERT_BSONOBJ_EQ(*secondResult.getValue().getResult(), BSON("a" << 2));
     ASSERT_TRUE(cursor.remotesExhausted());
 
-    auto thirdResult = cursor.next();
+    auto thirdResult = cursor.next(nullptr);
     ASSERT_OK(thirdResult.getStatus());
     ASSERT_TRUE(thirdResult.getValue().isEOF());
     ASSERT_TRUE(cursor.remotesExhausted());
@@ -155,12 +144,29 @@ TEST(ClusterClientCursorImpl, ForwardsAwaitDataTimeout) {
     auto mockStagePtr = mockStage.get();
     ASSERT_NOT_OK(mockStage->getAwaitDataTimeout().getStatus());
 
-    ClusterClientCursorImpl cursor(std::move(mockStage));
+    ClusterClientCursorImpl cursor(std::move(mockStage),
+                                   ClusterClientCursorParams(NamespaceString("unused"), {}),
+                                   boost::none);
     ASSERT_OK(cursor.setAwaitDataTimeout(Milliseconds(789)));
 
     auto awaitDataTimeout = mockStagePtr->getAwaitDataTimeout();
     ASSERT_OK(awaitDataTimeout.getStatus());
     ASSERT_EQ(789, durationCount<Milliseconds>(awaitDataTimeout.getValue()));
+}
+
+TEST(ClusterClientCursorImpl, LogicalSessionIdsOnCursors) {
+    // Make a cursor with no lsid
+    auto mockStage = stdx::make_unique<RouterStageMock>();
+    ClusterClientCursorParams params(NamespaceString("test"), {});
+    ClusterClientCursorImpl cursor{std::move(mockStage), std::move(params), boost::none};
+    ASSERT(!cursor.getLsid());
+
+    // Make a cursor with an lsid
+    auto mockStage2 = stdx::make_unique<RouterStageMock>();
+    ClusterClientCursorParams params2(NamespaceString("test"), {});
+    auto lsid = LogicalSessionId::gen();
+    ClusterClientCursorImpl cursor2{std::move(mockStage2), std::move(params2), lsid};
+    ASSERT(*(cursor2.getLsid()) == lsid);
 }
 
 }  // namespace

@@ -2,9 +2,15 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.SConscript(
     dirs=[
         "collation",
+        "datetime",
+    ],
+    exports=[
+        'env'
     ],
 )
 
@@ -69,15 +75,25 @@ env.Library(
         "query_common",
         "query_planner",
         "query_planner_test_lib",
+        '$BUILD_DIR/mongo/db/catalog/collection',
+        '$BUILD_DIR/mongo/db/catalog/database',
+        '$BUILD_DIR/mongo/db/catalog/index_catalog',
+        '$BUILD_DIR/mongo/db/catalog/index_catalog_entry',
         "$BUILD_DIR/mongo/db/curop",
         "$BUILD_DIR/mongo/db/exec/exec",
+        "$BUILD_DIR/mongo/db/repl/repl_coordinator_interface",
         "$BUILD_DIR/mongo/db/s/sharding",
+        "$BUILD_DIR/mongo/db/storage/oplog_hack",
+        "$BUILD_DIR/mongo/util/elapsed_tracker",
+        "$BUILD_DIR/mongo/db/matcher/expressions_mongod_only",
+        #'$BUILD_DIR/mongo/db/clientcursor', # CYCLE
+        #'$BUILD_DIR/mongo/db/write_ops', # CYCLE
+        #'$BUILD_DIR/mongo/db/catalog/catalog', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Depends on files from serverOnlyFiles, and has many other
-        # missing dependencies.
-        'incomplete',
-    ]
+        # TODO(ADAM, 2017-04-06): See `CYCLE` tags above.
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
+    ],
 )
 
 # Shared mongod/mongos query code.
@@ -86,15 +102,36 @@ env.Library(
     source=[
         "collation/collator_factory_icu_decoration.cpp",
         "find_common.cpp",
-        "explain_common.cpp",
         "parsed_distinct.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/util/fail_point",
         "collation/collator_icu",
+        "datetime/init_timezone_data",
+        "explain_options",
         "query_planner",
         "query_request",
+    ],
+)
+
+env.Library(
+    target="explain_options",
+    source=[
+        "explain_options.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+    ],
+)
+
+env.CppUnitTest(
+    target="explain_options_test",
+    source=[
+        "explain_options_test.cpp",
+    ],
+    LIBDEPS=[
+        "explain_options",
     ],
 )
 
@@ -137,7 +174,7 @@ env.Library(
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/index_names",
-        "$BUILD_DIR/mongo/db/matcher/expressions_geo",
+        "$BUILD_DIR/mongo/db/matcher/expressions",
         "$BUILD_DIR/mongo/db/mongohasher",
         "$BUILD_DIR/mongo/db/server_parameters",
         "collation/collator_interface",
@@ -193,10 +230,11 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/exec/exec',
         '$BUILD_DIR/mongo/db/exec/working_set',
+        #'$BUILD_DIR/mongo/db/query/query', # CYCLE
     ],
     LIBDEPS_TAGS=[
-        # Circular with the 'query' library in this directory
-        'incomplete',
+        # TODO(ADAM, 2017-01-09): See `CYCLE` tags above
+        'illegal_cyclic_or_unresolved_dependencies_whitelisted',
     ],
 )
 
@@ -218,6 +256,7 @@ env.Library(
     ],
     LIBDEPS=[
         "collation/collator_factory_mock",
+        "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/db/service_context",
     ],
 )

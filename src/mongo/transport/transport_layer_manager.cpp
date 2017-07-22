@@ -31,8 +31,13 @@
 #include "mongo/transport/transport_layer_manager.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/transport/service_executor_fixed.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/transport_layer_legacy.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/time_support.h"
 #include <limits>
@@ -62,10 +67,6 @@ Status TransportLayerManager::wait(Ticket&& ticket) {
 
 void TransportLayerManager::asyncWait(Ticket&& ticket, TicketCallback callback) {
     return getTicketTransportLayer(ticket)->asyncWait(std::move(ticket), std::move(callback));
-}
-
-SSLPeerInfo TransportLayerManager::getX509PeerInfo(const ConstSessionHandle& session) const {
-    return session->getX509PeerInfo();
 }
 
 template <typename Callable>
@@ -101,16 +102,35 @@ void TransportLayerManager::end(const SessionHandle& session) {
     session->getTransportLayer()->end(session);
 }
 
-void TransportLayerManager::endAllSessions(Session::TagMask tags) {
-    _foreach([&tags](TransportLayer* tl) { tl->endAllSessions(tags); });
-}
-
+// TODO Right now this and setup() leave TLs started if there's an error. In practice the server
+// exits with an error and this isn't an issue, but we should make this more robust.
 Status TransportLayerManager::start() {
+    for (auto&& tl : _tls) {
+        auto status = tl->start();
+        if (!status.isOK()) {
+            _tls.clear();
+            return status;
+        }
+    }
+
     return Status::OK();
 }
 
 void TransportLayerManager::shutdown() {
     _foreach([](TransportLayer* tl) { tl->shutdown(); });
+}
+
+// TODO Same comment as start()
+Status TransportLayerManager::setup() {
+    for (auto&& tl : _tls) {
+        auto status = tl->setup();
+        if (!status.isOK()) {
+            _tls.clear();
+            return status;
+        }
+    }
+
+    return Status::OK();
 }
 
 Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<TransportLayer> tl) {
@@ -120,6 +140,33 @@ Status TransportLayerManager::addAndStartTransportLayer(std::unique_ptr<Transpor
         _tls.emplace_back(std::move(tl));
     }
     return ptr->start();
+}
+
+std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
+    const ServerGlobalParams* config, ServiceContext* ctx) {
+    std::unique_ptr<TransportLayer> transportLayer;
+    auto sep = ctx->getServiceEntryPoint();
+    if (config->transportLayer == "asio") {
+        transport::TransportLayerASIO::Options opts(config);
+        if (config->serviceExecutor != "synchronous") {
+            opts.async = true;
+        }
+
+        auto transportLayerASIO = stdx::make_unique<transport::TransportLayerASIO>(opts, sep);
+
+        if (config->serviceExecutor == "fixedForTesting") {
+            ctx->setServiceExecutor(
+                stdx::make_unique<ServiceExecutorFixed>(ctx, transportLayerASIO->getIOContext()));
+        }
+        transportLayer = std::move(transportLayerASIO);
+    } else if (serverGlobalParams.transportLayer == "legacy") {
+        transport::TransportLayerLegacy::Options opts(config);
+        transportLayer = stdx::make_unique<transport::TransportLayerLegacy>(opts, sep);
+    }
+
+    std::vector<std::unique_ptr<TransportLayer>> retVector;
+    retVector.emplace_back(std::move(transportLayer));
+    return stdx::make_unique<TransportLayerManager>(std::move(retVector));
 }
 
 }  // namespace transport

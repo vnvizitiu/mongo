@@ -37,7 +37,7 @@
 namespace mongo {
 
 StorageEngine* ServiceContextNoop::getGlobalStorageEngine() {
-    return NULL;
+    return nullptr;
 }
 
 void ServiceContextNoop::initializeGlobalStorageEngine() {}
@@ -76,4 +76,5 @@ void ServiceContextNoop::setOpObserver(std::unique_ptr<OpObserver> opObserver) {
 OpObserver* ServiceContextNoop::getOpObserver() {
     return nullptr;
 }
+
 }  // namespace mongo

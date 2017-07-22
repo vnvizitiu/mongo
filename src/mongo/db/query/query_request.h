@@ -250,6 +250,14 @@ public:
         _comment = comment;
     }
 
+    const BSONObj& getUnwrappedReadPref() const {
+        return _unwrappedReadPref;
+    }
+
+    void setUnwrappedReadPref(BSONObj unwrappedReadPref) {
+        _unwrappedReadPref = unwrappedReadPref.getOwned();
+    }
+
     int getMaxScan() const {
         return _maxScan;
     }
@@ -393,6 +401,16 @@ public:
      */
     static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQueryMessage(const QueryMessage& qm);
 
+    /**
+     * Parse the provided legacy query object and parameters to construct a QueryRequest.
+     */
+    static StatusWith<std::unique_ptr<QueryRequest>> fromLegacyQueryForTest(NamespaceString nss,
+                                                                            const BSONObj& queryObj,
+                                                                            const BSONObj& proj,
+                                                                            int ntoskip,
+                                                                            int ntoreturn,
+                                                                            int queryOptions);
+
 private:
     Status init(int ntoskip,
                 int ntoreturn,
@@ -439,6 +457,11 @@ private:
     // The collation is parsed elsewhere.
     BSONObj _collation;
 
+    // The unwrapped readPreference object, if one was given to us by the mongos command processor.
+    // This object will be empty when no readPreference is specified or if the request does not
+    // originate from mongos.
+    BSONObj _unwrappedReadPref;
+
     bool _wantMore = true;
 
     // Must be either unset or positive. Negative skip is illegal and a skip of zero received from
@@ -463,6 +486,8 @@ private:
     std::string _comment;
 
     int _maxScan = 0;
+
+    // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     int _maxTimeMS = 0;
 
     BSONObj _min;

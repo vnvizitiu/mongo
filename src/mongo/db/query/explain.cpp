@@ -31,6 +31,7 @@
 #include "mongo/db/query/explain.h"
 
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
@@ -41,6 +42,7 @@
 #include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/text.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -166,33 +168,39 @@ size_t getDocsExamined(StageType type, const SpecificStats* specific) {
 }
 
 /**
- * Adds to the plan summary string being built by 'ss' for the execution stage 'stage'.
+ * Adds to the plan summary string being built by 'sb' for the execution stage 'stage'.
  */
-void addStageSummaryStr(const PlanStage* stage, mongoutils::str::stream& ss) {
+void addStageSummaryStr(const PlanStage* stage, StringBuilder& sb) {
     // First add the stage type string.
     const CommonStats* common = stage->getCommonStats();
-    ss << common->stageTypeStr;
+    sb << common->stageTypeStr;
 
     // Some leaf nodes also provide info about the index they used.
     const SpecificStats* specific = stage->getSpecificStats();
     if (STAGE_COUNT_SCAN == stage->stageType()) {
         const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
-        ss << " " << spec->keyPattern;
+        const KeyPattern keyPattern{spec->keyPattern};
+        sb << " " << keyPattern;
     } else if (STAGE_DISTINCT_SCAN == stage->stageType()) {
         const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
-        ss << " " << spec->keyPattern;
+        const KeyPattern keyPattern{spec->keyPattern};
+        sb << " " << keyPattern;
     } else if (STAGE_GEO_NEAR_2D == stage->stageType()) {
         const NearStats* spec = static_cast<const NearStats*>(specific);
-        ss << " " << spec->keyPattern;
+        const KeyPattern keyPattern{spec->keyPattern};
+        sb << " " << keyPattern;
     } else if (STAGE_GEO_NEAR_2DSPHERE == stage->stageType()) {
         const NearStats* spec = static_cast<const NearStats*>(specific);
-        ss << " " << spec->keyPattern;
+        const KeyPattern keyPattern{spec->keyPattern};
+        sb << " " << keyPattern;
     } else if (STAGE_IXSCAN == stage->stageType()) {
         const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
-        ss << " " << spec->keyPattern;
+        const KeyPattern keyPattern{spec->keyPattern};
+        sb << " " << keyPattern;
     } else if (STAGE_TEXT == stage->stageType()) {
         const TextStats* spec = static_cast<const TextStats*>(specific);
-        ss << " " << spec->indexPrefix;
+        const KeyPattern keyPattern{spec->indexPrefix};
+        sb << " " << keyPattern;
     }
 }
 
@@ -238,7 +246,7 @@ using mongoutils::str::stream;
 
 // static
 void Explain::statsToBSON(const PlanStageStats& stats,
-                          ExplainCommon::Verbosity verbosity,
+                          ExplainOptions::Verbosity verbosity,
                           BSONObjBuilder* bob,
                           BSONObjBuilder* topLevelBob) {
     invariant(bob);
@@ -260,7 +268,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     }
 
     // Some top-level exec stats get pulled out of the root stage.
-    if (verbosity >= ExplainCommon::EXEC_STATS) {
+    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         bob->appendNumber("nReturned", stats.common.advanced);
         bob->appendNumber("executionTimeMillisEstimate", stats.common.executionTimeMillis);
         bob->appendNumber("works", stats.common.works);
@@ -277,7 +285,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     if (STAGE_AND_HASH == stats.stageType) {
         AndHashStats* spec = static_cast<AndHashStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("memUsage", spec->memUsage);
             bob->appendNumber("memLimit", spec->memLimit);
 
@@ -291,7 +299,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_AND_SORTED == stats.stageType) {
         AndSortedStats* spec = static_cast<AndSortedStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("flagged", spec->flagged);
             for (size_t i = 0; i < spec->failedAnd.size(); ++i) {
                 bob->appendNumber(string(stream() << "failedAnd_" << i), spec->failedAnd[i]);
@@ -300,20 +308,20 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_COLLSCAN == stats.stageType) {
         CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", spec->docsTested);
         }
     } else if (STAGE_COUNT == stats.stageType) {
         CountStats* spec = static_cast<CountStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nCounted", spec->nCounted);
             bob->appendNumber("nSkipped", spec->nSkipped);
         }
     } else if (STAGE_COUNT_SCAN == stats.stageType) {
         CountScanStats* spec = static_cast<CountScanStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("keysExamined", spec->keysExamined);
         }
 
@@ -340,7 +348,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_DELETE == stats.stageType) {
         DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nWouldDelete", spec->docsDeleted);
             bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
         }
@@ -368,18 +376,18 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->append("indexBounds", spec->indexBounds);
         }
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("keysExamined", spec->keysExamined);
         }
     } else if (STAGE_ENSURE_SORTED == stats.stageType) {
         EnsureSortedStats* spec = static_cast<EnsureSortedStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nDropped", spec->nDropped);
         }
     } else if (STAGE_FETCH == stats.stageType) {
         FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", spec->docsExamined);
             bob->appendNumber("alreadyHasObj", spec->alreadyHasObj);
         }
@@ -390,7 +398,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         bob->append("indexName", spec->indexName);
         bob->append("indexVersion", spec->indexVersion);
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
             for (vector<IntervalStats>::const_iterator it = spec->intervalStats.begin();
                  it != spec->intervalStats.end();
@@ -406,12 +414,12 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         }
     } else if (STAGE_GROUP == stats.stageType) {
         GroupStats* spec = static_cast<GroupStats*>(stats.specific.get());
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nGroups", spec->nGroups);
         }
     } else if (STAGE_IDHACK == stats.stageType) {
         IDHackStats* spec = static_cast<IDHackStats*>(stats.specific.get());
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("keysExamined", spec->keysExamined);
             bob->appendNumber("docsExamined", spec->docsExamined);
         }
@@ -439,7 +447,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             bob->append("indexBounds", spec->indexBounds);
         }
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("keysExamined", spec->keysExamined);
             bob->appendNumber("seeks", spec->seeks);
             bob->appendNumber("dupsTested", spec->dupsTested);
@@ -449,7 +457,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_OR == stats.stageType) {
         OrStats* spec = static_cast<OrStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
             bob->appendNumber("recordIdsForgotten", spec->recordIdsForgotten);
@@ -463,7 +471,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_SHARDING_FILTER == stats.stageType) {
         ShardingFilterStats* spec = static_cast<ShardingFilterStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("chunkSkips", spec->chunkSkips);
         }
     } else if (STAGE_SKIP == stats.stageType) {
@@ -473,7 +481,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         SortStats* spec = static_cast<SortStats*>(stats.specific.get());
         bob->append("sortPattern", spec->sortPattern);
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("memUsage", spec->memUsage);
             bob->appendNumber("memLimit", spec->memLimit);
         }
@@ -485,7 +493,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
         MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
         bob->append("sortPattern", spec->sortPattern);
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("dupsTested", spec->dupsTested);
             bob->appendNumber("dupsDropped", spec->dupsDropped);
         }
@@ -499,19 +507,19 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_TEXT_MATCH == stats.stageType) {
         TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsRejected", spec->docsRejected);
         }
     } else if (STAGE_TEXT_OR == stats.stageType) {
         TextOrStats* spec = static_cast<TextOrStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", spec->fetches);
         }
     } else if (STAGE_UPDATE == stats.stageType) {
         UpdateStats* spec = static_cast<UpdateStats*>(stats.specific.get());
 
-        if (verbosity >= ExplainCommon::EXEC_STATS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("nMatched", spec->nMatched);
             bob->appendNumber("nWouldModify", spec->nModified);
             bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
@@ -547,7 +555,7 @@ void Explain::statsToBSON(const PlanStageStats& stats,
 }
 
 // static
-BSONObj Explain::statsToBSON(const PlanStageStats& stats, ExplainCommon::Verbosity verbosity) {
+BSONObj Explain::statsToBSON(const PlanStageStats& stats, ExplainOptions::Verbosity verbosity) {
     BSONObjBuilder bob;
     statsToBSON(stats, &bob, verbosity);
     return bob.obj();
@@ -556,7 +564,7 @@ BSONObj Explain::statsToBSON(const PlanStageStats& stats, ExplainCommon::Verbosi
 // static
 void Explain::statsToBSON(const PlanStageStats& stats,
                           BSONObjBuilder* bob,
-                          ExplainCommon::Verbosity verbosity) {
+                          ExplainOptions::Verbosity verbosity) {
     statsToBSON(stats, verbosity, bob, bob);
 }
 
@@ -574,7 +582,7 @@ void Explain::getWinningPlanStats(const PlanExecutor* exec, BSONObjBuilder* bob)
         mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()])
             : std::move(exec->getRootStage()->getStats()));
 
-    statsToBSON(*winningStats, ExplainCommon::EXEC_STATS, bob, bob);
+    statsToBSON(*winningStats, ExplainOptions::Verbosity::kExecStats, bob, bob);
 }
 
 // static
@@ -588,7 +596,7 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));
 
     plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
-    plannerBob.append("namespace", exec->ns());
+    plannerBob.append("namespace", exec->nss().ns());
 
     // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
     // field will always be false in the case of EOF or idhack plans.
@@ -619,14 +627,14 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     }
 
     BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
-    statsToBSON(*winnerStats, &winningPlanBob, ExplainCommon::QUERY_PLANNER);
+    statsToBSON(*winnerStats, &winningPlanBob, ExplainOptions::Verbosity::kQueryPlanner);
     winningPlanBob.doneFast();
 
     // Genenerate array of rejected plans.
     BSONArrayBuilder allPlansBob(plannerBob.subarrayStart("rejectedPlans"));
     for (size_t i = 0; i < rejectedStats.size(); i++) {
         BSONObjBuilder childBob(allPlansBob.subobjStart());
-        statsToBSON(*rejectedStats[i], &childBob, ExplainCommon::QUERY_PLANNER);
+        statsToBSON(*rejectedStats[i], &childBob, ExplainOptions::Verbosity::kQueryPlanner);
     }
     allPlansBob.doneFast();
 
@@ -635,7 +643,7 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
 
 // static
 void Explain::generateExecStats(PlanStageStats* stats,
-                                ExplainCommon::Verbosity verbosity,
+                                ExplainOptions::Verbosity verbosity,
                                 BSONObjBuilder* out,
                                 boost::optional<long long> totalTimeMillis) {
     out->appendNumber("nReturned", stats->common.advanced);
@@ -685,7 +693,7 @@ void Explain::generateServerInfo(BSONObjBuilder* out) {
 // static
 void Explain::explainStages(PlanExecutor* exec,
                             const Collection* collection,
-                            ExplainCommon::Verbosity verbosity,
+                            ExplainOptions::Verbosity verbosity,
                             BSONObjBuilder* out) {
     //
     // Collect plan stats, running the plan if necessary. The stats also give the structure of the
@@ -699,7 +707,7 @@ void Explain::explainStages(PlanExecutor* exec,
     // Get stats of the winning plan from the trial period, if the verbosity level is high enough
     // and there was a runoff between multiple plans.
     unique_ptr<PlanStageStats> winningStatsTrial;
-    if (verbosity >= ExplainCommon::EXEC_ALL_PLANS && mps) {
+    if (verbosity >= ExplainOptions::Verbosity::kExecAllPlans && mps) {
         winningStatsTrial = std::move(mps->getStats()->children[mps->bestPlanIdx()]);
         invariant(winningStatsTrial.get());
     }
@@ -718,7 +726,7 @@ void Explain::explainStages(PlanExecutor* exec,
 
     // If we need execution stats, then run the plan in order to gather the stats.
     Status executePlanStatus = Status::OK();
-    if (verbosity >= ExplainCommon::EXEC_STATS) {
+    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         executePlanStatus = exec->executePlan();
     }
 
@@ -738,11 +746,11 @@ void Explain::explainStages(PlanExecutor* exec,
     // Use the stats trees to produce explain BSON.
     //
 
-    if (verbosity >= ExplainCommon::QUERY_PLANNER) {
+    if (verbosity >= ExplainOptions::Verbosity::kQueryPlanner) {
         generatePlannerInfo(exec, collection, winningStats.get(), allPlansStats, out);
     }
 
-    if (verbosity >= ExplainCommon::EXEC_STATS) {
+    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         BSONObjBuilder execBob(out->subobjStart("executionStats"));
 
         // If there is an execution error while running the query, the error is reported under
@@ -755,12 +763,13 @@ void Explain::explainStages(PlanExecutor* exec,
 
         // Generate exec stats BSON for the winning plan.
         OperationContext* opCtx = exec->getOpCtx();
-        long long totalTimeMillis = CurOp::get(opCtx)->elapsedMicros() / 1000;
+        long long totalTimeMillis =
+            durationCount<Milliseconds>(CurOp::get(opCtx)->elapsedTimeTotal());
         generateExecStats(winningStats.get(), verbosity, &execBob, totalTimeMillis);
 
         // Also generate exec stats for all plans, if the verbosity level is high enough.
         // These stats reflect what happened during the trial period that ranked the plans.
-        if (verbosity >= ExplainCommon::EXEC_ALL_PLANS) {
+        if (verbosity >= ExplainOptions::Verbosity::kExecAllPlans) {
             // If we ranked multiple plans against each other, then add stats collected
             // from the trial period of the winning plan. The "allPlansExecution" section
             // will contain an apples-to-apples comparison of the winning plan's stats against
@@ -801,7 +810,7 @@ std::string Explain::getPlanSummary(const PlanStage* root) {
     flattenExecTree(root, &stages);
 
     // Use this stream to build the plan summary string.
-    mongoutils::str::stream ss;
+    StringBuilder sb;
     bool seenLeaf = false;
 
     for (size_t i = 0; i < stages.size(); i++) {
@@ -809,15 +818,15 @@ std::string Explain::getPlanSummary(const PlanStage* root) {
             // This is a leaf node. Add to the plan summary string accordingly. Unless
             // this is the first leaf we've seen, add a delimiting string first.
             if (seenLeaf) {
-                ss << ", ";
+                sb << ", ";
             } else {
                 seenLeaf = true;
             }
-            addStageSummaryStr(stages[i], ss);
+            addStageSummaryStr(stages[i], sb);
         }
     }
 
-    return ss;
+    return sb.str();
 }
 
 // static

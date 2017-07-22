@@ -68,7 +68,7 @@ protected:
 TEST_F(ReplaceRootBasics, FieldPathAsNewRootPromotesSubdocument) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$a"));
-    Document subdoc = Document{{"b", 1}, {"c", "hello"}, {"d", Document{{"e", 2}}}};
+    Document subdoc = Document{{"b", 1}, {"c", "hello"_sd}, {"d", Document{{"e", 2}}}};
     auto mock = DocumentSourceMock::create(Document{{"a", subdoc}});
     replaceRoot->setSource(mock.get());
 
@@ -211,7 +211,7 @@ TEST_F(ReplaceRootBasics, ErrorsWhenNewRootDoesNotEvaluateToAnObject) {
                                               << "$a"));
 
     // A string is not an object.
-    auto mock = DocumentSourceMock::create(Document{{"a", "hello"}});
+    auto mock = DocumentSourceMock::create(Document{{"a", "hello"_sd}});
     replaceRoot->setSource(mock.get());
     ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40228);
 
@@ -277,6 +277,16 @@ TEST_F(ReplaceRootBasics, ReplaceRootModifiesAllFields) {
     auto modifiedPaths = replaceRoot->getModifiedPaths();
     ASSERT(modifiedPaths.type == DocumentSource::GetModPathsReturn::Type::kAllPaths);
     ASSERT_EQUALS(0U, modifiedPaths.paths.size());
+}
+
+TEST_F(ReplaceRootBasics, ReplaceRootWithRemoveSystemVariableThrows) {
+    auto replaceRoot = createReplaceRoot(BSON("newRoot"
+                                              << "$$REMOVE"));
+    Document inputDoc = Document{{"b", 2}};
+    auto mock = DocumentSourceMock::create({inputDoc});
+    replaceRoot->setSource(mock.get());
+
+    ASSERT_THROWS_CODE(replaceRoot->getNext(), UserException, 40228);
 }
 
 /**

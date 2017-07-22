@@ -112,6 +112,17 @@ StatusWith<ChunkVersion> ChunkVersion::parseFromBSONForChunk(const BSONObj& obj)
     return chunkVersion;
 }
 
+StatusWith<ChunkVersion> ChunkVersion::parseFromBSONWithFieldAndSetEpoch(const BSONObj& obj,
+                                                                         StringData field,
+                                                                         const OID& epoch) {
+    bool canParse;
+    ChunkVersion chunkVersion = ChunkVersion::fromBSON(obj, field.toString(), &canParse);
+    if (!canParse)
+        return {ErrorCodes::BadValue, "Unable to parse shard version"};
+    chunkVersion._epoch = epoch;
+    return chunkVersion;
+}
+
 void ChunkVersion::appendForSetShardVersion(BSONObjBuilder* builder) const {
     addToBSON(*builder, kVersion);
 }

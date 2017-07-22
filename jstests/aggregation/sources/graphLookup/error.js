@@ -1,3 +1,7 @@
+// Cannot implicitly shard accessed collections because unsupported use of sharded collection
+// for target collection of $lookup and $graphLookup.
+// @tags: [assumes_unsharded_collection]
+
 // In MongoDB 3.4, $graphLookup was introduced. In this file, we test the error cases.
 load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
 
@@ -10,7 +14,8 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
     local.insert({});
 
     var pipeline = {$graphLookup: 4};
-    assertErrorCode(local, pipeline, 40327, "$graphLookup spec must be an object");
+    assertErrorCode(
+        local, pipeline, ErrorCodes.FailedToParse, "$graphLookup spec must be an object");
 
     pipeline = {
         $graphLookup: {
@@ -57,7 +62,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40329, "from must be a string");
+    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from must be a string");
 
     pipeline = {
         $graphLookup: {
@@ -68,7 +73,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
             as: "output"
         }
     };
-    assertErrorCode(local, pipeline, 40330, "from must be a valid namespace");
+    assertErrorCode(local, pipeline, ErrorCodes.InvalidNamespace, "from must be a valid namespace");
 
     pipeline = {
         $graphLookup: {
@@ -215,7 +220,7 @@ load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
         $graphLookup:
             {startWith: {$literal: 0}, connectToField: "a", connectFromField: "b", as: "output"}
     };
-    assertErrorCode(local, pipeline, 40328, "from was not specified");
+    assertErrorCode(local, pipeline, ErrorCodes.FailedToParse, "from was not specified");
 
     // restrictSearchWithMatch must be a valid match expression.
     pipeline = {

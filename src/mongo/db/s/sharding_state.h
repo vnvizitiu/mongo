@@ -43,8 +43,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -75,10 +73,6 @@ public:
     using GlobalInitFunc =
         stdx::function<Status(OperationContext*, const ConnectionString&, StringData)>;
 
-    // Signature for the callback function used by the MetadataManager to inform the
-    // sharding subsystem that there is range cleanup work to be done.
-    using RangeDeleterCleanupNotificationFunc = stdx::function<void(const NamespaceString&)>;
-
     ShardingState();
     ~ShardingState();
 
@@ -93,9 +87,25 @@ public:
     static ShardingState* get(ServiceContext* serviceContext);
     static ShardingState* get(OperationContext* operationContext);
 
+    /**
+     * Returns true if ShardingState has been successfully initialized.
+     *
+     * Code that needs to perform extra actions if sharding is initialized, but does not need to
+     * error if not, should use this. Alternatively, see ShardingState::canAcceptShardedCommands().
+     */
     bool enabled() const;
 
-    ConnectionString getConfigServer(OperationContext* txn);
+    /**
+     * Returns Status::OK if the ShardingState is enabled; if not, returns an error describing
+     * whether the ShardingState is just not yet initialized, or if this shard is not running with
+     * --shardsvr at all.
+     *
+     * Code that should error if sharding state has not been initialized should use this to report
+     * a more descriptive error. Alternatively, see ShardingState::enabled().
+     */
+    Status canAcceptShardedCommands() const;
+
+    ConnectionString getConfigServer(OperationContext* opCtx);
 
     std::string getShardName();
 
@@ -104,39 +114,27 @@ public:
     }
 
     /**
-     * Initializes sharding state and begins authenticating outgoing connections and handling shard
-     * versions. If this is not run before sharded operations occur auth will not work and versions
-     * will not be tracked. This method is deprecated and is mainly used for initialization from
-     * mongos metadata commands like moveChunk, splitChunk, mergeChunk and setShardVersion.
+     * Initializes the sharding state of this server from the shard identity document argument
+     * and sets secondary or primary state information on the catalog cache loader.
      *
-     * Throws if initialization fails for any reason and the sharding state object becomes unusable
-     * afterwards. Any sharding state operations afterwards will fail.
-     *
-     * Note that this will also try to connect to the config servers and will block until it
-     * succeeds.
+     * Note: caller must hold a global/database lock! Needed in order to stably check for
+     * replica set state (primary, secondary, standalone).
      */
-    void initializeFromConfigConnString(OperationContext* txn,
-                                        const std::string& configSvr,
-                                        const std::string shardName);
-
-    /**
-     * Initializes the sharding state of this server from the shard identity document argument.
-     */
-    Status initializeFromShardIdentity(OperationContext* txn,
+    Status initializeFromShardIdentity(OperationContext* opCtx,
                                        const ShardIdentityType& shardIdentity);
 
     /**
      * Shuts down sharding machinery on the shard.
      */
-    void shutDown(OperationContext* txn);
+    void shutDown(OperationContext* opCtx);
 
     /**
      * Updates the ShardRegistry's stored notion of the config server optime based on the
      * ConfigServerMetadata decoration attached to the OperationContext.
      */
-    Status updateConfigServerOpTimeFromMetadata(OperationContext* txn);
+    Status updateConfigServerOpTimeFromMetadata(OperationContext* opCtx);
 
-    CollectionShardingState* getNS(const std::string& ns, OperationContext* txn);
+    CollectionShardingState* getNS(const std::string& ns, OperationContext* opCtx);
 
     /**
      * Iterates through all known sharded collections and marks them (in memory only) as not sharded
@@ -148,7 +146,7 @@ public:
      * Refreshes the local metadata based on whether the expected version is higher than what we
      * have cached.
      */
-    Status onStaleShardVersion(OperationContext* txn,
+    Status onStaleShardVersion(OperationContext* opCtx,
                                const NamespaceString& nss,
                                const ChunkVersion& expectedVersion);
 
@@ -174,13 +172,13 @@ public:
      * @return !OK if something else went wrong during reload
      * @return latestShardVersion the version that is now stored for this collection
      */
-    Status refreshMetadataNow(OperationContext* txn,
+    Status refreshMetadataNow(OperationContext* opCtx,
                               const NamespaceString& nss,
                               ChunkVersion* latestShardVersion);
 
-    void appendInfo(OperationContext* txn, BSONObjBuilder& b);
+    void appendInfo(OperationContext* opCtx, BSONObjBuilder& b);
 
-    bool needCollectionMetadata(OperationContext* txn, const std::string& ns);
+    bool needCollectionMetadata(OperationContext* opCtx, const std::string& ns);
 
     /**
      * Updates the config server field of the shardIdentity document with the given connection
@@ -188,7 +186,7 @@ public:
      *
      * Note: this can return NotMaster error.
      */
-    Status updateShardIdentityConfigString(OperationContext* txn,
+    Status updateShardIdentityConfigString(OperationContext* opCtx,
                                            const std::string& newConnectionString);
 
     /**
@@ -229,7 +227,7 @@ public:
      *
      * Takes an IS lock on the namespace of the active migration, if one is active.
      */
-    BSONObj getActiveMigrationStatusReport(OperationContext* txn);
+    BSONObj getActiveMigrationStatusReport(OperationContext* opCtx);
 
     /**
      * For testing only. Mock the initialization method used by initializeFromConfigConnString and
@@ -244,18 +242,6 @@ public:
     void scheduleCleanup(const NamespaceString& nss);
 
     /**
-     * Returns a pointer to the collection range deleter task executor.
-     */
-    executor::ThreadPoolTaskExecutor* getRangeDeleterTaskExecutor();
-
-    /**
-     * Sets the function used by scheduleWorkOnRangeDeleterTaskExecutor to
-     * schedule work. Used for mocking the executor for testing. See the ShardingState
-     * for the default implementation of _scheduleWorkFn.
-     */
-    void setScheduleCleanupFunctionForTest(RangeDeleterCleanupNotificationFunc fn);
-
-    /**
      * If started with --shardsvr, initializes sharding awareness from the shardIdentity document
      * on disk, if there is one.
      * If started with --shardsvr in queryableBackupMode, initializes sharding awareness from the
@@ -265,18 +251,15 @@ public:
      * classes for sharding were initialized, but no networking calls were made yet (with the
      * exception of the duplicate ShardRegistry reload in ShardRegistry::startup() (see
      * SERVER-26123). Outgoing networking calls to cluster members can now be made.
+     *
+     * Note: this function briefly takes the global lock to determine primary/secondary state.
      */
-    StatusWith<bool> initializeShardingAwarenessIfNeeded(OperationContext* txn);
+    StatusWith<bool> initializeShardingAwarenessIfNeeded(OperationContext* opCtx);
 
     /**
-     * Check if a command is one of the whitelisted commands that can be accepted with shardVersion
-     * information before this node is sharding aware, because the command initializes sharding
-     * awareness.
+     * Return the task executor to be shared by the range deleters for all collections.
      */
-    static bool commandInitializesShardingAwareness(const std::string& commandName) {
-        return _commandsThatInitializeShardingAwareness.find(commandName) !=
-            _commandsThatInitializeShardingAwareness.end();
-    }
+    executor::TaskExecutor* getRangeDeleterTaskExecutor();
 
 private:
     // Map from a namespace into the sharding state for each collection we have
@@ -291,10 +274,6 @@ private:
         // recovey document is found or stay in it until initialize has been called.
         kNew,
 
-        // The sharding state has been recovered (or doesn't need to be recovered) and the catalog
-        // manager is currently being initialized by one of the threads.
-        kInitializing,
-
         // Sharding state is fully usable.
         kInitialized,
 
@@ -304,59 +283,21 @@ private:
     };
 
     /**
-     * Initializes the sharding infrastructure (connection hook, catalog manager, etc) and
-     * optionally recovers its minimum optime. Must not be called while holding the sharding state
-     * mutex.
-     *
-     * Doesn't throw, only updates the initialization state variables.
-     *
-     * Runs in a new thread so that if all config servers are down initialization can continue
-     * retrying in the background even if the operation that kicked off the initialization has
-     * terminated.
-     *
-     * @param configSvr Connection string of the config server to use.
-     * @param shardName the name of the shard in config.shards
-     */
-    void _initializeImpl(ConnectionString configSvr, std::string shardName);
-
-    /**
-     * Must be called only when the current state is kInitializing. Sets the current state to
-     * kInitialized if the status is OK or to kError otherwise.
-     */
-    void _signalInitializationComplete(Status status);
-
-    /**
-     * Blocking method, which waits for the initialization state to become kInitialized or kError
-     * and returns the initialization status.
-     */
-    Status _waitForInitialization(Date_t deadline);
-    Status _waitForInitialization_inlock(Date_t deadline, stdx::unique_lock<stdx::mutex>& lk);
-
-    /**
-     * Simple wrapper to cast the initialization state atomic uint64 to InitializationState value
-     * without doing any locking.
+     * Returns the initialization state.
      */
     InitializationState _getInitializationState() const;
 
     /**
-     * Updates the initialization state. Must be called while holding _mutex.
+     * Updates the initialization state.
      */
-    void _setInitializationState_inlock(InitializationState newState);
+    void _setInitializationState(InitializationState newState);
 
     /**
      * Refreshes collection metadata by asking the config server for the latest information and
      * returns the latest version at the time the reload was done. This call does network I/O and
      * should never be called with a lock.
-     *
-     * The metadataForDiff argument indicates that the specified metadata should be used as a base
-     * from which to only load the differences. If nullptr is passed, a full reload will be done.
      */
-    StatusWith<ChunkVersion> _refreshMetadata(OperationContext* txn,
-                                              const NamespaceString& nss,
-                                              const CollectionMetadata* metadataForDiff);
-
-    // Initializes a TaskExecutor for cleaning up orphaned ranges
-    void _initializeRangeDeleterTaskExecutor();
+    ChunkVersion _refreshMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
     // Manages the state of the migration recipient shard
     MigrationDestinationManager _migrationDestManager;
@@ -379,9 +320,6 @@ private:
     // Sets the shard name for this host (comes through setShardVersion)
     std::string _shardName;
 
-    // Protects from hitting the config server from too many threads at once
-    TicketHolder _configServerTickets;
-
     // Cache of collection metadata on this shard. It is not safe to look-up values from this map
     // without holding some form of collection lock. It is only safe to add/remove values when
     // holding X lock on the respective namespace.
@@ -390,19 +328,16 @@ private:
     // The id for the cluster this shard belongs to.
     OID _clusterId;
 
-    // A whitelist of sharding commands that are allowed when running with --shardsvr but not yet
-    // shard aware, because they initialize sharding awareness.
-    static const std::set<std::string> _commandsThatInitializeShardingAwareness;
-
     // Function for initializing the external sharding state components not owned here.
     GlobalInitFunc _globalInit;
 
-    // Function for scheduling work on the _rangeDeleterTaskExecutor.
-    // Used in call to scheduleCleanup(NamespaceString).
-    RangeDeleterCleanupNotificationFunc _scheduleWorkFn;
-
-    // Task executor for the collection range deleter.
-    std::unique_ptr<executor::ThreadPoolTaskExecutor> _rangeDeleterTaskExecutor;
+    // Task executor shared by the collection range deleters.
+    struct RangeDeleterExecutor {
+        stdx::mutex lock{};
+        std::unique_ptr<executor::TaskExecutor> taskExecutor{nullptr};
+        ~RangeDeleterExecutor();
+    };
+    RangeDeleterExecutor _rangeDeleterExecutor;
 };
 
 }  // namespace mongo

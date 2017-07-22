@@ -46,6 +46,7 @@
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/sock.h"
@@ -185,6 +186,7 @@ void NetworkInterfaceASIO::waitForWork() {
     stdx::unique_lock<stdx::mutex> lk(_executorMutex);
     // TODO: This can be restructured with a lambda.
     while (!_isExecutorRunnable) {
+        MONGO_IDLE_THREAD_BLOCK;
         _isExecutorRunnableCondition.wait(lk);
     }
     _isExecutorRunnable = false;
@@ -198,6 +200,7 @@ void NetworkInterfaceASIO::waitForWorkUntil(Date_t when) {
         if (waitTime <= Milliseconds(0)) {
             break;
         }
+        MONGO_IDLE_THREAD_BLOCK;
         _isExecutorRunnableCondition.wait_for(lk, waitTime.toSystemDuration());
     }
     _isExecutorRunnable = false;
@@ -227,13 +230,11 @@ Status attachMetadataIfNeeded(RemoteCommandRequest& request,
     // Append the metadata of the request with metadata from the metadata hook
     // if a hook is installed
     if (metadataHook) {
-        BSONObjBuilder augmentedBob;
-        augmentedBob.appendElements(request.metadata);
+        BSONObjBuilder augmentedBob(std::move(request.metadata));
 
         auto writeStatus = callNoexcept(*metadataHook,
                                         &rpc::EgressMetadataHook::writeRequestMetadata,
-                                        request.txn,
-                                        request.target,
+                                        request.opCtx,
                                         &augmentedBob);
         if (!writeStatus.isOK()) {
             return writeStatus;
@@ -287,6 +288,9 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
             Status status = wasPreviouslyCanceled
                 ? Status(ErrorCodes::CallbackCanceled, "Callback canceled")
                 : swConn.getStatus();
+            if (status.code() == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
+                status = Status(ErrorCodes::ExceededTimeLimit, status.reason());
+            }
             if (status.code() == ErrorCodes::ExceededTimeLimit) {
                 _numTimedOutOps.fetchAndAdd(1);
             }
@@ -363,8 +367,9 @@ Status NetworkInterfaceASIO::startCommand(const TaskExecutor::CallbackHandle& cb
                     msg << "Remote command timed out while waiting to get a connection from the "
                         << "pool, took " << getConnectionDuration << ", timeout was set to "
                         << timeout;
-                    auto rs = ResponseStatus(
-                        ErrorCodes::ExceededTimeLimit, msg.str(), getConnectionDuration);
+                    auto rs = ResponseStatus(ErrorCodes::NetworkInterfaceExceededTimeLimit,
+                                             msg.str(),
+                                             getConnectionDuration);
                     return _completeOperation(op, rs);
                 }
 
@@ -446,18 +451,6 @@ void NetworkInterfaceASIO::cancelCommand(const TaskExecutor::CallbackHandle& cbH
     }
 }
 
-void NetworkInterfaceASIO::cancelAllCommands() {
-    decltype(_inGetConnection) newInGetConnection;
-    {
-        stdx::lock_guard<stdx::mutex> lk(_inProgressMutex);
-        _inGetConnection.swap(newInGetConnection);
-        for (auto&& kv : _inProgress) {
-            kv.first->cancel();
-        }
-        _numCanceledOps.fetchAndAdd(_inProgress.size());
-    }
-}
-
 Status NetworkInterfaceASIO::setAlarm(Date_t when, const stdx::function<void()>& action) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterfaceASIO shutdown in progress"};
@@ -473,7 +466,17 @@ Status NetworkInterfaceASIO::setAlarm(Date_t when, const stdx::function<void()>&
         return exceptionToStatus();
     }
 
-    alarm->async_wait([alarm, this, action](std::error_code ec) {
+    alarm->async_wait([alarm, this, action, when](std::error_code ec) {
+        const auto nowValue = now();
+        if (nowValue < when) {
+            warning() << "ASIO alarm returned early. Expected at: " << when
+                      << ", fired at: " << nowValue;
+            const auto status = setAlarm(when, action);
+            if ((!status.isOK()) && (status.code() != ErrorCodes::ShutdownInProgress)) {
+                fassertFailedWithStatus(40383, status);
+            }
+            return;
+        }
         if (!ec) {
             return action();
         } else if (ec != asio::error::operation_aborted) {
@@ -514,6 +517,10 @@ void NetworkInterfaceASIO::_failWithInfo_inlock(const char* file,
     ss << _getDiagnosticString_inlock(op);
     Status status{ErrorCodes::InternalError, ss.str()};
     fassertFailedWithStatus(34429, status);
+}
+
+void NetworkInterfaceASIO::dropConnections(const HostAndPort& hostAndPort) {
+    _connectionPool.dropConnections(hostAndPort);
 }
 
 }  // namespace executor

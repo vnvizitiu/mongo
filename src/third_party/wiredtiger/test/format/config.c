@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2016 MongoDB, Inc.
+ * Public Domain 2014-2017 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -30,6 +30,7 @@
 #include "config.h"
 
 static void	   config_checksum(void);
+static void	   config_compatibility(void);
 static void	   config_compression(const char *);
 static void	   config_encryption(void);
 static const char *config_file_type(u_int);
@@ -40,10 +41,12 @@ static int	   config_is_perm(const char *);
 static void	   config_isolation(void);
 static void	   config_lrt(void);
 static void	   config_map_checksum(const char *, u_int *);
+static void	   config_map_compatibility(const char *, u_int *);
 static void	   config_map_compression(const char *, u_int *);
 static void	   config_map_encryption(const char *, u_int *);
 static void	   config_map_file_type(const char *, u_int *);
 static void	   config_map_isolation(const char *, u_int *);
+static void	   config_pct(void);
 static void	   config_reset(void);
 
 /*
@@ -62,39 +65,42 @@ config_setup(void)
 	config_in_memory();
 
 	/*
-	 * Choose a data source type and a file type: they're interrelated (LSM
-	 * trees are only compatible with row-store) and other items depend on
-	 * them.
+	 * Choose a file format and a data source: they're interrelated (LSM is
+	 * only compatible with row-store) and other items depend on them.
 	 */
+	if (!config_is_perm("file_type")) {
+		if (config_is_perm("data_source") && DATASOURCE("lsm"))
+			config_single("file_type=row", 0);
+		else
+			switch (mmrand(NULL, 1, 10)) {
+			case 1:					/* 10% */
+				config_single("file_type=fix", 0);
+				break;
+			case 2: case 3: case 4:			/* 30% */
+				config_single("file_type=var", 0);
+				break;				/* 60% */
+			case 5: case 6: case 7: case 8: case 9: case 10:
+				config_single("file_type=row", 0);
+				break;
+			}
+	}
+	config_map_file_type(g.c_file_type, &g.type);
+
 	if (!config_is_perm("data_source"))
 		switch (mmrand(NULL, 1, 3)) {
 		case 1:
 			config_single("data_source=file", 0);
 			break;
 		case 2:
-			if (!g.c_in_memory) {
-				config_single("data_source=lsm", 0);
-				break;
-			}
-			/* FALLTHROUGH */
-		case 3:
 			config_single("data_source=table", 0);
 			break;
-		}
-
-	if (!config_is_perm("file_type"))
-		switch (DATASOURCE("lsm") ? 5 : mmrand(NULL, 1, 10)) {
-		case 1:
-			config_single("file_type=fix", 0);
-			break;
-		case 2: case 3: case 4:
-			config_single("file_type=var", 0);
-			break;
-		case 5: case 6: case 7: case 8: case 9: case 10:
-			config_single("file_type=row", 0);
+		case 3:
+			if (g.c_in_memory || g.type != ROW)
+				config_single("data_source=table", 0);
+			else
+				config_single("data_source=lsm", 0);
 			break;
 		}
-	config_map_file_type(g.c_file_type, &g.type);
 
 	/*
 	 * If data_source and file_type were both "permanent", we may still
@@ -103,7 +109,7 @@ config_setup(void)
 	if (DATASOURCE("lsm") && g.type != ROW) {
 		fprintf(stderr,
 	    "%s: lsm data_source is only compatible with row file_type\n",
-		    g.progname);
+		    progname);
 		exit(EXIT_FAILURE);
 	}
 
@@ -154,35 +160,24 @@ config_setup(void)
 		g.c_threads = 1;
 
 	config_checksum();
+	config_compatibility();
 	config_compression("compression");
 	config_compression("logging_compression");
 	config_encryption();
 	config_isolation();
 	config_lrt();
+	config_pct();
 
 	/*
-	 * Periodically, set the delete percentage to 0 so salvage gets run,
-	 * as long as the delete percentage isn't nailed down.
-	 * Don't do it on the first run, all our smoke tests would hit it.
+	 * If this is an LSM run, ensure cache size sanity.
+	 * Ensure there is at least 1MB of cache per thread.
 	 */
-	if (!g.replay && g.run_cnt % 10 == 9 && !config_is_perm("delete_pct"))
-		config_single("delete_pct=0", 0);
-
-	/*
-	 * If this is an LSM run, set the cache size and crank up the insert
-	 * percentage.
-	 */
-	if (DATASOURCE("lsm")) {
-		if (!config_is_perm("cache"))
+	if (!config_is_perm("cache")) {
+		if (DATASOURCE("lsm"))
 			g.c_cache = 30 * g.c_chunk_size;
-
-		if (!config_is_perm("insert_pct"))
-			g.c_insert_pct = mmrand(NULL, 50, 85);
+		if (g.c_cache < g.c_threads)
+			g.c_cache = g.c_threads;
 	}
-
-	/* Ensure there is at least 1MB of cache per thread. */
-	if (!config_is_perm("cache") && g.c_cache < g.c_threads)
-		g.c_cache = g.c_threads;
 
 	/* Give in-memory configuration a final review. */
 	config_in_memory_check();
@@ -265,8 +260,8 @@ config_compression(const char *conf_name)
 	 */
 	cstr = "none";
 	if (strcmp(conf_name, "logging_compression") == 0 && g.c_logging == 0) {
-		(void)snprintf(
-		    confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr);
+		testutil_check(__wt_snprintf(
+		    confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr));
 		config_single(confbuf, 0);
 		return;
 	}
@@ -301,7 +296,7 @@ config_compression(const char *conf_name)
 		break;
 #endif
 #ifdef HAVE_BUILTIN_EXTENSION_ZSTD
-	case 15: case 16 case 17:		/* 15% zstd */
+	case 15: case 16: case 17:		/* 15% zstd */
 		cstr = "zstd";
 		break;
 #endif
@@ -310,8 +305,39 @@ config_compression(const char *conf_name)
 		break;
 	}
 
-	(void)snprintf(confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr);
+	testutil_check(__wt_snprintf(
+	    confbuf, sizeof(confbuf), "%s=%s", conf_name, cstr));
 	config_single(confbuf, 0);
+}
+
+/*
+ * config_compatibility --
+ *	Compatibility configuration.
+ */
+static void
+config_compatibility(void)
+{
+	/*
+	 * Compatibility is only relevant if logging is enabled.
+	 * Skip it no matter what if we're not logging.
+	 */
+	if (g.c_logging == 0) {
+		config_single("compatibility=none", 0);
+		return;
+	}
+	/* Choose a compatibility mode if nothing was specified. */
+	if (!config_is_perm("compatibility"))
+		switch (mmrand(NULL, 1, 10)) {
+		case 1:					/* 10% */
+			config_single("compatibility=v1", 0);
+			break;
+		case 2:					/* 10% */
+			config_single("compatibility=v2", 0);
+			break;
+		default:				/* 80% */
+			config_single("compatibility=none", 0);
+			break;
+		}
 }
 
 /*
@@ -388,10 +414,14 @@ config_in_memory_check(void)
 		return;
 
 	/* Turn off a lot of stuff. */
+	if (!config_is_perm("alter"))
+		config_single("alter=off", 0);
 	if (!config_is_perm("backups"))
 		config_single("backups=off", 0);
 	if (!config_is_perm("checkpoints"))
 		config_single("checkpoints=off", 0);
+	if (!config_is_perm("compatibility"))
+		config_single("compatibility=none", 0);
 	if (!config_is_perm("compression"))
 		config_single("compression=none", 0);
 	if (!config_is_perm("logging"))
@@ -473,12 +503,102 @@ config_lrt(void)
 	 * stores.
 	 */
 	if (g.type == FIX) {
-		if (config_is_perm("long_running_txn"))
+		if (config_is_perm("long_running_txn") && g.c_long_running_txn)
 			testutil_die(EINVAL,
 			    "long_running_txn not supported with fixed-length "
 			    "column store");
 		config_single("long_running_txn=off", 0);
 	}
+}
+
+/*
+ * config_pct --
+ *	Configure operation percentages.
+ */
+static void
+config_pct(void)
+{
+	static struct {
+		const char *name;		/* Operation */
+		uint32_t  *vp;			/* Value store */
+		u_int	   order;		/* Order of assignment */
+	} list[] = {
+#define	CONFIG_DELETE_ENTRY	0
+		{ "delete_pct", &g.c_delete_pct, 0 },
+		{ "insert_pct", &g.c_insert_pct, 0 },
+#define	CONFIG_MODIFY_ENTRY	2
+		{ "modify_pct", &g.c_modify_pct, 0 },
+		{ "read_pct", &g.c_read_pct, 0 },
+		{ "write_pct", &g.c_write_pct, 0 },
+	};
+	u_int i, max_order, max_slot, n, pct;
+
+	/*
+	 * Walk the list of operations, checking for an illegal configuration
+	 * and creating a random order in the list.
+	 */
+	pct = 0;
+	for (i = 0; i < WT_ELEMENTS(list); ++i)
+		if (config_is_perm(list[i].name))
+			pct += *list[i].vp;
+		else
+			list[i].order = mmrand(NULL, 1, 1000);
+	if (pct > 100)
+		testutil_die(EINVAL,
+		    "operation percentages total to more than 100%%");
+
+	/* Cursor modify isn't possible for fixed-length column store. */
+	if (g.type == FIX) {
+		if (config_is_perm("modify_pct"))
+			testutil_die(EINVAL,
+			    "WT_CURSOR.modify not supported by fixed-length "
+			    "column store or LSM");
+		list[CONFIG_MODIFY_ENTRY].order = 0;
+		*list[CONFIG_MODIFY_ENTRY].vp = 0;
+	}
+
+	/*
+	 * If the delete percentage isn't nailed down, periodically set it to
+	 * 0 so salvage gets run. Don't do it on the first run, all our smoke
+	 * tests would hit it.
+	 */
+	if (!config_is_perm("delete_pct") && !g.replay && g.run_cnt % 10 == 9) {
+		list[CONFIG_DELETE_ENTRY].order = 0;
+		*list[CONFIG_DELETE_ENTRY].vp = 0;
+	}
+
+	/*
+	 * Walk the list, allocating random numbers of operations in a random
+	 * order.
+	 *
+	 * If the "order" field is non-zero, we need to create a value for this
+	 * operation. Find the largest order field in the array; if one non-zero
+	 * order field is found, it's the last entry and gets the remainder of
+	 * the operations.
+	 */
+	for (pct = 100 - pct;;) {
+		for (i = n =
+		    max_order = max_slot = 0; i < WT_ELEMENTS(list); ++i) {
+			if (list[i].order != 0)
+				++n;
+			if (list[i].order > max_order) {
+				max_order = list[i].order;
+				max_slot = i;
+			}
+		}
+		if (n == 0)
+			break;
+		if (n == 1) {
+			*list[max_slot].vp = pct;
+			break;
+		}
+		*list[max_slot].vp = mmrand(NULL, 0, pct);
+		list[max_slot].order = 0;
+		pct -= *list[max_slot].vp;
+	}
+
+	testutil_assert(g.c_delete_pct + g.c_insert_pct +
+	    g.c_modify_pct + g.c_read_pct + g.c_write_pct == 100);
 }
 
 /*
@@ -609,13 +729,14 @@ void
 config_single(const char *s, int perm)
 {
 	CONFIG *cp;
-	long v;
+	long vlong;
+	uint32_t v;
 	char *p;
 	const char *ep;
 
 	if ((ep = strchr(s, '=')) == NULL) {
 		fprintf(stderr,
-		    "%s: %s: illegal configuration value\n", g.progname, s);
+		    "%s: %s: illegal configuration value\n", progname, s);
 		exit(EXIT_FAILURE);
 	}
 
@@ -648,6 +769,10 @@ config_single(const char *s, int perm)
 			config_map_checksum(ep, &g.c_checksum_flag);
 			*cp->vstr = dstrdup(ep);
 		} else if (strncmp(
+		    s, "compatibility", strlen("compatibility")) == 0) {
+			config_map_compatibility(ep, &g.c_compat_flag);
+			*cp->vstr = dstrdup(ep);
+		} else if (strncmp(
 		    s, "compression", strlen("compression")) == 0) {
 			config_map_compression(ep, &g.c_compression_flag);
 			*cp->vstr = dstrdup(ep);
@@ -674,34 +799,35 @@ config_single(const char *s, int perm)
 		return;
 	}
 
-	v = -1;
+	vlong = -1;
 	if (F_ISSET(cp, C_BOOL)) {
 		if (strncmp(ep, "off", strlen("off")) == 0)
-			v = 0;
+			vlong = 0;
 		else if (strncmp(ep, "on", strlen("on")) == 0)
-			v = 1;
+			vlong = 1;
 	}
-	if (v == -1) {
-		v = strtol(ep, &p, 10);
+	if (vlong == -1) {
+		vlong = strtol(ep, &p, 10);
 		if (*p != '\0') {
 			fprintf(stderr, "%s: %s: illegal numeric value\n",
-			    g.progname, s);
+			    progname, s);
 			exit(EXIT_FAILURE);
 		}
 	}
+	v = (uint32_t)vlong;
 	if (F_ISSET(cp, C_BOOL)) {
 		if (v != 0 && v != 1) {
 			fprintf(stderr, "%s: %s: value of boolean not 0 or 1\n",
-			    g.progname, s);
+			    progname, s);
 			exit(EXIT_FAILURE);
 		}
 	} else if (v < cp->min || v > cp->maxset) {
 		fprintf(stderr, "%s: %s: value outside min/max values of %"
 		    PRIu32 "-%" PRIu32 "\n",
-		    g.progname, s, cp->min, cp->maxset);
+		    progname, s, cp->min, cp->maxset);
 		exit(EXIT_FAILURE);
 	}
-	*cp->v = (uint32_t)v;
+	*cp->v = v;
 }
 
 /*
@@ -739,6 +865,24 @@ config_map_checksum(const char *s, u_int *vp)
 		*vp = CHECKSUM_UNCOMPRESSED;
 	else
 		testutil_die(EINVAL, "illegal checksum configuration: %s", s);
+}
+
+/*
+ * config_map_compatibility --
+ *	Map a compatibility configuration to a flag.
+ */
+static void
+config_map_compatibility(const char *s, u_int *vp)
+{
+	if (strcmp(s, "none") == 0)
+		*vp = COMPAT_NONE;
+	else if (strcmp(s, "v1") == 0)
+		*vp = COMPAT_V1;
+	else if (strcmp(s, "v2") == 0)
+		*vp = COMPAT_V2;
+	else
+		testutil_die(EINVAL,
+		    "illegal compatibility configuration: %s", s);
 }
 
 /*
@@ -817,7 +961,7 @@ config_find(const char *s, size_t len)
 			return (cp);
 
 	fprintf(stderr,
-	    "%s: %s: unknown configuration keyword\n", g.progname, s);
+	    "%s: %s: unknown configuration keyword\n", progname, s);
 	config_error();
 	exit(EXIT_FAILURE);
 }

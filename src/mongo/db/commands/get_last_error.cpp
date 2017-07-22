@@ -55,7 +55,7 @@ using std::stringstream;
    see if any of the operations triggered an error, but don't want to check
    after each op as that woudl be a client/server turnaround.
 */
-class CmdResetError : public Command {
+class CmdResetError : public BasicCommand {
 public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -69,21 +69,19 @@ public:
     virtual void help(stringstream& help) const {
         help << "reset error state (used with getpreverror)";
     }
-    CmdResetError() : Command("resetError", false, "reseterror") {}
-    bool run(OperationContext* txn,
+    CmdResetError() : BasicCommand("resetError", "reseterror") {}
+    bool run(OperationContext* opCtx,
              const string& db,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        LastError::get(txn->getClient()).reset();
+        LastError::get(opCtx->getClient()).reset();
         return true;
     }
 } cmdResetError;
 
-class CmdGetLastError : public Command {
+class CmdGetLastError : public ErrmsgCommandDeprecated {
 public:
-    CmdGetLastError() : Command("getLastError", false, "getlasterror") {}
+    CmdGetLastError() : ErrmsgCommandDeprecated("getLastError", "getlasterror") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -104,12 +102,11 @@ public:
              << "  { wtimeout:m} - timeout for w in m milliseconds";
     }
 
-    bool run(OperationContext* txn,
-             const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         //
         // Correct behavior here is very finicky.
         //
@@ -134,11 +131,11 @@ public:
         // err is null.
         //
 
-        LastError* le = &LastError::get(txn->getClient());
+        LastError* le = &LastError::get(opCtx->getClient());
         le->disable();
 
         // Always append lastOp and connectionId
-        Client& c = *txn->getClient();
+        Client& c = *opCtx->getClient();
         auto replCoord = repl::getGlobalReplicationCoordinator();
         if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
             const repl::OpTime lastOp = repl::ReplClientInfo::forClient(c).getLastOp();
@@ -203,9 +200,17 @@ public:
             }
         }
 
-        BSONObj writeConcernDoc = cmdObj;
+        BSONObj writeConcernDoc = ([&] {
+            BSONObjBuilder bob;
+            for (auto&& elem : cmdObj) {
+                if (!Command::isGenericArgument(elem.fieldNameStringData()))
+                    bob.append(elem);
+            }
+            return bob.obj();
+        }());
+
         // Use the default options if we have no gle options aside from wOpTime/wElectionId
-        const int nFields = cmdObj.nFields();
+        const int nFields = writeConcernDoc.nFields();
         bool useDefaultGLEOptions = (nFields == 1) || (nFields == 2 && lastOpTimePresent) ||
             (nFields == 3 && lastOpTimePresent && electionIdPresent);
 
@@ -224,7 +229,7 @@ public:
             // Ensure options are valid for this host. Since getLastError doesn't do writes itself,
             // treat it as if these are admin database writes, which need to be replicated so we do
             // the strictest checks write concern checks.
-            status = validateWriteConcern(txn, writeConcern, NamespaceString::kAdminDb);
+            status = validateWriteConcern(opCtx, writeConcern, NamespaceString::kAdminDb);
         }
 
         if (!status.isOK()) {
@@ -267,12 +272,12 @@ public:
         }
 
         {
-            stdx::lock_guard<Client> lk(*txn->getClient());
-            txn->setMessage_inlock("waiting for write concern");
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            CurOp::get(opCtx)->setMessage_inlock("waiting for write concern");
         }
 
         WriteConcernResult wcResult;
-        status = waitForWriteConcern(txn, lastOpTime, writeConcern, &wcResult);
+        status = waitForWriteConcern(opCtx, lastOpTime, writeConcern, &wcResult);
         wcResult.appendTo(writeConcern, &result);
 
         // For backward compatibility with 2.4, wtimeout returns ok : 1.0
@@ -290,7 +295,7 @@ public:
 
 } cmdGetLastError;
 
-class CmdGetPrevError : public Command {
+class CmdGetPrevError : public BasicCommand {
 public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -304,14 +309,12 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
-    CmdGetPrevError() : Command("getPrevError", false, "getpreverror") {}
-    bool run(OperationContext* txn,
+    CmdGetPrevError() : BasicCommand("getPrevError", "getpreverror") {}
+    bool run(OperationContext* opCtx,
              const string& dbname,
-             BSONObj& cmdObj,
-             int,
-             string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        LastError* le = &LastError::get(txn->getClient());
+        LastError* le = &LastError::get(opCtx->getClient());
         le->disable();
         le->appendSelf(result, true);
         if (le->isValid())

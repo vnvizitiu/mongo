@@ -99,27 +99,20 @@ Status addMongosOptions(moe::OptionSection* options) {
         .setSources(moe::SourceAllLegacy);
 
     sharding_options
-        .addOptionChaining("net.http.JSONPEnabled",
-                           "jsonp",
-                           moe::Switch,
-                           "allow JSONP access via http (has security implications)")
-        .setSources(moe::SourceAllLegacy);
-
-    sharding_options
         .addOptionChaining("noscripting", "noscripting", moe::Switch, "disable scripting engine")
         .setSources(moe::SourceAllLegacy);
 
 
-    options->addSection(general_options);
+    options->addSection(general_options).transitional_ignore();
 
 #if defined(_WIN32)
-    options->addSection(windows_scm_options);
+    options->addSection(windows_scm_options).transitional_ignore();
 #endif
 
-    options->addSection(sharding_options);
+    options->addSection(sharding_options).transitional_ignore();
 
 #ifdef MONGO_CONFIG_SSL
-    options->addSection(ssl_options);
+    options->addSection(ssl_options).transitional_ignore();
 #endif
 
     return Status::OK();
@@ -190,10 +183,6 @@ Status storeMongosOptions(const moe::Environment& params) {
     if (params.count("replication.localPingThresholdMs")) {
         serverGlobalParams.defaultLocalThresholdMillis =
             params["replication.localPingThresholdMs"].as<int>();
-    }
-
-    if (params.count("net.http.JSONPEnabled")) {
-        serverGlobalParams.jsonp = params["net.http.JSONPEnabled"].as<bool>();
     }
 
     if (params.count("noscripting")) {

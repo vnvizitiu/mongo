@@ -123,6 +123,18 @@ std::ostream& operator<<(std::ostream& stream, BSONType type);
  */
 bool isValidBSONType(int type);
 
+inline bool isNumericBSONType(BSONType type) {
+    switch (type) {
+        case NumberDouble:
+        case NumberInt:
+        case NumberLong:
+        case NumberDecimal:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* subtypes of BinData.
    bdtCustom and above are ones that the JS compiler understands, but are
    opaque to the database.
@@ -136,6 +148,11 @@ enum BinDataType {
     MD5Type = 5,
     bdtCustom = 128
 };
+
+/**
+ * Return the name of the BinData Type.
+ */
+const char* typeName(BinDataType type);
 
 /** Returns a number for where a given type falls in the sort order.
  *  Elements with the same return value should be compared for value equality.

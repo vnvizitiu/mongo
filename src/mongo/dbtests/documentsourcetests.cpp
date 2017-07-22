@@ -41,7 +41,7 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
@@ -86,7 +86,7 @@ using mongo::DocumentSourceCursor;
 
 class Base : public CollectionBase {
 public:
-    Base() : _ctx(new ExpressionContext(&_opCtx, AggregationRequest(nss, {}))) {
+    Base() : _ctx(new ExpressionContextForTest(&_opCtx, AggregationRequest(nss, {}))) {
         _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     }
 
@@ -105,15 +105,13 @@ protected:
             &_opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions()));
 
         auto exec = uassertStatusOK(
-            getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::YIELD_MANUAL));
+            getExecutor(&_opCtx, ctx.getCollection(), std::move(cq), PlanExecutor::NO_YIELD));
 
         exec->saveState();
-        exec->registerExec(ctx.getCollection());
-
-        _source = DocumentSourceCursor::create(nss.ns(), std::move(exec), _ctx);
+        _source = DocumentSourceCursor::create(ctx.getCollection(), std::move(exec), _ctx);
     }
 
-    intrusive_ptr<ExpressionContext> ctx() {
+    intrusive_ptr<ExpressionContextForTest> ctx() {
         return _ctx;
     }
 
@@ -123,7 +121,7 @@ protected:
 
 private:
     // It is important that these are ordered to ensure correct destruction order.
-    intrusive_ptr<ExpressionContext> _ctx;
+    intrusive_ptr<ExpressionContextForTest> _ctx;
     intrusive_ptr<DocumentSourceCursor> _source;
 };
 
@@ -272,6 +270,7 @@ public:
     void run() {
         createSource(BSON("$natural" << 1));
         ASSERT_EQ(source()->getOutputSorts().size(), 0U);
+        source()->dispose();
     }
 };
 
@@ -283,6 +282,7 @@ public:
 
         ASSERT_EQ(source()->getOutputSorts().size(), 1U);
         ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1)), 1U);
+        source()->dispose();
     }
 };
 
@@ -294,6 +294,7 @@ public:
 
         ASSERT_EQ(source()->getOutputSorts().size(), 1U);
         ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << -1)), 1U);
+        source()->dispose();
     }
 };
 
@@ -306,6 +307,42 @@ public:
         ASSERT_EQ(source()->getOutputSorts().size(), 2U);
         ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1)), 1U);
         ASSERT_EQ(source()->getOutputSorts().count(BSON("a" << 1 << "b" << -1)), 1U);
+        source()->dispose();
+    }
+};
+
+class SerializationRespectsExplainModes : public Base {
+public:
+    void run() {
+        createSource();
+
+        {
+            // Nothing serialized when no explain mode specified.
+            auto explainResult = source()->serialize();
+            ASSERT_TRUE(explainResult.missing());
+        }
+
+        {
+            auto explainResult = source()->serialize(ExplainOptions::Verbosity::kQueryPlanner);
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_TRUE(explainResult["$cursor"]["executionStats"].missing());
+        }
+
+        {
+            auto explainResult = source()->serialize(ExplainOptions::Verbosity::kExecStats);
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+            ASSERT_TRUE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+        }
+
+        {
+            auto explainResult =
+                source()->serialize(ExplainOptions::Verbosity::kExecAllPlans).getDocument();
+            ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"].missing());
+            ASSERT_FALSE(explainResult["$cursor"]["executionStats"]["allPlansExecution"].missing());
+        }
+        source()->dispose();
     }
 };
 
@@ -324,6 +361,7 @@ public:
         add<DocumentSourceCursor::IndexScanProvidesSortOnKeys>();
         add<DocumentSourceCursor::ReverseIndexScanProvidesSort>();
         add<DocumentSourceCursor::CompoundIndexScanProvidesMultipleSorts>();
+        add<DocumentSourceCursor::SerializationRespectsExplainModes>();
     }
 };
 

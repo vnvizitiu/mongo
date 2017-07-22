@@ -61,17 +61,14 @@ public:
     Status wait(Ticket&& ticket) override;
     void asyncWait(Ticket&& ticket, TicketCallback callback) override;
 
-    SSLPeerInfo getX509PeerInfo(const ConstSessionHandle& session) const override;
-    void setX509PeerInfo(const SessionHandle& session, SSLPeerInfo peerInfo);
-
     Stats sessionStats() override;
 
     SessionHandle createSession();
     SessionHandle get(Session::Id id);
     bool owns(Session::Id id);
     void end(const SessionHandle& session) override;
-    void endAllSessions(Session::TagMask tags) override;
 
+    Status setup() override;
     Status start() override;
     void shutdown() override;
     bool inShutdown() const;

@@ -13,19 +13,6 @@ function validateCollections(db, obj) {
         }
     }
 
-    function getFeatureCompatibilityVersion(adminDB) {
-        var res = adminDB.system.version.findOne({_id: "featureCompatibilityVersion"});
-        if (res === null) {
-            return "3.2";
-        }
-        return res.version;
-    }
-
-    function setFeatureCompatibilityVersion(adminDB, version) {
-        assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: version}));
-        assert.eq(version, getFeatureCompatibilityVersion(adminDB));
-    }
-
     assert.eq(typeof db, 'object', 'Invalid `db` object, is the shell connected to a mongod?');
     assert.eq(typeof obj, 'object', 'The `obj` argument must be an object');
     assert(obj.hasOwnProperty('full'), 'Please specify whether to use full validation');
@@ -35,30 +22,6 @@ function validateCollections(db, obj) {
     var success = true;
 
     var adminDB = db.getSiblingDB("admin");
-
-    // Set the featureCompatibilityVersion to its required value for performing validation. Save the
-    // original value.
-    var originalFeatureCompatibilityVersion;
-    if (jsTest.options().forceValidationWithFeatureCompatibilityVersion) {
-        try {
-            originalFeatureCompatibilityVersion = getFeatureCompatibilityVersion(adminDB);
-        } catch (e) {
-            if (jsTest.options().skipValidationOnInvalidViewDefinitions &&
-                e.code === ErrorCodes.InvalidViewDefinition) {
-                print("Reading the featureCompatibilityVersion from the admin.system.version" +
-                      " collection failed due to an invalid view definition on the admin database");
-                // The view catalog would only have been resolved if the namespace doesn't exist as
-                // a collection. The absence of the admin.system.version collection is equivalent to
-                // having featureCompatibilityVersion=3.2.
-                originalFeatureCompatibilityVersion = "3.2";
-            } else {
-                throw e;
-            }
-        }
-
-        setFeatureCompatibilityVersion(
-            adminDB, jsTest.options().forceValidationWithFeatureCompatibilityVersion);
-    }
 
     // Don't run validate on view namespaces.
     let filter = {type: "collection"};
@@ -77,15 +40,20 @@ function validateCollections(db, obj) {
         var res = coll.validate(full);
 
         if (!res.ok || !res.valid) {
+            if (jsTest.options().skipValidationOnNamespaceNotFound &&
+                res.errmsg === 'ns not found') {
+                // During a 'stopStart' backup/restore on the secondary node, the actual list of
+                // collections can be out of date if ops are still being applied from the oplog. In
+                // this case we skip the collection if the ns was not found at time of validation
+                // and continue to next.
+                print('Skipping collection validation for ' + coll.getFullName() +
+                      ' since collection was not found');
+                continue;
+            }
             print('Collection validation failed with response: ' + tojson(res));
             dumpCollection(coll, 100);
             success = false;
         }
-    }
-
-    // Restore the original value for featureCompatibilityVersion.
-    if (jsTest.options().forceValidationWithFeatureCompatibilityVersion) {
-        setFeatureCompatibilityVersion(adminDB, originalFeatureCompatibilityVersion);
     }
 
     return success;

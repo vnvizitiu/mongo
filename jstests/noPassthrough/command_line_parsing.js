@@ -16,7 +16,7 @@ var m2expected = {
     "parsed": {
         "config": "jstests/libs/testconfig",
         "storage": {"dbPath": m2.dbpath},
-        "net": {"port": m2.port},
+        "net": {"bindIp": "0.0.0.0", "port": m2.port},
         "help": false,
         "version": false,
         "sysinfo": false
@@ -25,7 +25,8 @@ var m2expected = {
 var m2result = m2.getDB("admin").runCommand("getCmdLineOpts");
 
 // remove variables that depend on the way the test is started.
-delete m2result.parsed.nopreallocj;
+delete m2result.parsed.net.serviceExecutor;
+delete m2result.parsed.storage.mmapv1;
 delete m2result.parsed.setParameter;
 delete m2result.parsed.storage.engine;
 delete m2result.parsed.storage.journal;
@@ -40,7 +41,7 @@ var m3expected = {
     "parsed": {
         "config": "jstests/libs/testconfig",
         "storage": {"dbPath": m3.dbpath},
-        "net": {"port": m3.port},
+        "net": {"bindIp": "0.0.0.0", "port": m3.port},
         "help": false,
         "version": false,
         "sysinfo": false
@@ -49,7 +50,8 @@ var m3expected = {
 var m3result = m3.getDB("admin").runCommand("getCmdLineOpts");
 
 // remove variables that depend on the way the test is started.
-delete m3result.parsed.nopreallocj;
+delete m3result.parsed.net.serviceExecutor;
+delete m3result.parsed.storage.mmapv1;
 delete m3result.parsed.setParameter;
 delete m3result.parsed.storage.engine;
 delete m3result.parsed.storage.journal;

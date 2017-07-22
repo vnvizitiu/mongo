@@ -33,6 +33,7 @@
 #include "mongo/db/query/planner_access.h"
 
 #include <algorithm>
+#include <memory>
 #include <vector>
 
 #include "mongo/base/owned_pointer_vector.h"
@@ -49,6 +50,7 @@
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
+#include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace {
 
@@ -108,6 +110,30 @@ bool scansAreEquivalent(const QuerySolutionNode* lhs, const QuerySolutionNode* r
     return *leftIxscan == *rightIxscan;
 }
 
+/**
+ * If all nodes can provide the requested sort, returns a vector expressing which nodes must have
+ * their index scans reversed to provide the sort. Otherwise, returns an empty vector.
+ * 'nodes' must not be empty.
+ */
+std::vector<bool> canProvideSortWithMergeSort(const std::vector<QuerySolutionNode*>& nodes,
+                                              const BSONObj& requestedSort) {
+    invariant(!nodes.empty());
+    std::vector<bool> shouldReverseScan;
+    const auto reverseSort = QueryPlannerCommon::reverseSortObj(requestedSort);
+    for (auto&& node : nodes) {
+        node->computeProperties();
+        auto sorts = node->getSort();
+        if (sorts.find(requestedSort) != sorts.end()) {
+            shouldReverseScan.push_back(false);
+        } else if (sorts.find(reverseSort) != sorts.end()) {
+            shouldReverseScan.push_back(true);
+        } else {
+            return {};
+        }
+    }
+    return shouldReverseScan;
+}
+
 }  // namespace
 
 namespace mongo {
@@ -117,11 +143,10 @@ using std::vector;
 using stdx::make_unique;
 
 // static
-QuerySolutionNode* QueryPlannerAccess::makeCollectionScan(const CanonicalQuery& query,
-                                                          bool tailable,
-                                                          const QueryPlannerParams& params) {
+std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
+    const CanonicalQuery& query, bool tailable, const QueryPlannerParams& params) {
     // Make the (only) node, a collection scan.
-    CollectionScanNode* csn = new CollectionScanNode();
+    auto csn = stdx::make_unique<CollectionScanNode>();
     csn->name = query.ns();
     csn->filter = query.root()->shallowClone();
     csn->tailable = tailable;
@@ -146,7 +171,7 @@ QuerySolutionNode* QueryPlannerAccess::makeCollectionScan(const CanonicalQuery& 
         }
     }
 
-    return csn;
+    return std::move(csn);
 }
 
 // static
@@ -623,22 +648,23 @@ void QueryPlannerAccess::findElemMatchChildren(const MatchExpression* node,
 // static
 std::vector<QuerySolutionNode*> QueryPlannerAccess::collapseEquivalentScans(
     const std::vector<QuerySolutionNode*> scans) {
-    OwnedPointerVector<QuerySolutionNode> ownedScans(scans);
+    std::vector<std::unique_ptr<QuerySolutionNode>> ownedScans =
+        transitional_tools_do_not_use::spool_vector(scans);
     invariant(ownedScans.size() > 0);
 
     // Scans that need to be collapsed will be adjacent to each other in the list due to how we
     // sort the query predicate. We step through the list, either merging the current scan into
     // the last scan in 'collapsedScans', or adding a new entry to 'collapsedScans' if it can't
     // be merged.
-    OwnedPointerVector<QuerySolutionNode> collapsedScans;
+    std::vector<std::unique_ptr<QuerySolutionNode>> collapsedScans;
 
-    collapsedScans.push_back(ownedScans.releaseAt(0));
+    collapsedScans.push_back(std::move(ownedScans[0]));
     for (size_t i = 1; i < ownedScans.size(); ++i) {
-        if (scansAreEquivalent(collapsedScans.back(), ownedScans[i])) {
+        if (scansAreEquivalent(collapsedScans.back().get(), ownedScans[i].get())) {
             // We collapse the entry from 'ownedScans' into the back of 'collapsedScans'.
-            std::unique_ptr<QuerySolutionNode> collapseFrom(ownedScans.releaseAt(i));
+            std::unique_ptr<QuerySolutionNode> collapseFrom(std::move(ownedScans[i]));
             FetchNode* collapseFromFetch = getFetchNode(collapseFrom.get());
-            FetchNode* collapseIntoFetch = getFetchNode(collapsedScans.back());
+            FetchNode* collapseIntoFetch = getFetchNode(collapsedScans.back().get());
 
             // If there's no filter associated with a fetch node on 'collapseFrom', all we have to
             // do is clear the filter on the node that we are collapsing into.
@@ -667,12 +693,12 @@ std::vector<QuerySolutionNode*> QueryPlannerAccess::collapseEquivalentScans(
                 CanonicalQuery::normalizeTree(collapsedFilter.release()));
         } else {
             // Scans are not equivalent and can't be collapsed.
-            collapsedScans.push_back(ownedScans.releaseAt(i));
+            collapsedScans.push_back(std::move(ownedScans[i]));
         }
     }
 
     invariant(collapsedScans.size() > 0);
-    return collapsedScans.release();
+    return transitional_tools_do_not_use::leak_vector(collapsedScans);
 }
 
 // static
@@ -972,7 +998,7 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedAnd(const CanonicalQuery& que
             AndSortedNode* asn = new AndSortedNode();
             asn->children.swap(ixscanNodes);
             andResult = asn;
-        } else if (internalQueryPlannerEnableHashIntersection) {
+        } else if (internalQueryPlannerEnableHashIntersection.load()) {
             AndHashNode* ahn = new AndHashNode();
             ahn->children.swap(ixscanNodes);
             andResult = ahn;
@@ -1081,40 +1107,25 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedOr(const CanonicalQuery& quer
     if (1 == ixscanNodes.size()) {
         orResult = ixscanNodes[0];
     } else {
-        bool shouldMergeSort = false;
+        std::vector<bool> shouldReverseScan;
 
         if (!query.getQueryRequest().getSort().isEmpty()) {
-            const BSONObj& desiredSort = query.getQueryRequest().getSort();
+            // If all ixscanNodes can provide the sort, shouldReverseScan is populated with which
+            // scans to reverse.
+            shouldReverseScan =
+                canProvideSortWithMergeSort(ixscanNodes, query.getQueryRequest().getSort());
+        }
 
-            // If there exists a sort order that is present in each child, we can merge them and
-            // maintain that sort order / those sort orders.
-            ixscanNodes[0]->computeProperties();
-            BSONObjSet sharedSortOrders = ixscanNodes[0]->getSort();
-
-            if (!sharedSortOrders.empty()) {
-                for (size_t i = 1; i < ixscanNodes.size(); ++i) {
-                    ixscanNodes[i]->computeProperties();
-                    const auto& bsonCmp = SimpleBSONObjComparator::kInstance;
-                    BSONObjSet isect = bsonCmp.makeBSONObjSet();
-                    set_intersection(sharedSortOrders.begin(),
-                                     sharedSortOrders.end(),
-                                     ixscanNodes[i]->getSort().begin(),
-                                     ixscanNodes[i]->getSort().end(),
-                                     std::inserter(isect, isect.end()),
-                                     bsonCmp.makeLessThan());
-                    sharedSortOrders = isect;
-                    if (sharedSortOrders.empty()) {
-                        break;
-                    }
+        if (!shouldReverseScan.empty()) {
+            // Each node can provide either the requested sort, or the reverse of the requested
+            // sort.
+            invariant(ixscanNodes.size() == shouldReverseScan.size());
+            for (size_t i = 0; i < ixscanNodes.size(); ++i) {
+                if (shouldReverseScan[i]) {
+                    QueryPlannerCommon::reverseScans(ixscanNodes[i]);
                 }
             }
 
-            // TODO: If we're looking for the reverse of one of these sort orders we could
-            // possibly reverse the ixscan nodes.
-            shouldMergeSort = (sharedSortOrders.end() != sharedSortOrders.find(desiredSort));
-        }
-
-        if (shouldMergeSort) {
             MergeSortNode* msn = new MergeSortNode();
             msn->sort = query.getQueryRequest().getSort();
             msn->children.swap(ixscanNodes);
@@ -1143,7 +1154,8 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedDataAccess(const CanonicalQue
                                                               bool inArrayOperator,
                                                               const vector<IndexEntry>& indices,
                                                               const QueryPlannerParams& params) {
-    if (root->isLogical() && !Indexability::isBoundsGeneratingNot(root)) {
+    if (root->getCategory() == MatchExpression::MatchCategory::kLogical &&
+        !Indexability::isBoundsGeneratingNot(root)) {
         if (MatchExpression::AND == root->matchType()) {
             // Takes ownership of root.
             return buildIndexedAnd(query, root, inArrayOperator, indices, params);
@@ -1163,8 +1175,6 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedDataAccess(const CanonicalQue
             autoRoot.reset(root);
         }
 
-        // isArray or isLeaf is true.  Either way, it's over one field, and the bounds builder
-        // deals with it.
         if (NULL == root->getTag()) {
             // No index to use here, not in the context of logical operator, so we're SOL.
             return NULL;
@@ -1206,7 +1216,7 @@ QuerySolutionNode* QueryPlannerAccess::buildIndexedDataAccess(const CanonicalQue
         } else if (Indexability::arrayUsesIndexOnChildren(root)) {
             QuerySolutionNode* solution = NULL;
 
-            invariant(MatchExpression::ELEM_MATCH_OBJECT);
+            invariant(root->matchType() == MatchExpression::ELEM_MATCH_OBJECT);
             // The child is an AND.
             invariant(1 == root->numChildren());
             solution = buildIndexedDataAccess(query, root->getChild(0), true, indices, params);

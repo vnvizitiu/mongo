@@ -34,6 +34,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/jsobj.h"
@@ -58,6 +59,7 @@ const std::string ROLE_DB_FIELD_NAME = "db";
 const std::string MONGODB_CR_CREDENTIAL_FIELD_NAME = "MONGODB-CR";
 const std::string SCRAM_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-1";
 const std::string MONGODB_EXTERNAL_CREDENTIAL_FIELD_NAME = "external";
+constexpr StringData AUTHENTICATION_RESTRICTIONS_FIELD_NAME = "authenticationRestrictions"_sd;
 
 inline Status _badValue(const char* reason, int location) {
     return Status(ErrorCodes::BadValue, reason, location);
@@ -223,6 +225,7 @@ Status _checkV2RolesArray(const BSONElement& rolesElement) {
 
 Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     BSONElement userElement = doc[AuthorizationManager::USER_NAME_FIELD_NAME];
+    BSONElement userIDElement = doc[AuthorizationManager::USER_ID_FIELD_NAME];
     BSONElement userDBElement = doc[AuthorizationManager::USER_DB_FIELD_NAME];
     BSONElement credentialsElement = doc[CREDENTIALS_FIELD_NAME];
     BSONElement rolesElement = doc[ROLES_FIELD_NAME];
@@ -232,6 +235,11 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
         return _badValue("User document needs 'user' field to be a string", 0);
     if (userElement.valueStringData().empty())
         return _badValue("User document needs 'user' field to be non-empty", 0);
+
+    // If we have an id field, make sure it is an OID
+    if (!userIDElement.eoo() && (userIDElement.type() != BSONType::jstOID)) {
+        return _badValue("User document 'userId' field must be an OID", 0);
+    }
 
     // Validate the "db" element
     if (userDBElement.type() != String || userDBElement.valueStringData().empty()) {
@@ -293,11 +301,26 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     if (!status.isOK())
         return status;
 
+    // Validate the "authenticationRestrictions" element.
+    status = initializeAuthenticationRestrictionsFromUserDocument(doc, nullptr);
+    if (!status.isOK()) {
+        return status;
+    }
+
     return Status::OK();
 }
 
 std::string V2UserDocumentParser::extractUserNameFromUserDocument(const BSONObj& doc) const {
     return doc[AuthorizationManager::USER_NAME_FIELD_NAME].str();
+}
+
+boost::optional<OID> V2UserDocumentParser::extractUserIDFromUserDocument(const BSONObj& doc) const {
+    BSONElement e = doc[AuthorizationManager::USER_ID_FIELD_NAME];
+    if (e.type() == BSONType::EOO) {
+        return boost::optional<OID>();
+    }
+
+    return e.OID();
 }
 
 Status V2UserDocumentParser::initializeUserCredentialsFromUserDocument(
@@ -425,6 +448,30 @@ Status V2UserDocumentParser::parseRoleVector(const BSONArray& rolesArray,
         roles.push_back(role);
     }
     std::swap(*result, roles);
+    return Status::OK();
+}
+
+Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocument(
+    const BSONObj& privDoc, User* user) const {
+    const auto authenticationRestrictions = privDoc[AUTHENTICATION_RESTRICTIONS_FIELD_NAME];
+    if (authenticationRestrictions.eoo()) {
+        return Status::OK();
+    }
+
+    if (authenticationRestrictions.type() != Array) {
+        return Status(ErrorCodes::UnsupportedFormat,
+                      "'authenticationRestrictions' field must be an array");
+    }
+
+    auto restrictions = parseAuthenticationRestriction(BSONArray(authenticationRestrictions.Obj()));
+    if (!restrictions.isOK()) {
+        return restrictions.getStatus();
+    }
+
+    if (user != nullptr) {
+        user->setRestrictions(
+            RestrictionDocuments(RestrictionDocuments::sequence_type{restrictions.getValue()}));
+    }
     return Status::OK();
 }
 

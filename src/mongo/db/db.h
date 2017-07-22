@@ -1,3 +1,4 @@
+
 /**
 *    Copyright (C) 2008 10gen Inc.
 *
@@ -40,7 +41,5 @@ namespace mongo {
 namespace repl {
 class ReplSettings;
 }  // namespace repl
-
-extern void (*snmpInit)();
 
 }  // namespace mongo

@@ -31,9 +31,15 @@
 #include "mongo/db/catalog/collection_options.h"
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+bool enableCollectionUUIDs = true;
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly> enableCollectionUUIDsParameter(
+    ServerParameterSet::getGlobal(), "enableCollectionUUIDs", &enableCollectionUUIDs);
 
 // static
 bool CollectionOptions::validMaxCappedDocs(long long* max) {
@@ -86,77 +92,45 @@ Status checkStorageEngineOptions(const BSONElement& elem) {
     return Status::OK();
 }
 
-// These are collection creation options which are handled elsewhere. If we encounter a field which
-// CollectionOptions doesn't know about, parsing the options should fail unless we find the field
-// name in this whitelist.
-const std::set<StringData> collectionOptionsWhitelist{
-    "maxTimeMS"_sd, "writeConcern"_sd,
-};
-
 }  // namespace
-
-void CollectionOptions::reset() {
-    capped = false;
-    cappedSize = 0;
-    cappedMaxDocs = 0;
-    initialNumExtents = 0;
-    initialExtentSizes.clear();
-    autoIndexId = DEFAULT;
-    // For compatibility with previous versions if the user sets no flags,
-    // we set Flag_UsePowerOf2Sizes in case the user downgrades.
-    flags = Flag_UsePowerOf2Sizes;
-    flagsSet = false;
-    temp = false;
-    storageEngine = BSONObj();
-    indexOptionDefaults = BSONObj();
-    validator = BSONObj();
-    validationLevel = "";
-    validationAction = "";
-    collation = BSONObj();
-    viewOn = "";
-    pipeline = BSONObj();
-}
-
-bool CollectionOptions::isValid() const {
-    return validate().isOK();
-}
 
 bool CollectionOptions::isView() const {
     return !viewOn.empty();
 }
 
-Status CollectionOptions::validate() const {
-    return CollectionOptions().parse(toBSON());
+Status CollectionOptions::validateForStorage() const {
+    return CollectionOptions().parse(toBSON(), ParseKind::parseForStorage);
 }
 
-Status CollectionOptions::parse(const BSONObj& options) {
-    reset();
+Status CollectionOptions::parse(const BSONObj& options, ParseKind kind) {
+    *this = {};
 
-    // Versions 2.4 and earlier of the server store "create" as the first field inside the
-    // collection metadata when the user issues an explicit collection creation command. These
-    // versions also wrote any unrecognized fields into the catalog metadata. Therefore, if the
-    // "create" field is present and first, we must ignore any unknown fields during parsing.
-    // Otherwise, we disallow unknown collection options.
+    // Versions 2.4 and earlier of the server store "create" inside the collection metadata when the
+    // user issues an explicit collection creation command. These versions also wrote any
+    // unrecognized fields into the catalog metadata and allowed the order of these fields to be
+    // changed. Therefore, if the "create" field is present, we must ignore any
+    // unknown fields during parsing. Otherwise, we disallow unknown collection options.
     //
     // Versions 2.6 through 3.2 ignored unknown collection options rather than failing but did not
     // store the "create" field. These versions also refrained from materializing the unknown
     // options in the catalog, so we are free to fail on unknown options in this case.
-    const bool createdOn24OrEarlier = (options.firstElement().fieldNameStringData() == "create"_sd);
+    const bool createdOn24OrEarlier = static_cast<bool>(options["create"]);
 
     // During parsing, ignore some validation errors in order to accept options objects that
     // were valid in previous versions of the server.  SERVER-13737.
     BSONObjIterator i(options);
 
-    // Skip the initial "create" field, if present.
-    if (createdOn24OrEarlier) {
-        i.next();
-    }
-
     while (i.more()) {
         BSONElement e = i.next();
         StringData fieldName = e.fieldName();
 
-        if (fieldName == "capped") {
+        if (fieldName == "uuid" && kind == parseForStorage) {
+            auto res = CollectionUUID::parse(e);
+            if (!res.isOK()) {
+                return res.getStatus();
+            }
+            uuid = res.getValue();
+        } else if (fieldName == "capped") {
             capped = e.trueValue();
         } else if (fieldName == "size") {
             if (!e.isNumber()) {
@@ -269,8 +243,7 @@ Status CollectionOptions::parse(const BSONObj& options) {
             }
 
             pipeline = e.Obj().getOwned();
-        } else if (!createdOn24OrEarlier &&
-                   collectionOptionsWhitelist.find(fieldName) == collectionOptionsWhitelist.end()) {
+        } else if (!createdOn24OrEarlier && !Command::isGenericArgument(fieldName)) {
             return Status(ErrorCodes::InvalidOptions,
                           str::stream() << "The field '" << fieldName
                                         << "' is not a valid collection option. Options: "
@@ -287,6 +260,11 @@ Status CollectionOptions::parse(const BSONObj& options) {
 
 BSONObj CollectionOptions::toBSON() const {
     BSONObjBuilder b;
+
+    if (uuid) {
+        b.appendElements(uuid->toBSON());
+    }
+
     if (capped) {
         b.appendBool("capped", true);
         b.appendNumber("size", cappedSize);

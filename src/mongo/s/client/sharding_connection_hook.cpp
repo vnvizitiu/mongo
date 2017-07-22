@@ -48,8 +48,8 @@ namespace mongo {
 
 using std::string;
 
-ShardingConnectionHook::ShardingConnectionHook(
-    bool shardedConnections, std::unique_ptr<rpc::ShardingEgressMetadataHook> egressHook)
+ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections,
+                                               std::unique_ptr<rpc::EgressMetadataHook> egressHook)
     : _shardedConnections(shardedConnections), _egressHook(std::move(egressHook)) {}
 
 void ShardingConnectionHook::onCreate(DBClientBase* conn) {
@@ -73,15 +73,14 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     // Delegate the metadata hook logic to the egress hook; use lambdas to pass the arguments in
     // the order expected by the egress hook.
     if (_shardedConnections) {
-        conn->setReplyMetadataReader([this](const BSONObj& metadataObj, StringData target) {
-            return _egressHook->readReplyMetadata(target, metadataObj);
-        });
+        conn->setReplyMetadataReader(
+            [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData target) {
+                return _egressHook->readReplyMetadata(opCtx, target, metadataObj);
+            });
     }
-    conn->setRequestMetadataWriter(
-        [this](OperationContext* txn, BSONObjBuilder* metadataBob, StringData hostStringData) {
-            return _egressHook->writeRequestMetadata(
-                _shardedConnections, txn, hostStringData, metadataBob);
-        });
+    conn->setRequestMetadataWriter([this](OperationContext* opCtx, BSONObjBuilder* metadataBob) {
+        return _egressHook->writeRequestMetadata(opCtx, metadataBob);
+    });
 
 
     if (conn->type() == ConnectionString::MASTER) {
@@ -98,6 +97,7 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
             // This isn't a config server we're talking to.
             return;
         }
+        uassertStatusOK(status);
 
         const long long minKnownConfigServerMode = 1;
         const long long maxKnownConfigServerMode = 2;

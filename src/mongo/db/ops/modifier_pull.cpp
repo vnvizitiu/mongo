@@ -32,10 +32,10 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
-#include "mongo/db/ops/field_checker.h"
-#include "mongo/db/ops/log_builder.h"
-#include "mongo/db/ops/path_support.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/update/field_checker.h"
+#include "mongo/db/update/log_builder.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -109,7 +109,9 @@ Status ModifierPull::init(const BSONElement& modExpr, const Options& opts, bool*
             _exprObj = _exprElt.embeddedObject();
 
             // If not is not a query operator, then it is a primitive.
-            _matcherOnPrimitive = (_exprObj.firstElement().getGtLtOp() != 0);
+            _matcherOnPrimitive = (MatchExpressionParser::parsePathAcceptingKeyword(
+                                       _exprObj.firstElement(), PathAcceptingKeyword::EQUALITY) !=
+                                   PathAcceptingKeyword::EQUALITY);
 
             // If the object is primitive then wrap it up into an object.
             if (_matcherOnPrimitive)
@@ -214,7 +216,7 @@ Status ModifierPull::apply() const {
     std::vector<mb::Element>::const_iterator where = _preparedState->elementsToRemove.begin();
     const std::vector<mb::Element>::const_iterator end = _preparedState->elementsToRemove.end();
     for (; where != end; ++where)
-        const_cast<mb::Element&>(*where).remove();
+        const_cast<mb::Element&>(*where).remove().transitional_ignore();
 
     return Status::OK();
 }

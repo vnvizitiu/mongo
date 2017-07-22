@@ -30,8 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string>
-
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
@@ -40,54 +38,65 @@
 namespace mongo {
 namespace {
 
-/**
- * Implements the aggregation (pipeline command for sharding).
- */
-class PipelineCommand : public Command {
+class ClusterPipelineCommand : public BasicCommand {
 public:
-    PipelineCommand() : Command(AggregationRequest::kCommandName, false) {}
+    ClusterPipelineCommand() : BasicCommand("aggregate") {}
 
-    virtual bool slaveOk() const {
+    void help(std::stringstream& help) const {
+        help << "Runs the sharded aggregation command. See "
+                "http://dochub.mongodb.org/core/aggregation for more details.";
+    }
+
+    bool slaveOk() const override {
         return true;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return false;
     }
 
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "Runs the sharded aggregation command";
-    }
-
-    // virtuals from Command
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) final {
-        NamespaceString nss(parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj);
+                               const BSONObj& cmdObj) override {
+        const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
+        return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, true);
     }
 
-    virtual bool run(OperationContext* txn,
-                     const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
-                     BSONObjBuilder& result) {
-        const std::string fullns = parseNs(dbname, cmdObj);
-        const NamespaceString nss(fullns);
-
-        ClusterAggregate::Namespaces nsStruct;
-        nsStruct.requestedNss = nss;
-        nsStruct.executionNss = std::move(nss);
-        auto status = ClusterAggregate::runAggregate(txn, nsStruct, cmdObj, options, &result);
-        appendCommandStatus(result, status);
-        return status.isOK();
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        return appendCommandStatus(result,
+                                   _runAggCommand(opCtx, dbname, cmdObj, boost::none, &result));
     }
+
+    Status explain(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const override {
+        return _runAggCommand(opCtx, dbname, cmdObj, verbosity, out);
+    }
+
+private:
+    static Status _runAggCommand(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj,
+                                 boost::optional<ExplainOptions::Verbosity> verbosity,
+                                 BSONObjBuilder* result) {
+        const auto aggregationRequest =
+            uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, verbosity));
+
+        const auto& nss = aggregationRequest.getNamespaceString();
+
+        return ClusterAggregate::runAggregate(
+            opCtx, ClusterAggregate::Namespaces{nss, nss}, aggregationRequest, cmdObj, result);
+    }
+
 } clusterPipelineCmd;
 
 }  // namespace

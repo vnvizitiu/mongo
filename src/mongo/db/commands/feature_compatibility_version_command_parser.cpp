@@ -32,13 +32,15 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-constexpr StringData FeatureCompatibilityVersionCommandParser::kVersion34;
 constexpr StringData FeatureCompatibilityVersionCommandParser::kVersion32;
+constexpr StringData FeatureCompatibilityVersionCommandParser::kVersion34;
+constexpr StringData FeatureCompatibilityVersionCommandParser::kVersion36;
 
 StatusWith<std::string> FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(
     StringData commandName, const BSONObj& cmdObj) {
@@ -57,13 +59,13 @@ StatusWith<std::string> FeatureCompatibilityVersionCommandParser::extractVersion
                               << typeName(versionElem.type())
                               << " in: "
                               << cmdObj
-                              << ". See http://dochub.mongodb.org/core/3.4-feature-compatibility."};
+                              << ". See http://dochub.mongodb.org/core/3.6-feature-compatibility."};
     }
 
     // Ensure that the command does not contain any unrecognized parameters
     for (const auto& cmdElem : cmdObj) {
-        if (cmdElem.fieldNameStringData() == commandName ||
-            cmdElem.fieldNameStringData() == QueryRequest::cmdOptionMaxTimeMS) {
+        const auto fieldName = cmdElem.fieldNameStringData();
+        if (fieldName == commandName || Command::isGenericArgument(fieldName)) {
             continue;
         }
 
@@ -71,23 +73,30 @@ StatusWith<std::string> FeatureCompatibilityVersionCommandParser::extractVersion
             ErrorCodes::InvalidOptions,
             str::stream() << "Unrecognized field found " << cmdElem.fieldNameStringData() << " in "
                           << cmdObj
-                          << ". See http ://dochub.mongodb.org/core/3.4-feature-compatibility.");
+                          << ". See http ://dochub.mongodb.org/core/3.6-feature-compatibility.");
     }
 
     const std::string version = versionElem.String();
 
-    if (version != FeatureCompatibilityVersionCommandParser::kVersion34 &&
-        version != FeatureCompatibilityVersionCommandParser::kVersion32) {
+    if (version == FeatureCompatibilityVersionCommandParser::kVersion32) {
+        return {ErrorCodes::BadValue,
+                "Invalid command argument: '3.2'. You must downgrade to MongoDB 3.4 to enable "
+                "featureCompatibilityVersion 3.2. See "
+                "http://dochub.mongodb.org/core/3.6-feature-compatibility."};
+    }
+
+    if (version != FeatureCompatibilityVersionCommandParser::kVersion36 &&
+        version != FeatureCompatibilityVersionCommandParser::kVersion34) {
         return {ErrorCodes::BadValue,
                 str::stream() << "Invalid command argument. Expected '"
-                              << FeatureCompatibilityVersionCommandParser::kVersion34
+                              << FeatureCompatibilityVersionCommandParser::kVersion36
                               << "' or '"
-                              << FeatureCompatibilityVersionCommandParser::kVersion32
+                              << FeatureCompatibilityVersionCommandParser::kVersion34
                               << "', found "
                               << version
                               << " in: "
                               << cmdObj
-                              << ". See http://dochub.mongodb.org/core/3.4-feature-compatibility."};
+                              << ". See http://dochub.mongodb.org/core/3.6-feature-compatibility."};
     }
 
     return version;

@@ -90,7 +90,7 @@
     // This write will have to wait on the initial sync to complete before progressing.
     assert.soonNoExcept(() => {
         assert.writeOK(rstest.getPrimary().getDB("db1")["aCollection"].insert(
-            {_id: "afterSecondNodeAdded"}, {writeConcern: {w: 2, wtimeout: 60 * 1000}}));
+            {a: "afterSecondNodeAdded"}, {writeConcern: {w: 2, wtimeout: 60 * 1000}}));
         return true;
     });
 
@@ -170,7 +170,16 @@
                   privileges: [{resource: {db: "db1", collection: "log"}, actions: ["insert"]}]
               }
             },
-            {op: "c", ns: "admin.$cmd", o: {dropDatabase: 1}},
+            {op: "c", ns: "admin.$cmd", o: {drop: "system.roles"}},
+        ]
+    }));
+
+    // The dropDatabase command cannot be run inside an applyOps if it still has any collections
+    // (drop-pending included). See SERVER-29874.
+    assert.commandWorked(rstest.getPrimary().getDB("admin").dropDatabase());
+
+    assert.commandWorked(rstest.getPrimary().getDB("admin").runCommand({
+        applyOps: [
             {op: "c", ns: "admin.$cmd", o: {create: "system.roles"}},
             {
               op: "i",

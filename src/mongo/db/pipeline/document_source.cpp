@@ -61,7 +61,7 @@ void DocumentSource::registerParser(string name, Parser parser) {
 }
 
 vector<intrusive_ptr<DocumentSource>> DocumentSource::parse(
-    const intrusive_ptr<ExpressionContext> expCtx, BSONObj stageObj) {
+    const intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj) {
     uassert(16435,
             "A pipeline stage specification object must contain exactly one field.",
             stageObj.nFields() == 1);
@@ -81,11 +81,6 @@ vector<intrusive_ptr<DocumentSource>> DocumentSource::parse(
 const char* DocumentSource::getSourceName() const {
     static const char unknown[] = "[UNKNOWN]";
     return unknown;
-}
-
-void DocumentSource::setSource(DocumentSource* pTheSource) {
-    verify(!isValidInitialSource());
-    pSource = pTheSource;
 }
 
 intrusive_ptr<DocumentSource> DocumentSource::optimize() {
@@ -110,8 +105,7 @@ std::set<std::string> extractModifiedDependencies(const std::set<std::string>& d
     // should not be included in the modified dependencies.
     for (auto&& dependency : dependencies) {
         bool preserved = false;
-        auto depAsPath = FieldPath(dependency);
-        auto firstField = depAsPath.getFieldName(0);
+        auto firstField = FieldPath::extractFirstFieldFromDottedPath(dependency).toString();
         // If even a prefix is preserved, the path is preserved, so search for any prefixes of
         // 'dependency' as well. 'preservedPaths' is an *ordered* set, so we only have to search the
         // range ['firstField', 'dependency'] to find any prefixes of 'dependency'.
@@ -153,10 +147,15 @@ splitMatchByModifiedFields(const boost::intrusive_ptr<DocumentSourceMatch>& matc
         case DocumentSource::GetModPathsReturn::Type::kAllExcept: {
             DepsTracker depsTracker;
             match->getDependencies(&depsTracker);
-            modifiedPaths = extractModifiedDependencies(depsTracker.fields, modifiedPathsRet.paths);
+
+            auto preservedPaths = modifiedPathsRet.paths;
+            for (auto&& rename : modifiedPathsRet.renames) {
+                preservedPaths.insert(rename.first);
+            }
+            modifiedPaths = extractModifiedDependencies(depsTracker.fields, preservedPaths);
         }
     }
-    return match->splitSourceBy(modifiedPaths);
+    return match->splitSourceBy(modifiedPaths, modifiedPathsRet.renames);
 }
 
 }  // namespace
@@ -193,13 +192,8 @@ Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
     return doOptimizeAt(itr, container);
 }
 
-void DocumentSource::dispose() {
-    if (pSource) {
-        pSource->dispose();
-    }
-}
-
-void DocumentSource::serializeToArray(vector<Value>& array, bool explain) const {
+void DocumentSource::serializeToArray(vector<Value>& array,
+                                      boost::optional<ExplainOptions::Verbosity> explain) const {
     Value entry = serialize(explain);
     if (!entry.missing()) {
         array.push_back(entry);

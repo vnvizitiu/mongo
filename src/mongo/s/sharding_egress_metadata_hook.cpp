@@ -50,17 +50,11 @@ namespace rpc {
 
 using std::shared_ptr;
 
-Status ShardingEgressMetadataHook::writeRequestMetadata(bool shardedConnection,
-                                                        OperationContext* txn,
-                                                        const StringData target,
+Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* opCtx,
                                                         BSONObjBuilder* metadataBob) {
     try {
-        audit::writeImpersonatedUsersToMetadata(txn, metadataBob);
-
-        ClientMetadataIsMasterState::writeToMetadata(txn, metadataBob);
-        if (!shardedConnection) {
-            return Status::OK();
-        }
+        audit::writeImpersonatedUsersToMetadata(opCtx, metadataBob);
+        ClientMetadataIsMasterState::writeToMetadata(opCtx, metadataBob);
         rpc::ConfigServerMetadata(_getConfigServerOpTime()).writeToMetadata(metadataBob);
         return Status::OK();
     } catch (...) {
@@ -68,33 +62,11 @@ Status ShardingEgressMetadataHook::writeRequestMetadata(bool shardedConnection,
     }
 }
 
-Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* txn,
-                                                        const HostAndPort& target,
-                                                        BSONObjBuilder* metadataBob) {
-    try {
-        audit::writeImpersonatedUsersToMetadata(txn, metadataBob);
-        ClientMetadataIsMasterState::writeToMetadata(txn, metadataBob);
-        rpc::ConfigServerMetadata(_getConfigServerOpTime()).writeToMetadata(metadataBob);
-        return Status::OK();
-    } catch (...) {
-        return exceptionToStatus();
-    }
-}
-
-Status ShardingEgressMetadataHook::readReplyMetadata(const StringData replySource,
+Status ShardingEgressMetadataHook::readReplyMetadata(OperationContext* opCtx,
+                                                     StringData replySource,
                                                      const BSONObj& metadataObj) {
     try {
         _saveGLEStats(metadataObj, replySource);
-        return _advanceConfigOptimeFromShard(replySource.toString(), metadataObj);
-    } catch (...) {
-        return exceptionToStatus();
-    }
-}
-
-Status ShardingEgressMetadataHook::readReplyMetadata(const HostAndPort& replySource,
-                                                     const BSONObj& metadataObj) {
-    try {
-        _saveGLEStats(metadataObj, replySource.toString());
         return _advanceConfigOptimeFromShard(replySource.toString(), metadataObj);
     } catch (...) {
         return exceptionToStatus();

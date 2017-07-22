@@ -17,9 +17,7 @@ load("./jstests/multiVersion/libs/verify_versions.js");
             {binVersion: "latest"}
         ],
         mongos: 1,
-        other: {mongosOptions: {binVersion: "last-stable"}},
-        // TODO: SERVER-24163 remove after v3.4
-        waitForCSRSSecondaries: false
+        other: {mongosOptions: {binVersion: "last-stable"}}
     };
 
     var st = new ShardingTest(options);
@@ -76,8 +74,10 @@ load("./jstests/multiVersion/libs/verify_versions.js");
      *      shard3 (latest)      -> bar chunk -> shard1 (last-stable)
      */
 
-    assert.commandWorked(admin.runCommand({moveChunk: fooNS, find: {a: 10}, to: shards[2]._id}));
-    assert.commandWorked(admin.runCommand({moveChunk: barNS, find: {a: 10}, to: shards[1]._id}));
+    assert.commandWorked(admin.runCommand(
+        {moveChunk: fooNS, find: {a: 10}, to: shards[2]._id, _waitForDelete: true}));
+    assert.commandWorked(admin.runCommand(
+        {moveChunk: barNS, find: {a: 10}, to: shards[1]._id, _waitForDelete: true}));
     assert.eq(1,
               fooRecipientColl.count(),
               "Foo collection migration failed. " +

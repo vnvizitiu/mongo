@@ -35,6 +35,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/write_ops/batched_update_document.h"
+#include "mongo/util/net/op_msg.h"
 
 namespace mongo {
 
@@ -46,18 +47,8 @@ class BatchedUpdateRequest {
     MONGO_DISALLOW_COPYING(BatchedUpdateRequest);
 
 public:
-    //
-    // schema declarations
-    //
-
-    // Name used for the batched update invocation.
-    static const std::string BATCHED_UPDATE_REQUEST;
-
-    // Field names and types in the batched update command type.
     static const BSONField<std::string> collName;
     static const BSONField<std::vector<BatchedUpdateDocument*>> updates;
-    static const BSONField<BSONObj> writeConcern;
-    static const BSONField<bool> ordered;
 
     //
     // construction / destruction
@@ -66,12 +57,9 @@ public:
     BatchedUpdateRequest();
     ~BatchedUpdateRequest();
 
-    /** Copies all the fields present in 'this' to 'other'. */
-    void cloneTo(BatchedUpdateRequest* other) const;
-
     bool isValid(std::string* errMsg) const;
     BSONObj toBSON() const;
-    bool parseBSON(StringData dbName, const BSONObj& source, std::string* errMsg);
+    void parseRequest(const OpMsgRequest& request);
     void clear();
     std::string toString() const;
 
@@ -82,34 +70,14 @@ public:
     void setNS(NamespaceString ns);
     const NamespaceString& getNS() const;
 
-    void setUpdates(const std::vector<BatchedUpdateDocument*>& updates);
-
     /**
      * updates ownership is transferred to here.
      */
     void addToUpdates(BatchedUpdateDocument* updates);
     void unsetUpdates();
-    bool isUpdatesSet() const;
     std::size_t sizeUpdates() const;
     const std::vector<BatchedUpdateDocument*>& getUpdates() const;
     const BatchedUpdateDocument* getUpdatesAt(std::size_t pos) const;
-
-    void setWriteConcern(const BSONObj& writeConcern);
-    void unsetWriteConcern();
-    bool isWriteConcernSet() const;
-    const BSONObj& getWriteConcern() const;
-
-    void setOrdered(bool ordered);
-    void unsetOrdered();
-    bool isOrderedSet() const;
-    bool getOrdered() const;
-
-    void setShouldBypassValidation(bool newVal) {
-        _shouldBypassValidation = newVal;
-    }
-    bool shouldBypassValidation() const {
-        return _shouldBypassValidation;
-    }
 
 private:
     // Convention: (M)andatory, (O)ptional
@@ -121,17 +89,6 @@ private:
     // (M)  array of individual updates
     std::vector<BatchedUpdateDocument*> _updates;
     bool _isUpdatesSet;
-
-    // (O)  to be issued after the batch applied
-    BSONObj _writeConcern;
-    bool _isWriteConcernSet;
-
-    // (O)  whether batch is issued in parallel or not
-    bool _ordered;
-    bool _isOrderedSet;
-
-    // (O)  should document validation be bypassed (default false)
-    bool _shouldBypassValidation;
 };
 
 }  // namespace mongo

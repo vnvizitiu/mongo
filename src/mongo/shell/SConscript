@@ -2,6 +2,8 @@
 
 Import("env")
 
+env = env.Clone()
+
 generateJSErrorCodes = env.Command(
     target=['error_codes.js'],
     source=['$BUILD_DIR/mongo/base/generate_error_codes.py', '$BUILD_DIR/mongo/base/error_codes.err'],
@@ -24,7 +26,6 @@ js_header = env.JSHeader(
         "mr.js",
         "query.js",
         "types.js",
-        "upgrade_check.js",
         "utils.js",
         "utils_sh.js",
         "utils_auth.js",
@@ -54,6 +55,7 @@ env.Library(
         'mongo.cpp',
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/base"
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/util/uuid"
     ],
 )

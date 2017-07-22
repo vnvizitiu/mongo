@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2016 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -22,7 +22,7 @@ static int __verify_set_file_size(WT_SESSION_IMPL *, WT_BLOCK *, WT_CKPT *);
 	((off) / (block)->allocsize - 1)
 #ifdef HAVE_VERBOSE
 #define	WT_FRAG_TO_OFF(block, frag)					\
-	(((wt_off_t)(frag + 1)) * (block)->allocsize)
+	(((wt_off_t)((frag) + 1)) * (block)->allocsize)
 #endif
 
 /*
@@ -33,7 +33,7 @@ int
 __wt_block_verify_start(WT_SESSION_IMPL *session,
     WT_BLOCK *block, WT_CKPT *ckptbase, const char *cfg[])
 {
-	WT_CKPT *ckpt;
+	WT_CKPT *ckpt, *t;
 	WT_CONFIG_ITEM cval;
 	wt_off_t size;
 
@@ -50,14 +50,12 @@ __wt_block_verify_start(WT_SESSION_IMPL *session,
 	 * checkpoint we have is fake, there's no work to do.  Don't complain,
 	 * that's not our problem to solve.
 	 */
-	WT_CKPT_FOREACH(ckptbase, ckpt)
-		;
-	for (;; --ckpt) {
-		if (ckpt->name != NULL && !F_ISSET(ckpt, WT_CKPT_FAKE))
-			break;
-		if (ckpt == ckptbase)
-			return (0);
-	}
+	ckpt = NULL;
+	WT_CKPT_FOREACH(ckptbase, t)
+		if (t->name != NULL && !F_ISSET(t, WT_CKPT_FAKE))
+			ckpt = t;
+	if (ckpt == NULL)
+		return (0);
 
 	/* Set the size of the file to the size of the last checkpoint. */
 	WT_RET(__verify_set_file_size(session, block, ckpt));
@@ -386,6 +384,8 @@ __verify_filefrag_add(WT_SESSION_IMPL *session, WT_BLOCK *block,
     const char *type, wt_off_t offset, wt_off_t size, bool nodup)
 {
 	uint64_t f, frag, frags, i;
+
+	WT_UNUSED(type);				/* !HAVE_VERBOSE */
 
 	__wt_verbose(session, WT_VERB_VERIFY,
 	    "add file block%s%s%s at %" PRIuMAX "-%" PRIuMAX " (%" PRIuMAX ")",

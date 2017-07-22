@@ -47,7 +47,7 @@
     jsTestLog('Creating initial data');
 
     st.adminCommand({enablesharding: "test"});
-    st.ensurePrimaryShard('test', 'test-rs0');
+    st.ensurePrimaryShard('test', st.shard0.shardName);
     st.adminCommand({shardcollection: "test.foo", key: {i: 1, j: 1}});
 
     // Balancer is stopped by default, so no moveChunks will interfere with the splits we're testing
@@ -117,9 +117,9 @@
             print("Checking read operations, should work");
             assert.eq(expectedDocs, testDB.foo.find().itcount());
             assert.eq(expectedDocs, testDB.foo.count());
+
             // NOTE: This is an explicit check that GLE can be run with read prefs, not the result
-            // of
-            // above.
+            // of above.
             assert.eq(null, testDB.runCommand({getlasterror: 1}).err);
             checkCommandSucceeded(testDB, {dbstats: 1});
             checkCommandSucceeded(testDB, {collstats: 'foo'});
@@ -132,9 +132,10 @@
 
             res = checkCommandSucceeded(testDB, {
                 aggregate: 'foo',
-                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}]
+                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}],
+                cursor: {}
             });
-            assert.eq(4500, res.result[0].sum);
+            assert.eq(4500, res.cursor.firstBatch[0].sum);
         } else {
             print("Checking read operations, should fail");
             assert.throws(function() {
@@ -146,7 +147,8 @@
                                {mapreduce: 'foo', map: map, reduce: reduce, out: {inline: 1}});
             checkCommandFailed(testDB, {
                 aggregate: 'foo',
-                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}]
+                pipeline: [{$project: {j: 1}}, {$group: {_id: 'j', sum: {$sum: '$j'}}}],
+                cursor: {}
             });
         }
     };
@@ -163,7 +165,6 @@
             testDB.foo.remove({a: 1});
             assert.eq(null, testDB.runCommand({getlasterror: 1}).err);
             checkCommandSucceeded(testDB, {reIndex: 'foo'});
-            checkCommandSucceeded(testDB, {repairDatabase: 1});
             checkCommandSucceeded(testDB,
                                   {mapreduce: 'foo', map: map, reduce: reduce, out: 'mrOutput'});
             assert.eq(100, testDB.mrOutput.count());
@@ -183,7 +184,6 @@
             checkCommandFailed(
                 testDB, {findAndModify: "foo", query: {a: 1, i: 1, j: 1}, update: {$set: {b: 1}}});
             checkCommandFailed(testDB, {reIndex: 'foo'});
-            checkCommandFailed(testDB, {repairDatabase: 1});
             checkCommandFailed(testDB,
                                {mapreduce: 'foo', map: map, reduce: reduce, out: 'mrOutput'});
             checkCommandFailed(testDB, {drop: 'foo'});

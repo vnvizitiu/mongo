@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2016 MongoDB, Inc.
+ * Public Domain 2014-2017 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -1101,6 +1101,7 @@ static const uint32_t g_crc_slicing[8][256] = {
  */
 uint32_t
 __wt_checksum_sw(const void *chunk, size_t len)
+    WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
 	uint32_t crc, next;
 	size_t nqwords;

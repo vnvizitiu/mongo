@@ -32,11 +32,23 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
     if config.MONGOD_SET_PARAMETERS is not None:
         suite_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
 
+    # Turn on replication heartbeat logging.
+    if "replSet" in kwargs and "logComponentVerbosity" not in suite_set_parameters:
+        suite_set_parameters["logComponentVerbosity"] = {"replication": {"heartbeats": 2}}
+
+    # orphanCleanupDelaySecs controls an artificial delay before cleaning up an orphaned chunk
+    # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
+    # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
+    # Setting it in the .yml file overrides this.
+    if "shardsvr" in kwargs and "orphanCleanupDelaySecs" not in suite_set_parameters:
+        suite_set_parameters["orphanCleanupDelaySecs"] = 0
+
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
         "nojournal": config.NO_JOURNAL,
         "nopreallocj": config.NO_PREALLOC_JOURNAL,
+        "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
         "wiredTigerCollectionConfigString": config.WT_COLL_CONFIG,
         "wiredTigerEngineConfigString": config.WT_ENGINE_CONFIG,
@@ -115,8 +127,7 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     return _process.Process(logger, args, **process_kwargs)
 
 
-def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=None,
-                        isMainTest=True, **kwargs):
+def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=None, **kwargs):
     """
     Returns a Process instance that starts a mongo shell with arguments
     constructed from 'kwargs'.
@@ -131,6 +142,7 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     shortcut_opts = {
         "noJournal": (config.NO_JOURNAL, False),
         "noJournalPrealloc": (config.NO_PREALLOC_JOURNAL, False),
+        "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
         "storageEngineCacheSizeGB": (config.STORAGE_ENGINE_CACHE_SIZE, ""),
         "testName": (os.path.splitext(os.path.basename(filename))[0], ""),
@@ -148,7 +160,6 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
             # Only use 'opt_default' if the property wasn't set in the YAML configuration.
             test_data[opt_name] = opt_default
 
-    test_data["isMainTest"] = isMainTest
     global_vars["TestData"] = test_data
 
     # Pass setParameters for mongos and mongod through TestData. The setParameter parsing in
@@ -168,11 +179,17 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
         mongos_set_parameters = utils.load_yaml(config.MONGOS_SET_PARAMETERS)
         test_data["setParametersMongos"] = _format_test_data_set_parameters(mongos_set_parameters)
 
+    if "eval_prepend" in kwargs:
+        eval_sb.append(str(kwargs.pop("eval_prepend")))
+
     for var_name in global_vars:
         _format_shell_vars(eval_sb, var_name, global_vars[var_name])
 
     if "eval" in kwargs:
         eval_sb.append(str(kwargs.pop("eval")))
+
+    # Load this file to allow a callback to validate collections before shutting down mongod.
+    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js')");
 
     eval_str = "; ".join(eval_sb)
     args.append("--eval")

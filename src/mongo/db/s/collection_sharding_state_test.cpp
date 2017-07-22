@@ -26,75 +26,54 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
+
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
 
-class CollShardingStateTest : public mongo::unittest::Test {
+/**
+ * Uses the ShardServerTestFixture that sets up the ShardServerCatalogCacheLoader on the
+ * CatalogCache and has a real Locker class (as opposed to LockerNoop) for locking.
+ */
+class CollShardingStateTest : public ShardServerTestFixture {
 public:
     void setUp() override {
-        _service.setFastClockSource(stdx::make_unique<ClockSourceMock>());
-        _service.setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
-
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        _client = _service.makeClient("ShardingStateTest");
-        // This skips version checking to avoid accessing a null ReplicationCoordinator.
-        _client->setInDirectClient(true);
-        _opCtx = _client->makeOperationContext();
+        ShardServerTestFixture::setUp();
 
         // Note: this assumes that globalInit will always be called on the same thread as the main
         // test thread.
-        ShardingState::get(txn())->setGlobalInitMethodForTest(
-            [this](OperationContext*, const ConnectionString&, StringData) {
-                _initCallCount++;
-                return Status::OK();
-            });
-    }
-
-    void tearDown() override {}
-
-    OperationContext* txn() {
-        return _opCtx.get();
+        ShardingState::get(operationContext())
+            ->setGlobalInitMethodForTest(
+                [this](OperationContext*, const ConnectionString&, StringData) {
+                    _initCallCount++;
+                    return Status::OK();
+                });
     }
 
     int getInitCallCount() const {
         return _initCallCount;
     }
 
-    ServiceContext* getServiceContext() {
-        return &_service;
-    }
-
-protected:
-    ServiceContextNoop _service;
-
 private:
-    ServiceContext::UniqueClient _client;
-    ServiceContext::UniqueOperationContext _opCtx;
-
     int _initCallCount = 0;
 };
 
 TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
-    CollectionShardingState collShardingState(&_service,
-                                              NamespaceString::kConfigCollectionNamespace);
+    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
+    // the shard identity document.
+    Lock::GlobalWrite lock(operationContext());
+
+    CollectionShardingState collShardingState(getServiceContext(),
+                                              NamespaceString::kServerConfigurationNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
@@ -102,8 +81,8 @@ TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
     shardIdentity.setShardName("a");
     shardIdentity.setClusterId(OID::gen());
 
-    WriteUnitOfWork wuow(txn());
-    collShardingState.onInsertOp(txn(), shardIdentity.toBSON());
+    WriteUnitOfWork wuow(operationContext());
+    collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON());
 
     ASSERT_EQ(0, getInitCallCount());
 
@@ -113,8 +92,12 @@ TEST_F(CollShardingStateTest, GlobalInitGetsCalledAfterWriteCommits) {
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
+    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
+    // the shard identity document.
+    Lock::GlobalWrite lock(operationContext());
+
     CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kConfigCollectionNamespace);
+                                              NamespaceString::kServerConfigurationNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setConfigsvrConnString(
@@ -123,8 +106,8 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
     shardIdentity.setClusterId(OID::gen());
 
     {
-        WriteUnitOfWork wuow(txn());
-        collShardingState.onInsertOp(txn(), shardIdentity.toBSON());
+        WriteUnitOfWork wuow(operationContext());
+        collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON());
 
         ASSERT_EQ(0, getInitCallCount());
     }
@@ -133,6 +116,10 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetCalledIfWriteAborts) {
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentity) {
+    // Must hold a lock to call initializeFromShardIdentity, which is called by the op observer on
+    // the shard identity document.
+    Lock::GlobalWrite lock(operationContext());
+
     CollectionShardingState collShardingState(getServiceContext(), NamespaceString("admin.user"));
 
     ShardIdentityType shardIdentity;
@@ -141,8 +128,8 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentit
     shardIdentity.setShardName("a");
     shardIdentity.setClusterId(OID::gen());
 
-    WriteUnitOfWork wuow(txn());
-    collShardingState.onInsertOp(txn(), shardIdentity.toBSON());
+    WriteUnitOfWork wuow(operationContext());
+    collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON());
 
     ASSERT_EQ(0, getInitCallCount());
 
@@ -152,21 +139,28 @@ TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfNSIsNotForShardIdentit
 }
 
 TEST_F(CollShardingStateTest, OnInsertOpThrowWithIncompleteShardIdentityDocument) {
+    // Must hold a lock to call CollectionShardingState::onInsertOp.
+    Lock::GlobalWrite lock(operationContext());
+
     CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kConfigCollectionNamespace);
+                                              NamespaceString::kServerConfigurationNamespace);
 
     ShardIdentityType shardIdentity;
     shardIdentity.setShardName("a");
 
-    ASSERT_THROWS(collShardingState.onInsertOp(txn(), shardIdentity.toBSON()), AssertionException);
+    ASSERT_THROWS(collShardingState.onInsertOp(operationContext(), shardIdentity.toBSON()),
+                  AssertionException);
 }
 
 TEST_F(CollShardingStateTest, GlobalInitDoesntGetsCalledIfShardIdentityDocWasNotInserted) {
-    CollectionShardingState collShardingState(getServiceContext(),
-                                              NamespaceString::kConfigCollectionNamespace);
+    // Must hold a lock to call CollectionShardingState::onInsertOp.
+    Lock::GlobalWrite lock(operationContext());
 
-    WriteUnitOfWork wuow(txn());
-    collShardingState.onInsertOp(txn(), BSON("_id" << 1));
+    CollectionShardingState collShardingState(getServiceContext(),
+                                              NamespaceString::kServerConfigurationNamespace);
+
+    WriteUnitOfWork wuow(operationContext());
+    collShardingState.onInsertOp(operationContext(), BSON("_id" << 1));
 
     ASSERT_EQ(0, getInitCallCount());
 

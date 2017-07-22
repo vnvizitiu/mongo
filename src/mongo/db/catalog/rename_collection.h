@@ -27,6 +27,8 @@
  */
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 class NamespaceString;
@@ -37,10 +39,19 @@ class OperationContext;
  * iff "dropTarget" is true. "stayTemp" indicates whether a collection should maintain its
  * temporariness.
  */
-Status renameCollection(OperationContext* txn,
+Status renameCollection(OperationContext* opCtx,
                         const NamespaceString& source,
                         const NamespaceString& target,
                         bool dropTarget,
                         bool stayTemp);
+
+/**
+ * As above, but may only be called from applyCommand_inlock. This allows creating a collection
+ * with a specific UUID for cross-database renames.
+ */
+Status renameCollectionForApplyOps(OperationContext* opCtx,
+                                   const std::string& dbName,
+                                   const BSONElement& ui,
+                                   const BSONObj& cmd);
 
 }  // namespace mongo

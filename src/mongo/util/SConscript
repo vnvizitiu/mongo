@@ -5,12 +5,19 @@ Import("get_option")
 Import("has_option")
 Import("use_system_version_of_library")
 
+env = env.Clone()
+
+env.InjectThirdPartyIncludePaths('asio')
+
 env.SConscript(
     dirs=[
         'cmdline_utils',
         'concurrency',
         'net',
         'options_parser',
+    ],
+    exports=[
+        'env',
     ],
 )
 
@@ -46,6 +53,9 @@ debuggerEnv.Library(
     LIBDEPS=[
         # NOTE: You *must not* add any library dependencies to the debugger library
     ],
+    LIBDEPS_TAGS=[
+        'init-no-global-side-effects',
+    ]
 )
 
 env.Library(
@@ -75,6 +85,38 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/third_party/shim_boost',
+    ],
+)
+
+env.CppUnitTest(
+    target='lru_cache_test',
+    source=[
+        'lru_cache_test.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Library(
+    target='uuid',
+    source=[
+        'uuid.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/decorable',
+        '$BUILD_DIR/third_party/murmurhash3/murmurhash3',
+    ],
+)
+
+env.CppUnitTest(
+    target='uuid_test',
+    source=[
+        'uuid_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'uuid',
     ],
 )
 
@@ -238,6 +280,52 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target="periodic_runner",
+    source=[
+        "periodic_runner.cpp",
+    ],
+    LIBDEPS=[
+    ],
+)
+
+env.Library(
+    target="periodic_runner_asio",
+    source=[
+        "periodic_runner_asio.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/service_context",
+        "$BUILD_DIR/third_party/shim_asio",
+        "$BUILD_DIR/mongo/executor/async_timer_asio",
+        "periodic_runner",
+    ],
+)
+
+env.CppUnitTest(
+    target="periodic_runner_asio_test",
+    source=[
+        "periodic_runner_asio_test.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        "$BUILD_DIR/mongo/executor/async_timer_mock",
+        "periodic_runner_asio",
+    ],
+)
+
+env.Library(
+    target='periodic_runner_factory',
+    source=[
+        'periodic_runner_factory.cpp',
+    ],
+    LIBDEPS=[
+        'periodic_runner',
+        'periodic_runner_asio',
+    ],
+)
+
+env.Library(
     target='background_job',
     source=[
         "background.cpp",
@@ -287,10 +375,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
             'heap_profiler.cpp',
         ],
         LIBDEPS=[
-            # TODO: This is needless, the definition of
-            # ServerStatusSection should live in its own library, as
-            # it doesn't require all of the other commands.
-            '$BUILD_DIR/mongo/db/commands/core',
+            '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/server_parameters',
             '$BUILD_DIR/mongo/util/net/network',
         ],
@@ -316,6 +401,7 @@ env.Library(
     target='clock_sources',
     source=[
         'background_thread_clock_source.cpp',
+        'clock_source.cpp',
         'fast_clock_source_factory.cpp',
     ],
     LIBDEPS=[
@@ -391,6 +477,15 @@ quick_exit_env.Library(
         "$BUILD_DIR/third_party/shim_allocator",
     ]
 )
+env.Library(
+    target="secure_compare_memory",
+    source=[
+        'secure_compare_memory.cpp',
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+    ],
+)
 
 env.Library(
     target="secure_zero_memory",
@@ -429,13 +524,10 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/log_process_details",
         "$BUILD_DIR/mongo/db/service_context",
         "$BUILD_DIR/mongo/db/server_options_core",
     ],
-    LIBDEPS_TAGS=[
-        # Depends on logProcessDetailsForLogRotate and exitCleanly
-        'incomplete',
-    ]
 )
 
 env.CppUnitTest(
@@ -516,6 +608,16 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ]
+)
+
+env.CppUnitTest(
+    target='base64_test',
+    source=[
+        'base64_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
 )
 
 if env.TargetOSIs('linux'):

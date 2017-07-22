@@ -109,11 +109,10 @@ public:
             Date_t expiration = transport::Ticket::kNoExpirationDate) override;
         Status wait(transport::Ticket&& ticket) override;
         void asyncWait(transport::Ticket&& ticket, TicketCallback callback) override;
-        SSLPeerInfo getX509PeerInfo(const transport::ConstSessionHandle& session) const override;
 
         Stats sessionStats() override;
         void end(const transport::SessionHandle& session) override;
-        void endAllSessions(transport::Session::TagMask tags) override;
+        Status setup() override;
         Status start() override;
         void shutdown() override;
 
@@ -128,8 +127,6 @@ public:
         stdx::function<void(transport::Ticket, TicketCallback)> _asyncWait;
         stdx::function<void(const transport::SessionHandle&)> _end;
         stdx::function<void(SEPTestSession& session)> _destroy_hook;
-        stdx::function<void(transport::Session::TagMask tags)> _endAllSessions =
-            [](transport::Session::TagMask tags) {};
         stdx::function<Status(void)> _start = [] { return Status::OK(); };
         stdx::function<void(void)> _shutdown = [] {};
 

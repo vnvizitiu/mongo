@@ -55,7 +55,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // kMajority implies JOURNAL if journaling is
                                                 // supported by mongod and
                                                 // writeConcernMajorityJournalDefault is set to true
-                                                // in the ReplicaSetConfig.
+                                                // in the ReplSetConfig.
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 Seconds(15));
 
@@ -65,9 +65,9 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
  *   zone: <string zoneName>
  * }
  */
-class AddShardToZoneCmd : public Command {
+class AddShardToZoneCmd : public BasicCommand {
 public:
-    AddShardToZoneCmd() : Command("addShardToZone", false, "addshardtozone") {}
+    AddShardToZoneCmd() : BasicCommand("addShardToZone", "addshardtozone") {}
 
     virtual bool slaveOk() const {
         return true;
@@ -96,11 +96,9 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* txn,
+    virtual bool run(OperationContext* opCtx,
                      const std::string& dbname,
-                     BSONObj& cmdObj,
-                     int options,
-                     std::string& errmsg,
+                     const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         auto parsedRequest = uassertStatusOK(AddShardToZoneRequest::parseFromMongosCommand(cmdObj));
 
@@ -108,9 +106,9 @@ public:
         parsedRequest.appendAsConfigCommand(&cmdBuilder);
         cmdBuilder.append("writeConcern", kMajorityWriteConcern.toBSON());
 
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponseStatus = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           cmdBuilder.obj(),

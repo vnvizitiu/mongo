@@ -20,6 +20,20 @@ function isMongod(db) {
 }
 
 /**
+ * Returns true if the process is a mongod configsvr, and false otherwise.
+ *
+ */
+function isMongodConfigsvr(db) {
+    if (!isMongod(db)) {
+        return false;
+    }
+    var res = db.adminCommand('getCmdLineOpts');
+    assert.commandWorked(res);
+
+    return res.parsed && res.parsed.sharding && res.parsed.sharding.clusterRole === 'configsvr';
+}
+
+/**
  * Returns the name of the current storage engine.
  *
  * Throws an error if db is connected to a mongos, or if there is no reported storage engine.
@@ -56,6 +70,13 @@ function recordIdCanChangeOnUpdate(db) {
  */
 function isWiredTiger(db) {
     return getStorageEngineName(db) === 'wiredTiger';
+}
+
+/**
+ * Returns true if the current storage engine is ephemeralForTest, and false otherwise.
+ */
+function isEphemeralForTest(db) {
+    return getStorageEngineName(db) === 'ephemeralForTest';
 }
 
 /**

@@ -45,36 +45,15 @@ class StorageInterfaceImpl : public StorageInterface {
     MONGO_DISALLOW_COPYING(StorageInterfaceImpl);
 
 public:
-    static const char kDefaultMinValidNamespace[];
-    static const char kInitialSyncFlagFieldName[];
-    static const char kBeginFieldName[];
-    static const char kOplogDeleteFromPointFieldName[];
+    static const char kDefaultRollbackIdNamespace[];
+    static const char kRollbackIdFieldName[];
+    static const char kRollbackIdDocumentId[];
 
     StorageInterfaceImpl();
-    explicit StorageInterfaceImpl(const NamespaceString& minValidNss);
-    virtual ~StorageInterfaceImpl();
 
-    void startup() override;
-    void shutdown() override;
-
-    /**
-     * Returns namespace of collection containing the minvalid boundaries and initial sync flag.
-     */
-    NamespaceString getMinValidNss() const;
-
-    bool getInitialSyncFlag(OperationContext* txn) const override;
-
-    void setInitialSyncFlag(OperationContext* txn) override;
-
-    void clearInitialSyncFlag(OperationContext* txn) override;
-
-    OpTime getMinValid(OperationContext* txn) const override;
-    void setMinValid(OperationContext* txn, const OpTime& minValid) override;
-    void setMinValidToAtLeast(OperationContext* txn, const OpTime& endOpTime) override;
-    void setOplogDeleteFromPoint(OperationContext* txn, const Timestamp& timestamp) override;
-    Timestamp getOplogDeleteFromPoint(OperationContext* txn) override;
-    void setAppliedThrough(OperationContext* txn, const OpTime& optime) override;
-    OpTime getAppliedThrough(OperationContext* txn) override;
+    StatusWith<int> getRollbackID(OperationContext* opCtx) override;
+    Status initializeRollbackID(OperationContext* opCtx) override;
+    Status incrementRollbackID(OperationContext* opCtx) override;
 
     /**
      *  Allocates a new TaskRunner for use by the passed in collection.
@@ -85,26 +64,32 @@ public:
         const BSONObj idIndexSpec,
         const std::vector<BSONObj>& secondaryIndexSpecs) override;
 
-    Status insertDocument(OperationContext* txn,
+    Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
                           const BSONObj& doc) override;
 
-    Status insertDocuments(OperationContext* txn,
+    Status insertDocuments(OperationContext* opCtx,
                            const NamespaceString& nss,
-                           const std::vector<BSONObj>& docs) override;
+                           const std::vector<InsertStatement>& docs) override;
 
-    Status dropReplicatedDatabases(OperationContext* txn) override;
+    Status dropReplicatedDatabases(OperationContext* opCtx) override;
 
-    Status createOplog(OperationContext* txn, const NamespaceString& nss) override;
-    StatusWith<size_t> getOplogMaxSize(OperationContext* txn, const NamespaceString& nss) override;
+    Status createOplog(OperationContext* opCtx, const NamespaceString& nss) override;
+    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
+                                       const NamespaceString& nss) override;
 
-    Status createCollection(OperationContext* txn,
+    Status createCollection(OperationContext* opCtx,
                             const NamespaceString& nss,
                             const CollectionOptions& options) override;
 
-    Status dropCollection(OperationContext* txn, const NamespaceString& nss) override;
+    Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
-    StatusWith<std::vector<BSONObj>> findDocuments(OperationContext* txn,
+    Status renameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromNS,
+                            const NamespaceString& toNS,
+                            bool stayTemp) override;
+
+    StatusWith<std::vector<BSONObj>> findDocuments(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    boost::optional<StringData> indexName,
                                                    ScanDirection scanDirection,
@@ -112,7 +97,7 @@ public:
                                                    BoundInclusion boundInclusion,
                                                    std::size_t limit) override;
 
-    StatusWith<std::vector<BSONObj>> deleteDocuments(OperationContext* txn,
+    StatusWith<std::vector<BSONObj>> deleteDocuments(OperationContext* opCtx,
                                                      const NamespaceString& nss,
                                                      boost::optional<StringData> indexName,
                                                      ScanDirection scanDirection,
@@ -120,14 +105,46 @@ public:
                                                      BoundInclusion boundInclusion,
                                                      std::size_t limit) override;
 
-    Status isAdminDbValid(OperationContext* txn) override;
+    StatusWith<BSONObj> findSingleton(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    Status putSingleton(OperationContext* opCtx,
+                        const NamespaceString& nss,
+                        const BSONObj& update) override;
+
+    StatusWith<BSONObj> findById(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const BSONElement& idKey) override;
+
+    StatusWith<BSONObj> deleteById(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const BSONElement& idKey) override;
+
+    Status upsertById(OperationContext* opCtx,
+                      const NamespaceString& nss,
+                      const BSONElement& idKey,
+                      const BSONObj& update) override;
+
+    Status deleteByFilter(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const BSONObj& filter) override;
+
+    StatusWith<StorageInterface::CollectionSize> getCollectionSize(
+        OperationContext* opCtx, const NamespaceString& nss) override;
+
+    StatusWith<StorageInterface::CollectionCount> getCollectionCount(
+        OperationContext* opCtx, const NamespaceString& nss) override;
+
+    void setStableTimestamp(OperationContext* opCtx, SnapshotName snapshotName) override;
+
+    void setInitialDataTimestamp(OperationContext* opCtx, SnapshotName snapshotName) override;
+
+    /**
+     * Checks that the "admin" database contains a supported version of the auth data schema.
+     */
+    Status isAdminDbValid(OperationContext* opCtx) override;
 
 private:
-    // Returns empty document if not present.
-    BSONObj getMinValidDocument(OperationContext* txn) const;
-    void updateMinValidDocument(OperationContext* txn, const BSONObj& updateSpec);
-
-    const NamespaceString _minValidNss;
+    const NamespaceString _rollbackIdNss;
 };
 
 }  // namespace repl

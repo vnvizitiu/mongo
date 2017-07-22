@@ -41,12 +41,12 @@ namespace {
 
 const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
 
-class BalancerControlCommand : public Command {
+class BalancerControlCommand : public BasicCommand {
 public:
     BalancerControlCommand(StringData name,
                            StringData configsvrCommandName,
                            ActionType authorizationAction)
-        : Command(name),
+        : BasicCommand(name),
           _configsvrCommandName(configsvrCommandName),
           _authorizationAction(authorizationAction) {}
 
@@ -77,15 +77,13 @@ public:
         return Status::OK();
     }
 
-    bool run(OperationContext* txn,
+    bool run(OperationContext* opCtx,
              const std::string& dbname,
-             BSONObj& cmdObj,
-             int options,
-             std::string& errmsg,
+             const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto configShard = Grid::get(txn)->shardRegistry()->getConfigShard();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponse = uassertStatusOK(
-            configShard->runCommandWithFixedRetryAttempts(txn,
+            configShard->runCommandWithFixedRetryAttempts(opCtx,
                                                           kPrimaryOnlyReadPreference,
                                                           "admin",
                                                           BSON(_configsvrCommandName << 1),
@@ -93,7 +91,7 @@ public:
         uassertStatusOK(cmdResponse.commandStatus);
 
         // Append any return value from the response, which the config server returned
-        result.appendElements(cmdResponse.response);
+        filterCommandReplyForPassthrough(cmdResponse.response, &result);
 
         return true;
     }

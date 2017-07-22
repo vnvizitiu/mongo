@@ -38,7 +38,6 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/server_selection_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
@@ -56,15 +55,14 @@ namespace {
 using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
 using executor::TaskExecutor;
-using stdx::async;
 using unittest::assertGet;
 
-const BSONObj kReplSecondaryOkMetadata{[] {
+BSONObj getReplSecondaryOkMetadata() {
     BSONObjBuilder o;
-    o.appendElements(rpc::ServerSelectionMetadata(true, boost::none).toBSON());
+    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
     o.append(rpc::kReplSetMetadataFieldName, 1);
     return o.obj();
-}()};
+}
 
 class ClusterIdentityTest : public ShardingTestFixture {
 public:
@@ -77,7 +75,7 @@ public:
     void expectConfigVersionLoad(StatusWith<OID> result) {
         onFindCommand([&](const RemoteCommandRequest& request) {
             ASSERT_EQUALS(configHost, request.target);
-            ASSERT_BSONOBJ_EQ(kReplSecondaryOkMetadata,
+            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
                               rpc::TrackingMetadata::removeTrackingData(request.metadata));
 
             const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());

@@ -189,7 +189,7 @@ error_code("LinearizableReadConcernError", 187)
 error_code("IncompatibleServerVersion", 188)
 error_code("PrimarySteppedDown", 189)
 error_code("MasterSlaveConnectionFailure", 190)
-error_code("BalancerLostDistributedLock", 191)
+error_code("OBSOLETE_BalancerLostDistributedLock", 191)
 error_code("FailPointEnabled", 192)
 error_code("NoShardingEnabled", 193)
 error_code("BalancerInterrupted", 194)
@@ -197,6 +197,29 @@ error_code("ViewPipelineMaxSizeExceeded", 195)
 error_code("InvalidIndexSpecificationOption", 197)
 error_code("OBSOLETE_ReceivedOpReplyMessage", 198)
 error_code("ReplicaSetMonitorRemoved", 199)
+error_code("ChunkRangeCleanupPending", 200)
+error_code("CannotBuildIndexKeys", 201)
+error_code("NetworkInterfaceExceededTimeLimit", 202)
+error_code("ShardingStateNotInitialized", 203)
+error_code("TimeProofMismatch", 204)
+error_code("ClusterTimeFailsRateLimiter", 205)
+error_code("NoSuchSession", 206)
+error_code("InvalidUUID", 207)
+error_code("TooManyLocks", 208)
+error_code("StaleClusterTime", 209)
+error_code("CannotVerifyAndSignLogicalTime", 210)
+error_code("KeyNotFound", 211)
+error_code("IncompatibleRollbackAlgorithm", 212)
+error_code("DuplicateSession", 213)
+error_code("AuthenticationRestrictionUnmet", 214)
+error_code("DatabaseDropPending", 215)
+error_code("ElectionInProgress", 216)
+error_code("IncompleteTransactionHistory", 217);
+error_code("UpdateOperationFailed", 218)
+error_code("FTDCPathNotSet", 219)
+error_code("FTDCPathAlreadySet", 220)
+
+# Error codes 4000-8999 are reserved.
 
 # Non-sequential error codes (for compatibility only)
 error_code("SocketException", 9001)
@@ -218,8 +241,8 @@ error_code("SendStaleConfig", 13388);
 error_code("DatabaseDifferCase", 13297);
 error_code("OBSOLETE_PrepareConfigsFailed", 13104);
 
-# SERVER-21428 explains the extra changes needed if error_class components change.
-error_class("NetworkError", ["HostUnreachable", "HostNotFound", "NetworkTimeout"])
+# Group related errors into classes, can be checked against ErrorCodes::isXXXClassName methods.
+error_class("NetworkError", ["HostUnreachable", "HostNotFound", "NetworkTimeout", "SocketException"])
 error_class("Interruption", ["Interrupted",
                              "InterruptedAtShutdown",
                              "InterruptedDueToReplStateChange",

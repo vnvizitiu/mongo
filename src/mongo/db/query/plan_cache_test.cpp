@@ -49,6 +49,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 using namespace mongo;
 
@@ -67,12 +68,12 @@ static const NamespaceString nss("test.collection");
  */
 unique_ptr<CanonicalQuery> canonicalize(const BSONObj& queryObj) {
     QueryTestServiceContext serviceContext;
-    auto txn = serviceContext.makeOperationContext();
+    auto opCtx = serviceContext.makeOperationContext();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(queryObj);
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -87,7 +88,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                         const char* projStr,
                                         const char* collationStr) {
     QueryTestServiceContext serviceContext;
-    auto txn = serviceContext.makeOperationContext();
+    auto opCtx = serviceContext.makeOperationContext();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
@@ -95,7 +96,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setProj(fromjson(projStr));
     qr->setCollation(fromjson(collationStr));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -109,7 +110,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                         const char* minStr,
                                         const char* maxStr) {
     QueryTestServiceContext serviceContext;
-    auto txn = serviceContext.makeOperationContext();
+    auto opCtx = serviceContext.makeOperationContext();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
@@ -125,7 +126,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setMin(fromjson(minStr));
     qr->setMax(fromjson(maxStr));
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -141,7 +142,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                         bool snapshot,
                                         bool explain) {
     QueryTestServiceContext serviceContext;
-    auto txn = serviceContext.makeOperationContext();
+    auto opCtx = serviceContext.makeOperationContext();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(fromjson(queryStr));
@@ -159,7 +160,7 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
     qr->setSnapshot(snapshot);
     qr->setExplain(explain);
     auto statusWithCQ = CanonicalQuery::canonicalize(
-        txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+        opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
 }
@@ -218,9 +219,9 @@ PlanRankingDecision* createDecision(size_t numPlans) {
     unique_ptr<PlanRankingDecision> why(new PlanRankingDecision());
     for (size_t i = 0; i < numPlans; ++i) {
         CommonStats common("COLLSCAN");
-        unique_ptr<PlanStageStats> stats(new PlanStageStats(common, STAGE_COLLSCAN));
+        auto stats = stdx::make_unique<PlanStageStats>(common, STAGE_COLLSCAN);
         stats->specific.reset(new CollectionScanStats());
-        why->stats.mutableVector().push_back(stats.release());
+        why->stats.push_back(std::move(stats));
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
@@ -539,7 +540,7 @@ protected:
                       const BSONObj& maxObj,
                       bool snapshot) {
         QueryTestServiceContext serviceContext;
-        auto txn = serviceContext.makeOperationContext();
+        auto opCtx = serviceContext.makeOperationContext();
 
         // Clean up any previous state from a call to runQueryFull or runQueryAsCommand.
         for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
@@ -563,7 +564,7 @@ protected:
         qr->setMax(maxObj);
         qr->setSnapshot(snapshot);
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
         ASSERT_OK(s);
@@ -571,7 +572,7 @@ protected:
 
     void runQueryAsCommand(const BSONObj& cmdObj) {
         QueryTestServiceContext serviceContext;
-        auto txn = serviceContext.makeOperationContext();
+        auto opCtx = serviceContext.makeOperationContext();
 
         // Clean up any previous state from a call to runQueryFull or runQueryAsCommand.
         for (vector<QuerySolution*>::iterator it = solns.begin(); it != solns.end(); ++it) {
@@ -585,7 +586,7 @@ protected:
             assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         Status s = QueryPlanner::plan(*statusWithCQ.getValue(), params, &solns);
         ASSERT_OK(s);
@@ -658,7 +659,7 @@ protected:
                                       const BSONObj& collation,
                                       const QuerySolution& soln) const {
         QueryTestServiceContext serviceContext;
-        auto txn = serviceContext.makeOperationContext();
+        auto opCtx = serviceContext.makeOperationContext();
 
         auto qr = stdx::make_unique<QueryRequest>(nss);
         qr->setFilter(query);
@@ -666,7 +667,7 @@ protected:
         qr->setProj(proj);
         qr->setCollation(collation);
         auto statusWithCQ = CanonicalQuery::canonicalize(
-            txn.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
+            opCtx.get(), std::move(qr), ExtensionsCallbackDisallowExtensions());
         ASSERT_OK(statusWithCQ.getStatus());
         unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
@@ -1103,11 +1104,11 @@ TEST_F(CachePlanSelectionTest,
        CachedPlanForSelfIntersectionOfMultikeyIndexNonPointRangesCannotIntersectBounds) {
     // Enable a hash-based index intersection plan to be generated because we are scanning a
     // non-point range on the "a" field.
-    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection;
+    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection.load();
     ON_BLOCK_EXIT([oldEnableHashIntersection] {
-        internalQueryPlannerEnableHashIntersection = oldEnableHashIntersection;
+        internalQueryPlannerEnableHashIntersection.store(oldEnableHashIntersection);
     });
-    internalQueryPlannerEnableHashIntersection = true;
+    internalQueryPlannerEnableHashIntersection.store(true);
     params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
 
     const bool multikey = true;
@@ -1144,11 +1145,11 @@ TEST_F(CachePlanSelectionTest, CachedPlanForIntersectionOfMultikeyIndexesWhenUsi
 TEST_F(CachePlanSelectionTest, CachedPlanForIntersectionWithNonMultikeyIndexCanIntersectBounds) {
     // Enable a hash-based index intersection plan to be generated because we are scanning a
     // non-point range on the "a.c" field.
-    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection;
+    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection.load();
     ON_BLOCK_EXIT([oldEnableHashIntersection] {
-        internalQueryPlannerEnableHashIntersection = oldEnableHashIntersection;
+        internalQueryPlannerEnableHashIntersection.store(oldEnableHashIntersection);
     });
-    internalQueryPlannerEnableHashIntersection = true;
+    internalQueryPlannerEnableHashIntersection.store(true);
     params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
 
     const bool multikey = true;
@@ -1275,6 +1276,44 @@ TEST_F(CachePlanSelectionTest, MatchingCollation) {
                                     BSON("locale"
                                          << "mock_reverse_string"),
                                     "{fetch: {node: {ixscan: {pattern: {x: 1}}}}}");
+}
+
+TEST_F(CachePlanSelectionTest, ContainedOr) {
+    addIndex(BSON("b" << 1 << "a" << 1), "b_1_a_1");
+    addIndex(BSON("c" << 1 << "a" << 1), "c_1_a_1");
+    BSONObj query = fromjson("{$and: [{a: 5}, {$or: [{b: 6}, {c: 7}]}]}");
+    runQuery(query);
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: null, node: {or: {nodes: ["
+        "{ixscan: {pattern: {b: 1, a: 1}, bounds: {b: [[6, 6, true, true]], a: [[5, 5, true, "
+        "true]]}}},"
+        "{ixscan: {pattern: {c: 1, a: 1}, bounds: {c: [[7, 7, true, true]], a: [[5, 5, true, "
+        "true]]}}}"
+        "]}}}}");
+}
+
+TEST_F(CachePlanSelectionTest, ContainedOrAndIntersection) {
+    bool oldEnableHashIntersection = internalQueryPlannerEnableHashIntersection.load();
+    ON_BLOCK_EXIT([oldEnableHashIntersection] {
+        internalQueryPlannerEnableHashIntersection.store(oldEnableHashIntersection);
+    });
+    internalQueryPlannerEnableHashIntersection.store(true);
+    params.options = QueryPlannerParams::INCLUDE_COLLSCAN | QueryPlannerParams::INDEX_INTERSECTION;
+    addIndex(BSON("a" << 1 << "b" << 1), "a_1_b_1");
+    addIndex(BSON("c" << 1), "c_1");
+    BSONObj query = fromjson("{$and: [{a: 5}, {$or: [{b: 6}, {c: 7}]}]}");
+    runQuery(query);
+    assertPlanCacheRecoversSolution(
+        query,
+        "{fetch: {filter: null, node: {andHash: {nodes: ["
+        "{or: {nodes: ["
+        "{ixscan: {pattern: {a: 1, b: 1}, bounds: {a: [[5, 5, true, true]], b: [[6, 6, true, "
+        "true]]}}},"
+        "{ixscan: {pattern: {c: 1}, bounds: {c: [[7, 7, true, true]]}}}]}},"
+        "{ixscan: {pattern: {a: 1, b: 1}, bounds: {a: [[5, 5, true, true]], b: [['MinKey', "
+        "'MaxKey', true, true]]}}}"
+        "]}}}}");
 }
 
 /**

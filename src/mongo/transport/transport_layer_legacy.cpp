@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
+#include <iterator>
 #include <memory>
 
 #include "mongo/transport/transport_layer_legacy.h"
@@ -44,9 +46,13 @@
 #include "mongo/util/log.h"
 #include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 namespace transport {
+
+TransportLayerLegacy::Options::Options(const ServerGlobalParams* params)
+    : port(params->port), ipList(params->bind_ip) {}
 
 TransportLayerLegacy::ListenerLegacy::ListenerLegacy(const TransportLayerLegacy::Options& opts,
                                                      NewConnectionCb callback)
@@ -74,8 +80,8 @@ std::shared_ptr<TransportLayerLegacy::LegacySession> TransportLayerLegacy::Legac
 
 TransportLayerLegacy::LegacySession::LegacySession(std::unique_ptr<AbstractMessagingPort> amp,
                                                    TransportLayerLegacy* tl)
-    : _remote(amp->remote()),
-      _local(amp->localAddr().toString(true)),
+    : _remote(amp->remoteAddr()),
+      _local(amp->localAddr()),
       _tl(tl),
       _tags(kEmptyTagMask),
       _connection(stdx::make_unique<Connection>(std::move(amp))) {}
@@ -132,20 +138,12 @@ TransportLayerLegacy::~TransportLayerLegacy() = default;
 Ticket TransportLayerLegacy::sourceMessage(const SessionHandle& session,
                                            Message* message,
                                            Date_t expiration) {
-    auto& compressorMgr = session->getCompressorManager();
-    auto sourceCb = [message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
+    auto sourceCb = [message](AbstractMessagingPort* amp) -> Status {
         if (!amp->recv(*message)) {
             return {ErrorCodes::HostUnreachable, "Recv failed"};
         }
 
-        networkCounter.hitPhysical(message->size(), 0);
-        if (message->operation() == dbCompressed) {
-            auto swm = compressorMgr.decompressMessage(*message);
-            if (!swm.isOK())
-                return swm.getStatus();
-            *message = swm.getValue();
-        }
-        networkCounter.hitLogical(message->size(), 0);
+        networkCounter.hitPhysicalIn(message->size());
         return Status::OK();
     };
 
@@ -155,18 +153,9 @@ Ticket TransportLayerLegacy::sourceMessage(const SessionHandle& session,
         stdx::make_unique<LegacyTicket>(std::move(legacySession), expiration, std::move(sourceCb)));
 }
 
-SSLPeerInfo TransportLayerLegacy::getX509PeerInfo(const ConstSessionHandle& session) const {
-    auto legacySession = checked_pointer_cast<const LegacySession>(session);
-    return legacySession->conn()->sslPeerInfo.value_or(SSLPeerInfo());
-}
-
 TransportLayer::Stats TransportLayerLegacy::sessionStats() {
     Stats stats;
-    {
-        stdx::lock_guard<stdx::mutex> lk(_sessionsMutex);
-        stats.numOpenSessions = _sessions.size();
-    }
-
+    stats.numOpenSessions = _currentConnections.load();
     stats.numAvailableSessions = Listener::globalTicketHolder.available();
     stats.numCreatedSessions = Listener::globalConnectionNumber.load();
 
@@ -176,16 +165,10 @@ TransportLayer::Stats TransportLayerLegacy::sessionStats() {
 Ticket TransportLayerLegacy::sinkMessage(const SessionHandle& session,
                                          const Message& message,
                                          Date_t expiration) {
-    auto& compressorMgr = session->getCompressorManager();
-    auto sinkCb = [&message, &compressorMgr](AbstractMessagingPort* amp) -> Status {
+    auto sinkCb = [&message](AbstractMessagingPort* amp) -> Status {
         try {
-            networkCounter.hitLogical(0, message.size());
-            auto swm = compressorMgr.compressMessage(message);
-            if (!swm.isOK())
-                return swm.getStatus();
-            const auto& compressedMessage = swm.getValue();
-            amp->say(compressedMessage);
-            networkCounter.hitPhysical(0, compressedMessage.size());
+            amp->say(message);
+            networkCounter.hitPhysicalOut(message.size());
 
             return Status::OK();
         } catch (const SocketException& e) {
@@ -216,36 +199,21 @@ void TransportLayerLegacy::end(const SessionHandle& session) {
 }
 
 void TransportLayerLegacy::_closeConnection(Connection* conn) {
+    stdx::lock_guard<stdx::mutex> lk(conn->closeMutex);
+
+    if (conn->closed) {
+        return;
+    }
+
     conn->closed = true;
     conn->amp->shutdown();
     Listener::globalTicketHolder.release();
-}
-
-void TransportLayerLegacy::endAllSessions(Session::TagMask tags) {
-    log() << "legacy transport layer closing all connections";
-    {
-        stdx::lock_guard<stdx::mutex> lk(_sessionsMutex);
-        for (auto&& it : _sessions) {
-
-            // Attempt to make our weak_ptr into a shared_ptr
-            auto session = it.lock();
-            if (session) {
-                if (session->getTags() & tags) {
-                    log() << "Skip closing connection for connection # "
-                          << session->conn()->connectionId;
-                } else {
-                    _closeConnection(session->conn());
-                }
-            }
-        }
-    }
 }
 
 void TransportLayerLegacy::shutdown() {
     _running.store(false);
     _listener->shutdown();
     _listenerThread.join();
-    endAllSessions(Session::kEmptyTagMask);
 }
 
 void TransportLayerLegacy::_destroy(LegacySession& session) {
@@ -253,8 +221,7 @@ void TransportLayerLegacy::_destroy(LegacySession& session) {
         _closeConnection(session.conn());
     }
 
-    stdx::lock_guard<stdx::mutex> lk(_sessionsMutex);
-    _sessions.erase(session.getIter());
+    _currentConnections.subtractAndFetch(1);
 }
 
 Status TransportLayerLegacy::_runTicket(Ticket ticket) {
@@ -288,10 +255,11 @@ Status TransportLayerLegacy::_runTicket(Ticket ticket) {
 
 #ifdef MONGO_CONFIG_SSL
     // If we didn't have an X509 subject name, see if we have one now
-    if (!conn->sslPeerInfo) {
+    auto& sslPeerInfo = SSLPeerInfo::forSession(legacyTicket->getSession());
+    if (sslPeerInfo.subjectName.empty()) {
         auto info = conn->amp->getX509PeerInfo();
-        if (info.subjectName != "") {
-            conn->sslPeerInfo = info;
+        if (!info.subjectName.empty()) {
+            sslPeerInfo = info;
         }
     }
 #endif
@@ -308,18 +276,9 @@ void TransportLayerLegacy::_handleNewConnection(std::unique_ptr<AbstractMessagin
     }
 
     amp->setLogLevel(logger::LogSeverity::Debug(1));
+
+    _currentConnections.addAndFetch(1);
     auto session = LegacySession::create(std::move(amp), this);
-
-    stdx::list<std::weak_ptr<LegacySession>> list;
-    auto it = list.emplace(list.begin(), session);
-
-    {
-        // Add the new session to our list
-        stdx::lock_guard<stdx::mutex> lk(_sessionsMutex);
-        session->setIter(it);
-        _sessions.splice(_sessions.begin(), list, it);
-    }
-
     invariant(_sep);
     _sep->startSession(std::move(session));
 }

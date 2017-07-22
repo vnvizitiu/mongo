@@ -36,6 +36,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/stdx/condition_variable.h"
@@ -51,27 +52,19 @@ namespace {
 // determine if documents changed, but a different recovery unit may be used across a getMore,
 // so there is a chance the snapshot ID will be reused.
 AtomicUInt64 nextSnapshotId{1};
+
+logger::LogSeverity kSlowTransactionSeverity = logger::LogSeverity::Debug(1);
 }  // namespace
 
 WiredTigerRecoveryUnit::WiredTigerRecoveryUnit(WiredTigerSessionCache* sc)
     : _sessionCache(sc),
       _inUnitOfWork(false),
       _active(false),
-      _mySnapshotId(nextSnapshotId.fetchAndAdd(1)),
-      _everStartedWrite(false) {}
+      _mySnapshotId(nextSnapshotId.fetchAndAdd(1)) {}
 
 WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
     invariant(!_inUnitOfWork);
     _abort();
-}
-
-void WiredTigerRecoveryUnit::reportState(BSONObjBuilder* b) const {
-    b->append("wt_inUnitOfWork", _inUnitOfWork);
-    b->append("wt_active", _active);
-    b->append("wt_everStartedWrite", _everStartedWrite);
-    b->appendNumber("wt_mySnapshotId", static_cast<long long>(_mySnapshotId));
-    if (_active)
-        b->append("wt_millisSinceCommit", _timer.millis());
 }
 
 void WiredTigerRecoveryUnit::prepareForCreateSnapshot(OperationContext* opCtx) {
@@ -110,7 +103,7 @@ void WiredTigerRecoveryUnit::_abort() {
         for (Changes::const_reverse_iterator it = _changes.rbegin(), end = _changes.rend();
              it != end;
              ++it) {
-            Change* change = *it;
+            Change* change = it->get();
             LOG(2) << "CUSTOM ROLLBACK " << redact(demangleName(typeid(*change)));
             change->rollback();
         }
@@ -126,7 +119,6 @@ void WiredTigerRecoveryUnit::beginUnitOfWork(OperationContext* opCtx) {
     invariant(!_areWriteUnitOfWorksBanned);
     invariant(!_inUnitOfWork);
     _inUnitOfWork = true;
-    _everStartedWrite = true;
 }
 
 void WiredTigerRecoveryUnit::commitUnitOfWork() {
@@ -156,7 +148,7 @@ bool WiredTigerRecoveryUnit::waitUntilDurable() {
 
 void WiredTigerRecoveryUnit::registerChange(Change* change) {
     invariant(_inUnitOfWork);
-    _changes.push_back(change);
+    _changes.push_back(std::unique_ptr<Change>{change});
 }
 
 void WiredTigerRecoveryUnit::assertInActiveTxn() const {
@@ -196,6 +188,14 @@ void WiredTigerRecoveryUnit::setOplogReadTill(const RecordId& id) {
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_active);
     WT_SESSION* s = _session->getSession();
+    if (_timer) {
+        const int transactionTime = _timer->millis();
+        if (transactionTime >= serverGlobalParams.slowMS) {
+            LOG(kSlowTransactionSeverity) << "Slow WT transaction. Lifetime of SnapshotId "
+                                          << _mySnapshotId << " was " << transactionTime << "ms";
+        }
+    }
+
     if (commit) {
         invariantWTOK(s->commit_transaction(s, NULL));
         LOG(3) << "WT commit_transaction for snapshot id " << _mySnapshotId;
@@ -235,6 +235,10 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
     invariant(!_active);
     _ensureSession();
 
+    // Only start a timer for transaction's lifetime if we're going to log it.
+    if (shouldLog(kSlowTransactionSeverity)) {
+        _timer.reset(new Timer());
+    }
     WT_SESSION* s = _session->getSession();
 
     if (_readFromMajorityCommittedSnapshot) {
@@ -245,7 +249,6 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
     }
 
     LOG(3) << "WT begin_transaction for snapshot id " << _mySnapshotId;
-    _timer.reset();
     _active = true;
 }
 
@@ -254,10 +257,10 @@ void WiredTigerRecoveryUnit::_txnOpen(OperationContext* opCtx) {
 WiredTigerCursor::WiredTigerCursor(const std::string& uri,
                                    uint64_t tableId,
                                    bool forRecordStore,
-                                   OperationContext* txn) {
+                                   OperationContext* opCtx) {
     _tableID = tableId;
-    _ru = WiredTigerRecoveryUnit::get(txn);
-    _session = _ru->getSession(txn);
+    _ru = WiredTigerRecoveryUnit::get(opCtx);
+    _session = _ru->getSession(opCtx);
     _cursor = _session->getCursor(uri, tableId, forRecordStore);
     if (!_cursor) {
         error() << "no cursor for uri: " << uri;
@@ -271,9 +274,5 @@ WiredTigerCursor::~WiredTigerCursor() {
 
 void WiredTigerCursor::reset() {
     invariantWTOK(_cursor->reset(_cursor));
-}
-
-WT_SESSION* WiredTigerCursor::getWTSession() {
-    return _session->getSession();
 }
 }

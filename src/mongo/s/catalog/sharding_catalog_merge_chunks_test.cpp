@@ -63,13 +63,14 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
 
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupChunks({chunk, chunk2}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     chunkBoundaries,
+                                     "shard0000"));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -77,7 +78,7 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
                                                  repl::ReadConcernLevel::kLocalReadConcern,
                                                  NamespaceString(ChunkType::ConfigNS),
                                                  BSON(ChunkType::ns() << "TestDB.TestColl"),
-                                                 BSON(ChunkType::DEPRECATED_lastmod << -1),
+                                                 BSON(ChunkType::lastmod << -1),
                                                  boost::none));
 
     const auto& chunksVector = findResponse.docs;
@@ -86,7 +87,7 @@ TEST_F(MergeChunkTest, MergeExistingChunksCorrectlyShouldSucceed) {
     ASSERT_EQ(1u, chunksVector.size());
 
     // MergedChunk should have range [chunkMin, chunkMax]
-    auto mergedChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.front()));
+    auto mergedChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
     ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
     ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
 
@@ -126,13 +127,14 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkBound2, chunkMax};
 
-    setupChunks({chunk, chunk2, chunk3});
+    setupChunks({chunk, chunk2, chunk3}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     chunkBoundaries,
+                                     "shard0000"));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -140,7 +142,7 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
                                                  repl::ReadConcernLevel::kLocalReadConcern,
                                                  NamespaceString(ChunkType::ConfigNS),
                                                  BSON(ChunkType::ns() << "TestDB.TestColl"),
-                                                 BSON(ChunkType::DEPRECATED_lastmod << -1),
+                                                 BSON(ChunkType::lastmod << -1),
                                                  boost::none));
 
     const auto& chunksVector = findResponse.docs;
@@ -149,7 +151,7 @@ TEST_F(MergeChunkTest, MergeSeveralChunksCorrectlyShouldSucceed) {
     ASSERT_EQ(1u, chunksVector.size());
 
     // MergedChunk should have range [chunkMin, chunkMax]
-    auto mergedChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.front()));
+    auto mergedChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
     ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
     ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
 
@@ -193,13 +195,14 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk});
+    setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 collEpoch,
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     collEpoch,
+                                     chunkBoundaries,
+                                     "shard0000"));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -207,7 +210,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
                                                  repl::ReadConcernLevel::kLocalReadConcern,
                                                  NamespaceString(ChunkType::ConfigNS),
                                                  BSON(ChunkType::ns() << "TestDB.TestColl"),
-                                                 BSON(ChunkType::DEPRECATED_lastmod << -1),
+                                                 BSON(ChunkType::lastmod << -1),
                                                  boost::none));
 
     const auto& chunksVector = findResponse.docs;
@@ -216,7 +219,7 @@ TEST_F(MergeChunkTest, NewMergeShouldClaimHighestVersion) {
     ASSERT_EQ(2u, chunksVector.size());
 
     // MergedChunk should have range [chunkMin, chunkMax]
-    auto mergedChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.front()));
+    auto mergedChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
     ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
     ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
 
@@ -256,13 +259,14 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
     otherChunk.setMin(BSON("a" << 10));
     otherChunk.setMax(BSON("a" << 20));
 
-    setupChunks({chunk, chunk2, otherChunk});
+    setupChunks({chunk, chunk2, otherChunk}).transitional_ignore();
 
-    ASSERT_OK(catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+    ASSERT_OK(ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     chunkBoundaries,
+                                     "shard0000"));
 
     auto findResponse = uassertStatusOK(
         getConfigShard()->exhaustiveFindOnConfig(operationContext(),
@@ -270,7 +274,7 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
                                                  repl::ReadConcernLevel::kLocalReadConcern,
                                                  NamespaceString(ChunkType::ConfigNS),
                                                  BSON(ChunkType::ns() << "TestDB.TestColl"),
-                                                 BSON(ChunkType::DEPRECATED_lastmod << -1),
+                                                 BSON(ChunkType::lastmod << -1),
                                                  boost::none));
 
     const auto& chunksVector = findResponse.docs;
@@ -279,7 +283,7 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
     ASSERT_EQ(2u, chunksVector.size());
 
     // MergedChunk should have range [chunkMin, chunkMax]
-    auto mergedChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.front()));
+    auto mergedChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
     ASSERT_BSONOBJ_EQ(chunkMin, mergedChunk.getMin());
     ASSERT_BSONOBJ_EQ(chunkMax, mergedChunk.getMax());
 
@@ -290,7 +294,7 @@ TEST_F(MergeChunkTest, MergeLeavesOtherChunksAlone) {
     }
 
     // OtherChunk should have been left alone
-    auto foundOtherChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.back()));
+    auto foundOtherChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.back()));
     ASSERT_BSONOBJ_EQ(otherChunk.getMin(), foundOtherChunk.getMin());
     ASSERT_BSONOBJ_EQ(otherChunk.getMax(), foundOtherChunk.getMax());
 }
@@ -318,13 +322,14 @@ TEST_F(MergeChunkTest, NonExistingNamespace) {
     // Record chunk boundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupChunks({chunk, chunk2}).transitional_ignore();
 
-    auto mergeStatus = catalogManager()->commitChunkMerge(operationContext(),
-                                                          NamespaceString("TestDB.NonExistingColl"),
-                                                          origVersion.epoch(),
-                                                          chunkBoundaries,
-                                                          "shard0000");
+    auto mergeStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkMerge(operationContext(),
+                                              NamespaceString("TestDB.NonExistingColl"),
+                                              origVersion.epoch(),
+                                              chunkBoundaries,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::IllegalOperation, mergeStatus);
 }
 
@@ -351,13 +356,14 @@ TEST_F(MergeChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
     // Record chunk baoundaries for passing into commitChunkMerge
     std::vector<BSONObj> chunkBoundaries{chunkMin, chunkBound, chunkMax};
 
-    setupChunks({chunk, chunk2});
+    setupChunks({chunk, chunk2}).transitional_ignore();
 
-    auto mergeStatus = catalogManager()->commitChunkMerge(operationContext(),
-                                                          NamespaceString("TestDB.TestColl"),
-                                                          OID::gen(),
-                                                          chunkBoundaries,
-                                                          "shard0000");
+    auto mergeStatus = ShardingCatalogManager::get(operationContext())
+                           ->commitChunkMerge(operationContext(),
+                                              NamespaceString("TestDB.TestColl"),
+                                              OID::gen(),
+                                              chunkBoundaries,
+                                              "shard0000");
     ASSERT_EQ(ErrorCodes::StaleEpoch, mergeStatus);
 }
 
@@ -390,14 +396,15 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
     mergedChunk.setVersion(mergedVersion);
     mergedChunk.setMax(chunkMax);
 
-    setupChunks({mergedChunk});
+    setupChunks({mergedChunk}).transitional_ignore();
 
     ASSERT_EQ(ErrorCodes::BadValue,
-              catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 origVersion.epoch(),
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+              ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     origVersion.epoch(),
+                                     chunkBoundaries,
+                                     "shard0000"));
 
     // Verify that no change to config.chunks happened.
     auto findResponse = uassertStatusOK(
@@ -406,7 +413,7 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
                                                  repl::ReadConcernLevel::kLocalReadConcern,
                                                  NamespaceString(ChunkType::ConfigNS),
                                                  BSON(ChunkType::ns() << "TestDB.TestColl"),
-                                                 BSON(ChunkType::DEPRECATED_lastmod << -1),
+                                                 BSON(ChunkType::lastmod << -1),
                                                  boost::none));
 
     const auto& chunksVector = findResponse.docs;
@@ -415,8 +422,8 @@ TEST_F(MergeChunkTest, MergeAlreadyHappenedFailsPrecondition) {
     ASSERT_EQ(1u, chunksVector.size());
 
     // MergedChunk should have range [chunkMin, chunkMax]
-    ChunkType foundChunk = uassertStatusOK(ChunkType::fromBSON(chunksVector.front()));
-    ASSERT_BSONOBJ_EQ(mergedChunk.toBSON(), foundChunk.toBSON());
+    ChunkType foundChunk = uassertStatusOK(ChunkType::fromConfigBSON(chunksVector.front()));
+    ASSERT_BSONOBJ_EQ(mergedChunk.toConfigBSON(), foundChunk.toConfigBSON());
 }
 
 TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
@@ -449,15 +456,16 @@ TEST_F(MergeChunkTest, ChunkBoundariesOutOfOrderFails) {
         chunk.setVersion(version);
         originalChunks.push_back(chunk);
 
-        setupChunks(originalChunks);
+        setupChunks(originalChunks).transitional_ignore();
     }
 
     ASSERT_EQ(ErrorCodes::InvalidOptions,
-              catalogManager()->commitChunkMerge(operationContext(),
-                                                 NamespaceString("TestDB.TestColl"),
-                                                 epoch,
-                                                 chunkBoundaries,
-                                                 "shard0000"));
+              ShardingCatalogManager::get(operationContext())
+                  ->commitChunkMerge(operationContext(),
+                                     NamespaceString("TestDB.TestColl"),
+                                     epoch,
+                                     chunkBoundaries,
+                                     "shard0000"));
 }
 
 }  // namespace
